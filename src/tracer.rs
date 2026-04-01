@@ -830,16 +830,16 @@ fn parse_signal_declarations(source: &str) -> Vec<SignalDecl> {
         let line_num = (line_idx + 1) as u32;
         let trimmed = line_text.trim();
 
-        if !trimmed.starts_with("signal ") {
+        let after_signal = if let Some(rest) = trimmed.strip_prefix("signal ") {
+            rest.trim()
+        } else {
             continue;
-        }
+        };
 
-        let after_signal = trimmed[7..].trim();
-
-        let (kind, rest) = if after_signal.starts_with("input ") {
-            (SignalKind::Input, after_signal[6..].trim())
-        } else if after_signal.starts_with("output ") {
-            (SignalKind::Output, after_signal[7..].trim())
+        let (kind, rest) = if let Some(rest) = after_signal.strip_prefix("input ") {
+            (SignalKind::Input, rest.trim())
+        } else if let Some(rest) = after_signal.strip_prefix("output ") {
+            (SignalKind::Output, rest.trim())
         } else {
             (SignalKind::Intermediate, after_signal)
         };
@@ -887,11 +887,11 @@ fn parse_template_definitions(source: &str) -> Vec<TemplateDef> {
         let line_num = (line_idx + 1) as u32;
         let trimmed = line_text.trim();
 
-        if !trimmed.starts_with("template ") {
+        let after_template = if let Some(rest) = trimmed.strip_prefix("template ") {
+            rest
+        } else {
             continue;
-        }
-
-        let after_template = &trimmed[9..];
+        };
         if let Some(paren_pos) = after_template.find('(') {
             let name = after_template[..paren_pos].trim().to_string();
             if !name.is_empty() {
@@ -971,8 +971,8 @@ fn find_template_inputs(source: &str, template_name: Option<&str>) -> Vec<String
             }
 
             // Parse signal input declarations within this template.
-            if trimmed.starts_with("signal input ") {
-                let name = trimmed[13..]
+            if let Some(rest) = trimmed.strip_prefix("signal input ") {
+                let name = rest
                     .trim()
                     .trim_end_matches(';')
                     .trim()
