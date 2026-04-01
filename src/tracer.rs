@@ -972,11 +972,7 @@ fn find_template_inputs(source: &str, template_name: Option<&str>) -> Vec<String
 
             // Parse signal input declarations within this template.
             if let Some(rest) = trimmed.strip_prefix("signal input ") {
-                let name = rest
-                    .trim()
-                    .trim_end_matches(';')
-                    .trim()
-                    .to_string();
+                let name = rest.trim().trim_end_matches(';').trim().to_string();
                 if !name.is_empty() {
                     inputs.push(name);
                 }
