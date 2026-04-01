@@ -5,6 +5,8 @@
 //! converting the results into the CodeTracer trace format for debugging
 //! and analysis.
 
+pub mod cpp_witness;
 pub mod recorder;
+pub mod signal_hierarchy;
 pub mod source_map;
 pub mod tracer;

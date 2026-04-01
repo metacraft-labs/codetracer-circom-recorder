@@ -15,6 +15,8 @@ use eyre::{Context, Result, eyre};
 use num_bigint::BigUint;
 use wasmtime::{Engine, Func, Linker, Module, Store, Val};
 
+use crate::cpp_witness::{self, CompilerSourceMap};
+use crate::signal_hierarchy::{SignalPath, build_hierarchy};
 use crate::source_map::SourceMap;
 
 /// Convert a wasmtime error to an eyre error.
@@ -73,6 +75,17 @@ fn parse_sym_file(sym_path: &Path) -> Result<Vec<SymbolEntry>> {
         });
     }
     Ok(entries)
+}
+
+/// Parse a signal name into a hierarchical `SignalPath`.
+///
+/// This handles:
+/// - Simple signals: `"main.out"` -> `["main", "out"]`
+/// - Sub-component signals: `"main.adder.out"` -> `["main", "adder", "out"]`
+/// - Array signals: `"main.values[0]"` -> `["main", "values[0]"]`
+/// - Combined: `"main.comp.arr[3]"` -> `["main", "comp", "arr[3]"]`
+pub fn parse_signal_hierarchy(name: &str) -> SignalPath {
+    SignalPath::parse(name)
 }
 
 /// FNV-1a hash (64-bit) matching Circom's JavaScript implementation.
@@ -300,6 +313,7 @@ fn to_array32_le(val: &BigUint, size: usize) -> Vec<u32> {
 
 /// A parsed signal declaration.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct SignalDecl {
     /// Signal name (e.g. "a", "out").
     name: String,
@@ -360,24 +374,62 @@ impl CircomTracer {
         out_dir: &Path,
         format: TraceEventsFileFormat,
     ) -> Result<()> {
+        Self::trace_program_with_backend(source_path, source_code, out_dir, format, false)
+    }
+
+    /// Trace using the C++ witness generator backend (faster for large circuits).
+    pub fn trace_program_cpp(
+        source_path: &Path,
+        source_code: &str,
+        out_dir: &Path,
+        format: TraceEventsFileFormat,
+    ) -> Result<()> {
+        Self::trace_program_with_backend(source_path, source_code, out_dir, format, true)
+    }
+
+    fn trace_program_with_backend(
+        source_path: &Path,
+        source_code: &str,
+        out_dir: &Path,
+        format: TraceEventsFileFormat,
+        use_cpp: bool,
+    ) -> Result<()> {
         // -- 1. Compile the Circom source --------------------------------------------------
         let compile_dir = tempfile::tempdir()
             .with_context(|| "failed to create temp dir for circom compilation")?;
 
         let circom_bin = std::env::var("CIRCOM_BIN").unwrap_or_else(|_| "circom".to_string());
 
-        let compile_output = Command::new(&circom_bin)
+        let mut compile_cmd = Command::new(&circom_bin);
+        compile_cmd
             .arg(source_path)
             .arg("--wasm")
             .arg("--sym")
             .arg("--O0") // Disable optimization to preserve all signals in the witness.
             .arg("-o")
-            .arg(compile_dir.path())
+            .arg(compile_dir.path());
+
+        // Also compile C++ output when using the C++ backend
+        if use_cpp {
+            compile_cmd.arg("--c");
+        }
+
+        // Request source map if the compiler supports it (forked circom)
+        compile_cmd.arg("--srcmap");
+
+        let compile_output = compile_cmd
             .output()
             .with_context(|| format!("failed to run circom compiler ('{circom_bin}')"))?;
 
         if !compile_output.status.success() {
             let stderr = String::from_utf8_lossy(&compile_output.stderr);
+            // If --srcmap failed (stock circom), retry without it
+            if stderr.contains("srcmap") || stderr.contains("unrecognized") {
+                eprintln!("Compiler doesn't support --srcmap, retrying without it");
+                return Self::trace_program_no_srcmap(
+                    source_path, source_code, out_dir, format, use_cpp,
+                );
+            }
             let stdout = String::from_utf8_lossy(&compile_output.stdout);
             return Err(eyre!(
                 "circom compilation failed:\nstdout: {stdout}\nstderr: {stderr}"
@@ -397,6 +449,7 @@ impl CircomTracer {
             .join(format!("{stem}_js"))
             .join(format!("{stem}.wasm"));
         let sym_path = compile_dir.path().join(format!("{stem}.sym"));
+        let srcmap_path = compile_dir.path().join(format!("{stem}.srcmap.json"));
 
         if !wasm_path.exists() {
             return Err(eyre!(
@@ -411,38 +464,85 @@ impl CircomTracer {
             ));
         }
 
+        // Load compiler source map if available
+        let compiler_srcmap = if srcmap_path.exists() {
+            match CompilerSourceMap::load(&srcmap_path) {
+                Ok(map) => {
+                    eprintln!(
+                        "Loaded compiler source map: {} entries, {} files",
+                        map.mappings.len(),
+                        map.files.len()
+                    );
+                    Some(map)
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to load source map: {e}");
+                    None
+                }
+            }
+        } else {
+            eprintln!("No compiler source map found (using heuristic mapping)");
+            None
+        };
+
         // -- 2. Parse the .sym file -------------------------------------------------------
         let symbols = parse_sym_file(&sym_path)?;
         eprintln!("Parsed {} symbols from .sym file", symbols.len());
 
         // -- 3. Prepare inputs ------------------------------------------------------------
+        // Only set inputs for the main component's template (not sub-component templates).
         let signal_decls = parse_signal_declarations(source_code);
+        let main_template_name = find_main_template_name(source_code);
+        let main_template_inputs =
+            find_template_inputs(source_code, main_template_name.as_deref());
         let mut inputs: HashMap<String, Vec<String>> = HashMap::new();
-        for sig in &signal_decls {
-            if sig.kind == SignalKind::Input {
-                // Default input value is "0". In a real usage, inputs would come
-                // from a JSON file; for tracing purposes we use 0.
-                inputs.insert(sig.name.clone(), vec!["0".to_string()]);
-            }
+        for input_name in &main_template_inputs {
+            // Default input value is "0". In a real usage, inputs would come
+            // from a JSON file; for tracing purposes we use 0.
+            inputs.insert(input_name.clone(), vec!["0".to_string()]);
         }
 
         // -- 4. Run the witness generator -------------------------------------------------
-        let witness = calculate_witness(&wasm_path, &inputs)?;
+        let witness = if use_cpp {
+            // C++ backend: compile and run the C++ witness generator
+            let binary = cpp_witness::compile_cpp_witness(compile_dir.path(), &stem)?;
+            let input_json = compile_dir.path().join("input.json");
+            let wtns_path = compile_dir.path().join("witness.wtns");
+            cpp_witness::write_input_json(&input_json, &inputs)?;
+            cpp_witness::run_cpp_witness(&binary, &input_json, &wtns_path)?
+        } else {
+            // WASM backend: use wasmtime
+            calculate_witness(&wasm_path, &inputs)?
+        };
         eprintln!("Computed witness with {} elements", witness.len());
 
         // -- 5. Map symbol names to values ------------------------------------------------
         let mut values: HashMap<String, i64> = HashMap::new();
+        let mut full_name_values: Vec<(String, i64)> = Vec::new();
         for sym in &symbols {
             if sym.witness_index < witness.len() {
                 let val = &witness[sym.witness_index];
                 let val_i64 = bigint_to_i64(val);
                 values.insert(sym.name.clone(), val_i64);
+                full_name_values.push((sym.full_name.clone(), val_i64));
             }
         }
 
+        // Build the signal hierarchy for component-aware querying.
+        let hierarchy = build_hierarchy(&full_name_values);
+
         eprintln!("Mapped {} signal values from witness", values.len());
+        let child_components = hierarchy.get_child_components(&["main"]);
+        if !child_components.is_empty() {
+            eprintln!(
+                "Signal hierarchy: main has {} sub-component(s): {:?}",
+                child_components.len(),
+                child_components
+            );
+        }
         for (name, val) in &values {
-            eprintln!("  {name} = {val}");
+            let path = parse_signal_hierarchy(&format!("main.{name}"));
+            eprintln!("  {name} = {val} (depth={})", path.depth());
         }
 
         // -- 6. Parse source for trace event emission -------------------------------------
@@ -487,9 +587,148 @@ impl CircomTracer {
             &assignments,
             &templates,
             &values,
+            compiler_srcmap.as_ref(),
         )?;
 
         // -- 11. Finish writing -----------------------------------------------------------
+        TraceWriter::finish_writing_trace_events(&mut *tracer.writer)
+            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
+            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer)
+            .map_err(|e| eyre!("{e}"))?;
+
+        Ok(())
+    }
+
+    /// Fallback when --srcmap is not supported by the compiler.
+    fn trace_program_no_srcmap(
+        source_path: &Path,
+        source_code: &str,
+        out_dir: &Path,
+        format: TraceEventsFileFormat,
+        use_cpp: bool,
+    ) -> Result<()> {
+        let compile_dir = tempfile::tempdir()
+            .with_context(|| "failed to create temp dir for circom compilation")?;
+
+        let circom_bin = std::env::var("CIRCOM_BIN").unwrap_or_else(|_| "circom".to_string());
+
+        let mut compile_cmd = Command::new(&circom_bin);
+        compile_cmd
+            .arg(source_path)
+            .arg("--wasm")
+            .arg("--sym")
+            .arg("--O0")
+            .arg("-o")
+            .arg(compile_dir.path());
+
+        if use_cpp {
+            compile_cmd.arg("--c");
+        }
+
+        let compile_output = compile_cmd
+            .output()
+            .with_context(|| format!("failed to run circom compiler ('{circom_bin}')"))?;
+
+        if !compile_output.status.success() {
+            let stderr = String::from_utf8_lossy(&compile_output.stderr);
+            let stdout = String::from_utf8_lossy(&compile_output.stdout);
+            return Err(eyre!(
+                "circom compilation failed:\nstdout: {stdout}\nstderr: {stderr}"
+            ));
+        }
+
+        let stem = source_path
+            .file_stem()
+            .ok_or_else(|| eyre!("source path has no file stem"))?
+            .to_string_lossy();
+
+        let wasm_path = compile_dir
+            .path()
+            .join(format!("{stem}_js"))
+            .join(format!("{stem}.wasm"));
+        let sym_path = compile_dir.path().join(format!("{stem}.sym"));
+
+        if !wasm_path.exists() {
+            return Err(eyre!(
+                "circom did not produce expected WASM file: {}",
+                wasm_path.display()
+            ));
+        }
+
+        let symbols = parse_sym_file(&sym_path)?;
+        let signal_decls = parse_signal_declarations(source_code);
+        let main_template_name = find_main_template_name(source_code);
+        let main_template_inputs =
+            find_template_inputs(source_code, main_template_name.as_deref());
+        let mut inputs: HashMap<String, Vec<String>> = HashMap::new();
+        for input_name in &main_template_inputs {
+            inputs.insert(input_name.clone(), vec!["0".to_string()]);
+        }
+
+        let witness = if use_cpp {
+            let binary = cpp_witness::compile_cpp_witness(compile_dir.path(), &stem)?;
+            let input_json = compile_dir.path().join("input.json");
+            let wtns_path = compile_dir.path().join("witness.wtns");
+            cpp_witness::write_input_json(&input_json, &inputs)?;
+            cpp_witness::run_cpp_witness(&binary, &input_json, &wtns_path)?
+        } else {
+            calculate_witness(&wasm_path, &inputs)?
+        };
+
+        let mut values: HashMap<String, i64> = HashMap::new();
+        let mut full_name_values: Vec<(String, i64)> = Vec::new();
+        for sym in &symbols {
+            if sym.witness_index < witness.len() {
+                let val = &witness[sym.witness_index];
+                let val_i64 = bigint_to_i64(val);
+                values.insert(sym.name.clone(), val_i64);
+                full_name_values.push((sym.full_name.clone(), val_i64));
+            }
+        }
+        let _hierarchy = build_hierarchy(&full_name_values);
+
+        let source_map = SourceMap::from_source(source_path, source_code);
+        let assignments = parse_signal_assignments(source_code);
+        let templates = parse_template_definitions(source_code);
+
+        let program_str = source_path.to_string_lossy();
+        let mut tracer = CircomTracer {
+            writer: create_trace_writer(&program_str, &[], format),
+            field_type_id: None,
+        };
+
+        std::fs::create_dir_all(out_dir)
+            .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
+
+        let events_path = out_dir.join("trace.bin");
+        let metadata_path = out_dir.join("trace_metadata.json");
+        let paths_path = out_dir.join("trace_paths.json");
+
+        TraceWriter::begin_writing_trace_events(&mut *tracer.writer, &events_path)
+            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::begin_writing_trace_metadata(&mut *tracer.writer, &metadata_path)
+            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::begin_writing_trace_paths(&mut *tracer.writer, &paths_path)
+            .map_err(|e| eyre!("{e}"))?;
+
+        TraceWriter::start(&mut *tracer.writer, source_path, Line(1));
+
+        let field_type_id =
+            TraceWriter::ensure_type_id(&mut *tracer.writer, TypeKind::Int, "field");
+        tracer.field_type_id = Some(field_type_id);
+
+        tracer.emit_source_trace(
+            source_path,
+            &source_map,
+            &signal_decls,
+            &assignments,
+            &templates,
+            &values,
+            None,
+        )?;
+
         TraceWriter::finish_writing_trace_events(&mut *tracer.writer)
             .map_err(|e| eyre!("{e}"))?;
         TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
@@ -509,6 +748,7 @@ impl CircomTracer {
         assignments: &[SignalAssignment],
         templates: &[TemplateDef],
         values: &HashMap<String, i64>,
+        _compiler_srcmap: Option<&CompilerSourceMap>,
     ) -> Result<()> {
         let field_type_id = self.field_type_id.unwrap();
 
@@ -678,6 +918,83 @@ fn parse_template_definitions(source: &str) -> Vec<TemplateDef> {
     templates
 }
 
+/// Find the name of the template instantiated as `component main = TemplateName()`.
+///
+/// Returns `None` if no main component line is found.
+fn find_main_template_name(source: &str) -> Option<String> {
+    for line_text in source.lines() {
+        let trimmed = line_text.trim();
+        // Match patterns like: component main = TemplateName();
+        // or: component main = TemplateName(args);
+        if trimmed.starts_with("component main") {
+            if let Some(eq_pos) = trimmed.find('=') {
+                let after_eq = trimmed[eq_pos + 1..].trim();
+                // Extract the template name (everything before the first '(')
+                if let Some(paren_pos) = after_eq.find('(') {
+                    let name = after_eq[..paren_pos].trim().to_string();
+                    if !name.is_empty() {
+                        return Some(name);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find input signal names for a specific template.
+///
+/// If `template_name` is `None`, falls back to collecting all input signals
+/// from the entire source (backward-compatible behavior for single-template files).
+fn find_template_inputs(source: &str, template_name: Option<&str>) -> Vec<String> {
+    let mut inputs = Vec::new();
+    let mut in_target_template = template_name.is_none();
+    let mut brace_depth = 0i32;
+
+    for line_text in source.lines() {
+        let trimmed = line_text.trim();
+
+        // Track when we enter/exit the target template.
+        if let Some(target) = template_name {
+            if trimmed.starts_with("template ") {
+                if let Some(paren_pos) = trimmed.find('(') {
+                    let name = trimmed[9..paren_pos].trim();
+                    if name == target {
+                        in_target_template = true;
+                        brace_depth = 0;
+                    }
+                }
+            }
+        }
+
+        if in_target_template {
+            // Track brace depth to know when the template ends.
+            for ch in trimmed.chars() {
+                match ch {
+                    '{' => brace_depth += 1,
+                    '}' => {
+                        brace_depth -= 1;
+                        if brace_depth <= 0 && template_name.is_some() {
+                            in_target_template = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Parse signal input declarations within this template.
+            if trimmed.starts_with("signal input ") {
+                let name = trimmed[13..].trim().trim_end_matches(';').trim().to_string();
+                if !name.is_empty() {
+                    inputs.push(name);
+                }
+            }
+        }
+    }
+
+    inputs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,5 +1100,123 @@ template FlowTest() {
         assert_eq!(entries[1].name, "in");
         assert_eq!(entries[2].witness_index, 3);
         assert_eq!(entries[2].name, "a");
+    }
+
+    #[test]
+    fn test_parse_sym_file_with_sub_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let sym_path = dir.path().join("test.sym");
+        std::fs::write(
+            &sym_path,
+            "1,1,0,main.out\n2,-1,0,main.adder.a\n3,-1,0,main.adder.b\n4,2,0,main.adder.out\n",
+        )
+        .unwrap();
+
+        let entries = parse_sym_file(&sym_path).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].name, "out");
+        assert_eq!(entries[0].full_name, "main.out");
+        assert_eq!(entries[1].name, "adder.a");
+        assert_eq!(entries[1].full_name, "main.adder.a");
+        assert_eq!(entries[2].name, "adder.b");
+        assert_eq!(entries[2].full_name, "main.adder.b");
+        assert_eq!(entries[3].name, "adder.out");
+        assert_eq!(entries[3].full_name, "main.adder.out");
+    }
+
+    #[test]
+    fn test_parse_sym_file_with_arrays() {
+        let dir = tempfile::tempdir().unwrap();
+        let sym_path = dir.path().join("test.sym");
+        std::fs::write(
+            &sym_path,
+            "1,-1,0,main.values[0]\n2,-1,0,main.values[1]\n3,-1,0,main.values[2]\n4,1,0,main.out\n",
+        )
+        .unwrap();
+
+        let entries = parse_sym_file(&sym_path).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].name, "values[0]");
+        assert_eq!(entries[1].name, "values[1]");
+        assert_eq!(entries[2].name, "values[2]");
+        assert_eq!(entries[3].name, "out");
+    }
+
+    #[test]
+    fn test_parse_signal_hierarchy_simple() {
+        let path = parse_signal_hierarchy("main.out");
+        assert_eq!(path.depth(), 2);
+        assert_eq!(path.leaf_name(), "out");
+    }
+
+    #[test]
+    fn test_parse_signal_hierarchy_sub_component() {
+        let path = parse_signal_hierarchy("main.adder.out");
+        assert_eq!(path.depth(), 3);
+        assert_eq!(path.components[1].name, "adder");
+        assert_eq!(path.leaf_name(), "out");
+        let comp_path = path.component_path();
+        assert_eq!(comp_path.len(), 1);
+        assert_eq!(comp_path[0].name, "adder");
+    }
+
+    #[test]
+    fn test_parse_signal_hierarchy_array() {
+        let path = parse_signal_hierarchy("main.values[0]");
+        assert_eq!(path.depth(), 2);
+        assert_eq!(path.leaf_name(), "values");
+        assert_eq!(path.leaf_index(), Some(0));
+    }
+
+    #[test]
+    fn test_parse_signal_hierarchy_deep() {
+        let path = parse_signal_hierarchy("main.component.sub_signal");
+        assert_eq!(path.depth(), 3);
+        assert_eq!(path.components[0].name, "main");
+        assert_eq!(path.components[1].name, "component");
+        assert_eq!(path.components[2].name, "sub_signal");
+        assert_eq!(path.full_name(), "main.component.sub_signal");
+    }
+
+    #[test]
+    fn test_build_hierarchy_from_sym_entries() {
+        use crate::signal_hierarchy::build_hierarchy;
+
+        let signals = vec![
+            ("main.in".to_string(), 5),
+            ("main.adder.a".to_string(), 10),
+            ("main.adder.b".to_string(), 20),
+            ("main.adder.out".to_string(), 30),
+            ("main.out".to_string(), 30),
+        ];
+        let hierarchy = build_hierarchy(&signals);
+
+        let main_sigs = hierarchy.get_signals_for_component(&["main"]);
+        assert_eq!(main_sigs.len(), 2);
+
+        let adder_sigs = hierarchy.get_signals_for_component(&["main", "adder"]);
+        assert_eq!(adder_sigs.len(), 3);
+
+        let children = hierarchy.get_child_components(&["main"]);
+        assert!(children.contains(&"adder".to_string()));
+    }
+
+    #[test]
+    fn test_build_hierarchy_with_arrays() {
+        use crate::signal_hierarchy::build_hierarchy;
+
+        let signals = vec![
+            ("main.values[0]".to_string(), 100),
+            ("main.values[1]".to_string(), 200),
+            ("main.values[2]".to_string(), 300),
+            ("main.out".to_string(), 600),
+        ];
+        let hierarchy = build_hierarchy(&signals);
+
+        let arr = hierarchy.get_array_signals(&["main"], "values");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0], (0, 100));
+        assert_eq!(arr[1], (1, 200));
+        assert_eq!(arr[2], (2, 300));
     }
 }

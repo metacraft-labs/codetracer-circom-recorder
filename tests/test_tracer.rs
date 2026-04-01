@@ -21,6 +21,7 @@ fn run_tracer_on_file(source_path: &Path, out_dir: &Path) {
         source_path,
         out_dir,
         TraceEventsFileFormat::Json,
+        false, // use WASM backend
     )
     .expect("trace_program should succeed");
 }
@@ -515,7 +516,140 @@ fn test_circom_function_entry_exit() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 9: All intermediate values appear in trace
+// Test 9: Component test circuit (sub-component instantiation)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_circom_component_circuit() {
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out_dir = tmp_dir.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let source_path = test_programs_dir().join("component_test.circom");
+    run_tracer_on_file(&source_path, &out_dir);
+
+    let events = load_trace_events(&out_dir);
+    assert!(!events.is_empty(), "component_test trace should have events");
+
+    // The circuit has sub-component signals like adder.a, adder.b, adder.out.
+    // These should appear in the trace as variable names.
+    let var_names = collect_variable_names(&events);
+    assert!(
+        !var_names.is_empty(),
+        "component_test trace should have variable names"
+    );
+
+    // Check that step events exist.
+    let step_count = events.iter().filter(|e| e.get("Step").is_some()).count();
+    assert!(
+        step_count > 0,
+        "component_test trace should have step events"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: Array test circuit (signal arrays)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_circom_array_circuit() {
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out_dir = tmp_dir.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let source_path = test_programs_dir().join("array_test.circom");
+    run_tracer_on_file(&source_path, &out_dir);
+
+    let events = load_trace_events(&out_dir);
+    assert!(!events.is_empty(), "array_test trace should have events");
+
+    // Check that step events exist.
+    let step_count = events.iter().filter(|e| e.get("Step").is_some()).count();
+    assert!(
+        step_count > 0,
+        "array_test trace should have step events"
+    );
+
+    // Check that value events exist.
+    let int_values = collect_int_values(&events);
+    assert!(
+        !int_values.is_empty(),
+        "array_test trace should have value events"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: Signal hierarchy unit tests (no circom CLI needed)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_signal_hierarchy_from_component_circuit() {
+    use codetracer_circom_recorder::signal_hierarchy::{SignalPath, build_hierarchy};
+
+    // Simulate what a component_test.circom .sym file would produce.
+    let signals = vec![
+        ("main.result".to_string(), 42),
+        ("main.x".to_string(), 20),
+        ("main.y".to_string(), 22),
+        ("main.adder.a".to_string(), 20),
+        ("main.adder.b".to_string(), 22),
+        ("main.adder.out".to_string(), 42),
+    ];
+    let hierarchy = build_hierarchy(&signals);
+
+    // Main-level signals.
+    let main_sigs = hierarchy.get_signals_for_component(&["main"]);
+    assert_eq!(main_sigs.len(), 3);
+
+    // Sub-component signals.
+    let adder_sigs = hierarchy.get_signals_for_component(&["main", "adder"]);
+    assert_eq!(adder_sigs.len(), 3);
+    assert!(adder_sigs.contains(&("a".to_string(), 20)));
+    assert!(adder_sigs.contains(&("b".to_string(), 22)));
+    assert!(adder_sigs.contains(&("out".to_string(), 42)));
+
+    // Check hierarchy structure.
+    let children = hierarchy.get_child_components(&["main"]);
+    assert_eq!(children.len(), 1);
+    assert!(children.contains(&"adder".to_string()));
+
+    // Check signal path parsing for sub-component signals.
+    let path = SignalPath::parse("main.adder.out");
+    assert_eq!(path.depth(), 3);
+    assert_eq!(path.component_path().len(), 1);
+    assert_eq!(path.component_path()[0].name, "adder");
+    assert_eq!(path.leaf_name(), "out");
+}
+
+#[test]
+fn test_signal_hierarchy_from_array_circuit() {
+    use codetracer_circom_recorder::signal_hierarchy::{SignalPath, build_hierarchy};
+
+    // Simulate what an array_test.circom .sym file would produce.
+    let signals = vec![
+        ("main.in".to_string(), 5),
+        ("main.values[0]".to_string(), 5),
+        ("main.values[1]".to_string(), 10),
+        ("main.values[2]".to_string(), 30),
+        ("main.out".to_string(), 30),
+    ];
+    let hierarchy = build_hierarchy(&signals);
+
+    // Array query.
+    let arr = hierarchy.get_array_signals(&["main"], "values");
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[0], (0, 5));
+    assert_eq!(arr[1], (1, 10));
+    assert_eq!(arr[2], (2, 30));
+
+    // Signal path parsing for array signals.
+    let path = SignalPath::parse("main.values[1]");
+    assert_eq!(path.leaf_name(), "values");
+    assert_eq!(path.leaf_index(), Some(1));
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: All intermediate values appear in trace (flow_test)
 // ---------------------------------------------------------------------------
 
 #[test]

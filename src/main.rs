@@ -53,6 +53,14 @@ enum OutputFormat {
     Json,
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+enum WitnessBackend {
+    /// Use the WASM witness generator via Wasmtime (default).
+    Wasm,
+    /// Use the C++ witness generator (faster for large circuits).
+    Cpp,
+}
+
 #[derive(Debug, clap::Args)]
 struct RecordArgs {
     /// Path to the Circom source (.circom) file.
@@ -67,6 +75,13 @@ struct RecordArgs {
     /// Output format for the trace data.
     #[arg(short = 'f', long, default_value = "binary")]
     format: OutputFormat,
+
+    /// Witness generator backend to use.
+    ///
+    /// The C++ backend is faster for large circuits but requires
+    /// gcc/make in the dev shell.
+    #[arg(short = 'b', long, default_value = "wasm")]
+    backend: WitnessBackend,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,13 +121,18 @@ fn record(args: RecordArgs) -> Result<()> {
         OutputFormat::Json => TraceEventsFileFormat::Json,
     };
 
+    let use_cpp = matches!(args.backend, WitnessBackend::Cpp);
+    if use_cpp {
+        eprintln!("Using C++ witness generator backend");
+    }
+
     // 2. Create the output directory
     let out_dir = &args.out_dir;
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
     // 3. Run the recorder
-    codetracer_circom_recorder::recorder::record(&source_path, out_dir, format)?;
+    codetracer_circom_recorder::recorder::record(&source_path, out_dir, format, use_cpp)?;
 
     eprintln!("Trace files written to {}", out_dir.display());
 
