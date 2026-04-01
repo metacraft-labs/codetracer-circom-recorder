@@ -46,7 +46,10 @@ impl SignalPath {
     /// - `"main.comp.arr[3]"` -> components: `[main, comp, arr[3]]`
     pub fn parse(name: &str) -> Self {
         let parts: Vec<&str> = name.split('.').collect();
-        let components = parts.iter().map(|part| parse_path_component(part)).collect();
+        let components = parts
+            .iter()
+            .map(|part| parse_path_component(part))
+            .collect();
         SignalPath { components }
     }
 
@@ -107,10 +110,7 @@ fn parse_path_component(s: &str) -> PathComponent {
     if let Some(bracket_pos) = s.find('[') {
         let name = s[..bracket_pos].to_string();
         let index_str = &s[bracket_pos + 1..];
-        let index = index_str
-            .trim_end_matches(']')
-            .parse::<usize>()
-            .ok();
+        let index = index_str.trim_end_matches(']').parse::<usize>().ok();
         PathComponent { name, index }
     } else {
         PathComponent {

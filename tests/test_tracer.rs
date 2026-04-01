@@ -263,10 +263,8 @@ fn test_circom_step_events() {
     let events = load_trace_events(&out_dir);
 
     // Count Step events.
-    let step_events: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e.get("Step").is_some())
-        .collect();
+    let step_events: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e.get("Step").is_some()).collect();
 
     // flow_test.circom has 5 signal declarations + 5 assignments = at least 10 steps.
     assert!(
@@ -282,7 +280,9 @@ fn test_circom_step_events() {
             step.get("path_id").is_some(),
             "Step event should have path_id field"
         );
-        let line = step["line"].as_i64().expect("Step line should be an integer");
+        let line = step["line"]
+            .as_i64()
+            .expect("Step line should be an integer");
         assert!(line > 0, "Step line should be positive, got {}", line);
         // Lines should be within the source file range (19 lines).
         assert!(
@@ -424,10 +424,7 @@ fn test_circom_cli_record() {
     assert!(!events.is_empty(), "CLI trace should have events");
 
     let step_count = events.iter().filter(|e| e.get("Step").is_some()).count();
-    assert!(
-        step_count > 0,
-        "CLI trace should contain Step events"
-    );
+    assert!(step_count > 0, "CLI trace should contain Step events");
 
     // Verify values are present in the CLI-produced trace too.
     let int_values = collect_int_values(&events);
@@ -452,14 +449,11 @@ fn test_circom_tracer_paths_valid() {
     let source_path = test_programs_dir().join("flow_test.circom");
     run_tracer_on_file(&source_path, &out_dir);
 
-    let paths_content = std::fs::read_to_string(out_dir.join("trace_paths.json"))
-        .expect("failed to read paths");
+    let paths_content =
+        std::fs::read_to_string(out_dir.join("trace_paths.json")).expect("failed to read paths");
     let paths: serde_json::Value =
         serde_json::from_str(&paths_content).expect("trace_paths.json should be valid JSON");
-    assert!(
-        paths.is_array(),
-        "trace_paths.json should be a JSON array"
-    );
+    assert!(paths.is_array(), "trace_paths.json should be a JSON array");
     let paths_arr = paths.as_array().unwrap();
     assert!(
         !paths_arr.is_empty(),
@@ -529,7 +523,10 @@ fn test_circom_component_circuit() {
     run_tracer_on_file(&source_path, &out_dir);
 
     let events = load_trace_events(&out_dir);
-    assert!(!events.is_empty(), "component_test trace should have events");
+    assert!(
+        !events.is_empty(),
+        "component_test trace should have events"
+    );
 
     // The circuit has sub-component signals like adder.a, adder.b, adder.out.
     // These should appear in the trace as variable names.
@@ -565,10 +562,7 @@ fn test_circom_array_circuit() {
 
     // Check that step events exist.
     let step_count = events.iter().filter(|e| e.get("Step").is_some()).count();
-    assert!(
-        step_count > 0,
-        "array_test trace should have step events"
-    );
+    assert!(step_count > 0, "array_test trace should have step events");
 
     // Check that value events exist.
     let int_values = collect_int_values(&events);
@@ -584,7 +578,7 @@ fn test_circom_array_circuit() {
 
 #[test]
 fn test_signal_hierarchy_from_component_circuit() {
-    use codetracer_circom_recorder::signal_hierarchy::{SignalPath, build_hierarchy};
+    use codetracer_circom_recorder::signal_hierarchy::{build_hierarchy, SignalPath};
 
     // Simulate what a component_test.circom .sym file would produce.
     let signals = vec![
@@ -623,7 +617,7 @@ fn test_signal_hierarchy_from_component_circuit() {
 
 #[test]
 fn test_signal_hierarchy_from_array_circuit() {
-    use codetracer_circom_recorder::signal_hierarchy::{SignalPath, build_hierarchy};
+    use codetracer_circom_recorder::signal_hierarchy::{build_hierarchy, SignalPath};
 
     // Simulate what an array_test.circom .sym file would produce.
     let signals = vec![
