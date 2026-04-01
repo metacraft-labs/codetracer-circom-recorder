@@ -20,9 +20,14 @@ pub fn record(
     source_path: &Path,
     out_dir: &Path,
     format: TraceEventsFileFormat,
+    use_cpp: bool,
 ) -> Result<()> {
     let source_code = std::fs::read_to_string(source_path)
         .with_context(|| format!("failed to read source file: {}", source_path.display()))?;
 
-    CircomTracer::trace_program(source_path, &source_code, out_dir, format)
+    if use_cpp {
+        CircomTracer::trace_program_cpp(source_path, &source_code, out_dir, format)
+    } else {
+        CircomTracer::trace_program(source_path, &source_code, out_dir, format)
+    }
 }
