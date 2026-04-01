@@ -118,6 +118,7 @@ fn call_i32(func: &Func, store: &mut Store<()>) -> Result<i32> {
 /// 3. For each input signal, hash the name, write values to shared memory,
 ///    and call `setInputSignal(hMSB, hLSB, index)`
 /// 4. Read back all witness values via `getWitness(i)` + `readSharedRWMemory(j)`
+#[allow(clippy::needless_range_loop)]
 fn calculate_witness(
     wasm_path: &Path,
     inputs: &HashMap<String, Vec<String>>,
@@ -736,6 +737,7 @@ impl CircomTracer {
     }
 
     /// Emit trace events by walking through the source code.
+    #[allow(clippy::too_many_arguments)]
     fn emit_source_trace(
         &mut self,
         source_path: &Path,
