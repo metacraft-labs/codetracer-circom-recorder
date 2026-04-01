@@ -93,10 +93,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Record(args) => record(args),
         Commands::Version => {
-            println!(
-                "codetracer-circom-recorder {}",
-                env!("CARGO_PKG_VERSION")
-            );
+            println!("codetracer-circom-recorder {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }

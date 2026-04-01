@@ -10,13 +10,13 @@ use std::process::Command;
 
 use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer::trace_writer::TraceWriter;
-use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
-use eyre::{Context, Result, eyre};
+use codetracer_trace_writer::{create_trace_writer, TraceEventsFileFormat};
+use eyre::{eyre, Context, Result};
 use num_bigint::BigUint;
 use wasmtime::{Engine, Func, Linker, Module, Store, Val};
 
 use crate::cpp_witness::{self, CompilerSourceMap};
-use crate::signal_hierarchy::{SignalPath, build_hierarchy};
+use crate::signal_hierarchy::{build_hierarchy, SignalPath};
 use crate::source_map::SourceMap;
 
 /// Convert a wasmtime error to an eyre error.
@@ -145,9 +145,7 @@ fn calculate_witness(
         .func_wrap("runtime", "showSharedRWMemory", || {})
         .map_err(wasm_err)?;
 
-    let instance = linker
-        .instantiate(&mut store, &module)
-        .map_err(wasm_err)?;
+    let instance = linker.instantiate(&mut store, &module).map_err(wasm_err)?;
 
     // Get exported functions.
     let mut get_fn = |name: &str| -> Result<Func> {
@@ -427,7 +425,11 @@ impl CircomTracer {
             if stderr.contains("srcmap") || stderr.contains("unrecognized") {
                 eprintln!("Compiler doesn't support --srcmap, retrying without it");
                 return Self::trace_program_no_srcmap(
-                    source_path, source_code, out_dir, format, use_cpp,
+                    source_path,
+                    source_code,
+                    out_dir,
+                    format,
+                    use_cpp,
                 );
             }
             let stdout = String::from_utf8_lossy(&compile_output.stdout);
@@ -493,8 +495,7 @@ impl CircomTracer {
         // Only set inputs for the main component's template (not sub-component templates).
         let signal_decls = parse_signal_declarations(source_code);
         let main_template_name = find_main_template_name(source_code);
-        let main_template_inputs =
-            find_template_inputs(source_code, main_template_name.as_deref());
+        let main_template_inputs = find_template_inputs(source_code, main_template_name.as_deref());
         let mut inputs: HashMap<String, Vec<String>> = HashMap::new();
         for input_name in &main_template_inputs {
             // Default input value is "0". In a real usage, inputs would come
@@ -591,12 +592,10 @@ impl CircomTracer {
         )?;
 
         // -- 11. Finish writing -----------------------------------------------------------
-        TraceWriter::finish_writing_trace_events(&mut *tracer.writer)
-            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
         TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
             .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer)
-            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
 
         Ok(())
     }
@@ -660,8 +659,7 @@ impl CircomTracer {
         let symbols = parse_sym_file(&sym_path)?;
         let signal_decls = parse_signal_declarations(source_code);
         let main_template_name = find_main_template_name(source_code);
-        let main_template_inputs =
-            find_template_inputs(source_code, main_template_name.as_deref());
+        let main_template_inputs = find_template_inputs(source_code, main_template_name.as_deref());
         let mut inputs: HashMap<String, Vec<String>> = HashMap::new();
         for input_name in &main_template_inputs {
             inputs.insert(input_name.clone(), vec!["0".to_string()]);
@@ -729,12 +727,10 @@ impl CircomTracer {
             None,
         )?;
 
-        TraceWriter::finish_writing_trace_events(&mut *tracer.writer)
-            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
         TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
             .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer)
-            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
 
         Ok(())
     }
@@ -765,20 +761,12 @@ impl CircomTracer {
 
         // Emit Step events for signal declarations.
         for sig in signals {
-            TraceWriter::register_step(
-                &mut *self.writer,
-                source_path,
-                Line(sig.line as i64),
-            );
+            TraceWriter::register_step(&mut *self.writer, source_path, Line(sig.line as i64));
         }
 
         // Emit Step + Value events for signal assignments.
         for assign in assignments {
-            TraceWriter::register_step(
-                &mut *self.writer,
-                source_path,
-                Line(assign.line as i64),
-            );
+            TraceWriter::register_step(&mut *self.writer, source_path, Line(assign.line as i64));
 
             if let Some(&val) = values.get(&assign.target) {
                 let value = ValueRecord::Int {
@@ -984,7 +972,11 @@ fn find_template_inputs(source: &str, template_name: Option<&str>) -> Vec<String
 
             // Parse signal input declarations within this template.
             if trimmed.starts_with("signal input ") {
-                let name = trimmed[13..].trim().trim_end_matches(';').trim().to_string();
+                let name = trimmed[13..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim()
+                    .to_string();
                 if !name.is_empty() {
                     inputs.push(name);
                 }
@@ -1086,11 +1078,7 @@ template FlowTest() {
     fn test_parse_sym_file() {
         let dir = tempfile::tempdir().unwrap();
         let sym_path = dir.path().join("test.sym");
-        std::fs::write(
-            &sym_path,
-            "1,1,0,main.out\n2,-1,0,main.in\n3,-1,0,main.a\n",
-        )
-        .unwrap();
+        std::fs::write(&sym_path, "1,1,0,main.out\n2,-1,0,main.in\n3,-1,0,main.a\n").unwrap();
 
         let entries = parse_sym_file(&sym_path).unwrap();
         assert_eq!(entries.len(), 3);

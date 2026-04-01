@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use eyre::{Context, Result, eyre};
+use eyre::{eyre, Context, Result};
 use num_bigint::BigUint;
 use serde::Deserialize;
 
@@ -72,14 +72,9 @@ impl CompilerSourceMap {
     }
 
     /// Look up the source location for a signal by template and signal name.
-    pub fn find_signal(
-        &self,
-        template_name: &str,
-        signal_name: &str,
-    ) -> Option<&SrcMapEntry> {
+    pub fn find_signal(&self, template_name: &str, signal_name: &str) -> Option<&SrcMapEntry> {
         self.mappings.iter().find(|e| {
-            e.template_name == template_name
-                && e.signal_name.as_deref() == Some(signal_name)
+            e.template_name == template_name && e.signal_name.as_deref() == Some(signal_name)
         })
     }
 
@@ -93,7 +88,10 @@ impl CompilerSourceMap {
 
     /// Resolve a file ID to a file path.
     pub fn file_path(&self, file_id: usize) -> Option<&str> {
-        self.files.iter().find(|f| f.id == file_id).map(|f| f.path.as_str())
+        self.files
+            .iter()
+            .find(|f| f.id == file_id)
+            .map(|f| f.path.as_str())
     }
 }
 
@@ -112,10 +110,7 @@ impl CompilerSourceMap {
 /// - `<stem>_cpp/Makefile` — build script
 ///
 /// We compile with `-g` for debug symbols and `-O0` to preserve structure.
-pub fn compile_cpp_witness(
-    compile_dir: &Path,
-    stem: &str,
-) -> Result<PathBuf> {
+pub fn compile_cpp_witness(compile_dir: &Path, stem: &str) -> Result<PathBuf> {
     let cpp_dir = compile_dir.join(format!("{stem}_cpp"));
 
     if !cpp_dir.exists() {
@@ -178,14 +173,16 @@ pub fn run_cpp_witness(
         .arg(input_json_path)
         .arg(output_wtns_path)
         .output()
-        .with_context(|| format!("failed to run C++ witness generator: {}", binary_path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to run C++ witness generator: {}",
+                binary_path.display()
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(eyre!(
-            "C++ witness generator failed:\n{}",
-            stderr
-        ));
+        return Err(eyre!("C++ witness generator failed:\n{}", stderr));
     }
 
     // Parse the .wtns file
@@ -237,8 +234,7 @@ fn parse_wtns_file(path: &Path) -> Result<Vec<BigUint>> {
         }
 
         let section_type = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        let section_size =
-            u64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap()) as usize;
+        let section_size = u64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap()) as usize;
         pos += 12;
 
         if section_type == 1 {
@@ -251,9 +247,9 @@ fn parse_wtns_file(path: &Path) -> Result<Vec<BigUint>> {
             if pos + 4 + n8 + 4 > data.len() {
                 return Err(eyre!(".wtns field info truncated"));
             }
-            witness_count = u32::from_le_bytes(
-                data[pos + 4 + n8..pos + 4 + n8 + 4].try_into().unwrap(),
-            ) as usize;
+            witness_count =
+                u32::from_le_bytes(data[pos + 4 + n8..pos + 4 + n8 + 4].try_into().unwrap())
+                    as usize;
         } else if section_type == 2 {
             // Witness data section
             witness_data_start = pos;
@@ -284,12 +280,9 @@ fn parse_wtns_file(path: &Path) -> Result<Vec<BigUint>> {
 /// Write an input JSON file for the witness generator.
 ///
 /// Format: `{"signal_name": ["value", ...], ...}`
-pub fn write_input_json(
-    path: &Path,
-    inputs: &HashMap<String, Vec<String>>,
-) -> Result<()> {
-    let json = serde_json::to_string_pretty(inputs)
-        .with_context(|| "failed to serialize input JSON")?;
+pub fn write_input_json(path: &Path, inputs: &HashMap<String, Vec<String>>) -> Result<()> {
+    let json =
+        serde_json::to_string_pretty(inputs).with_context(|| "failed to serialize input JSON")?;
     std::fs::write(path, json)
         .with_context(|| format!("failed to write input JSON: {}", path.display()))?;
     Ok(())
