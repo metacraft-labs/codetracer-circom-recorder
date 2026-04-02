@@ -596,6 +596,9 @@ impl CircomTracer {
             compiler_srcmap.as_ref(),
         )?;
 
+        // Close the <toplevel> call that start() opened.
+        TraceWriter::register_return(&mut *tracer.writer, NONE_VALUE);
+
         // -- 11. Finish writing -----------------------------------------------------------
         TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
         TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
@@ -736,6 +739,9 @@ impl CircomTracer {
             None,
         )?;
 
+        // Close the <toplevel> call that start() opened.
+        TraceWriter::register_return(&mut *tracer.writer, NONE_VALUE);
+
         TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
         TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
             .map_err(|e| eyre!("{e}"))?;
@@ -759,14 +765,27 @@ impl CircomTracer {
         let field_type_id = self.field_type_id.unwrap();
 
         // Emit a Call for each template.
-        for template in templates {
-            let fn_id = TraceWriter::ensure_function_id(
+        //
+        // The first template (the "main" component) is NOT emitted as a nested
+        // Call because TraceWriter::start() already created a <toplevel> Call at
+        // depth 0. Emitting register_call for the main template would push all
+        // subsequent steps to depth 1, which breaks the db-backend's step-over
+        // logic: step-over from the initial position (depth 0) would skip every
+        // step at depth 1 and land at the end of the trace.
+        //
+        // We still register the function metadata via ensure_function_id so it
+        // appears in the function list, but we only emit Call/Return events for
+        // sub-component templates (index > 0).
+        for (i, template) in templates.iter().enumerate() {
+            let _fn_id = TraceWriter::ensure_function_id(
                 &mut *self.writer,
                 &template.name,
                 source_path,
                 Line(template.line as i64),
             );
-            TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
+            if i > 0 {
+                TraceWriter::register_call(&mut *self.writer, _fn_id, vec![]);
+            }
         }
 
         // Emit Step events for signal declarations.
@@ -791,9 +810,12 @@ impl CircomTracer {
             }
         }
 
-        // Emit Return for each template.
-        for _template in templates {
-            TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
+        // Emit Return for each template (skip the first/main template — its
+        // steps live under <toplevel> which is closed by finalize()).
+        for (i, _template) in templates.iter().enumerate() {
+            if i > 0 {
+                TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
+            }
         }
 
         Ok(())
