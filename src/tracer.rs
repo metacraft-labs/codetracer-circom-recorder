@@ -9,8 +9,8 @@ use std::path::Path;
 use std::process::Command;
 
 use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
-use codetracer_trace_writer::trace_writer::TraceWriter;
-use codetracer_trace_writer::{create_trace_writer, TraceEventsFileFormat};
+use codetracer_trace_writer_nim::trace_writer::TraceWriter;
+use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
 use num_bigint::BigUint;
 use wasmtime::{Engine, Func, Linker, Module, Store, Val};
@@ -565,7 +565,7 @@ impl CircomTracer {
 
         let events_filename = match format {
             TraceEventsFileFormat::Json => "trace.json",
-            TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 => "trace.bin",
+            TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 | TraceEventsFileFormat::Ctfs => "trace.bin",
         };
         let events_path = out_dir.join(events_filename);
         let metadata_path = out_dir.join("trace_metadata.json");
@@ -710,7 +710,7 @@ impl CircomTracer {
 
         let events_filename = match format {
             TraceEventsFileFormat::Json => "trace.json",
-            TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 => "trace.bin",
+            TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 | TraceEventsFileFormat::Ctfs => "trace.bin",
         };
         let events_path = out_dir.join(events_filename);
         let metadata_path = out_dir.join("trace_metadata.json");
