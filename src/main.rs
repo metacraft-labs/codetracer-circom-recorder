@@ -9,8 +9,14 @@
 //! ```text
 //! codetracer-circom-recorder record <circom-file> \
 //!     --out-dir <output-dir> \
-//!     [--format binary|json]
+//!     [--format ctfs|binary|json]
 //! ```
+//!
+//! The default output format is `ctfs` — the canonical CodeTracer
+//! multi-stream container that the Nim `ct_reader_*` FFI and the
+//! db-backend's `CTFSTraceReader` consume directly.  `binary`
+//! (legacy CBOR + Zstd) and `json` (human-readable) are kept for
+//! compatibility / debugging.
 
 use std::path::PathBuf;
 
@@ -47,10 +53,52 @@ enum Commands {
     Version,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+/// Output format for the trace files.
+///
+/// `Ctfs` is the canonical CodeTracer multi-stream container (the
+/// format the Nim `ct_reader_*` FFI and the db-backend's
+/// `CTFSTraceReader` consume directly) and is the default.  `Binary`
+/// is the legacy CBOR + Zstd container kept for compatibility with
+/// older readers.  `Json` is a slower, human-readable form useful
+/// for debugging.
+///
+/// Same shape as the audited recorders (EVM 1.39, Solana 1.44, Move
+/// 1.46, Cardano 1.48, Cairo 1.50, Flow 1.52, Fuel 1.53, PolkaVM
+/// 1.55, Miden 1.56, TON 1.57) so `From<OutputFormat>` collapses each
+/// dispatch site to `args.format.into()`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
+    /// Canonical CodeTracer multi-stream container (recommended; default).
+    Ctfs,
+    /// Legacy CBOR + Zstd binary format.
     Binary,
+    /// Human-readable JSON (slower; useful for debugging).
     Json,
+}
+
+impl From<OutputFormat> for TraceEventsFileFormat {
+    fn from(fmt: OutputFormat) -> Self {
+        match fmt {
+            OutputFormat::Ctfs => TraceEventsFileFormat::Ctfs,
+            OutputFormat::Binary => TraceEventsFileFormat::Binary,
+            OutputFormat::Json => TraceEventsFileFormat::Json,
+        }
+    }
+}
+
+impl OutputFormat {
+    /// Stable string representation suitable for `trace_metadata.json`'s
+    /// `format` field.  Wired here for forward compatibility with the
+    /// audit-aligned metadata emission path used by other recorders;
+    /// not yet consumed by the writer plumbing in this crate.
+    #[allow(dead_code)]
+    fn as_str(self) -> &'static str {
+        match self {
+            OutputFormat::Ctfs => "ctfs",
+            OutputFormat::Binary => "binary",
+            OutputFormat::Json => "json",
+        }
+    }
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -73,7 +121,7 @@ struct RecordArgs {
     out_dir: PathBuf,
 
     /// Output format for the trace data.
-    #[arg(short = 'f', long, default_value = "binary")]
+    #[arg(short = 'f', long, default_value = "ctfs")]
     format: OutputFormat,
 
     /// Witness generator backend to use.
@@ -113,10 +161,7 @@ fn record(args: RecordArgs) -> Result<()> {
 
     eprintln!("Source file: {}", source_path.display());
 
-    let format = match args.format {
-        OutputFormat::Binary => TraceEventsFileFormat::Binary,
-        OutputFormat::Json => TraceEventsFileFormat::Json,
-    };
+    let format: TraceEventsFileFormat = args.format.into();
 
     let use_cpp = matches!(args.backend, WitnessBackend::Cpp);
     if use_cpp {

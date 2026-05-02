@@ -346,6 +346,15 @@ struct TemplateDef {
     name: String,
     /// 1-based line number of the `template` keyword.
     line: u32,
+    /// Names of `signal input` declarations inside this template, in source
+    /// order.  Used as the formal-parameter list when staging `register_call`
+    /// arguments through `writer.arg(name, NONE_VALUE)` (audit checklist (c)).
+    /// Circom templates do not have a conventional parameter list at the AST
+    /// level for their *signal* inputs (only their generic `template T(N)`
+    /// numeric parameters do, and those are compile-time); the recorder
+    /// surfaces the input-signal names because they are the analogue users
+    /// see in the calltrace pane (`adder.a`, `adder.b` etc.).
+    input_signals: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -786,6 +795,19 @@ impl CircomTracer {
                 Line(template.line as i64),
             );
             if i > 0 {
+                // Audit checklist (c): stage each declared input-signal name
+                // through `writer.arg(name, NONE_VALUE)` immediately before
+                // `register_call` so the calltrace pane's `.call-arg` rows
+                // match the source.  Run-time values remain `NONE_VALUE`
+                // because the recorder does not yet propagate per-component
+                // input bindings (the `comp.in <== expr` assignment is parsed
+                // but not threaded back to its template's parameter list);
+                // tracked as an open follow-up in AUDIT-CTFS-2026-05.md.
+                // Same staging shape as Miden 1.56 (operand stack), TON 1.57
+                // (declared func.params), and PolkaVM 1.55 (Ecalli A0..A5).
+                for input_name in &template.input_signals {
+                    let _ = TraceWriter::arg(&mut *self.writer, input_name, NONE_VALUE);
+                }
                 TraceWriter::register_call(&mut *self.writer, _fn_id, vec![]);
             }
         }
@@ -914,27 +936,75 @@ fn parse_signal_assignments(source: &str) -> Vec<SignalAssignment> {
 }
 
 /// Parse template definitions from Circom source code.
+///
+/// In addition to the template name and source line, this also captures the
+/// list of `signal input` declarations inside each template body in source
+/// order — these are surfaced as formal parameters when staging
+/// `register_call` arguments (audit checklist (c) for the Circom recorder).
 fn parse_template_definitions(source: &str) -> Vec<TemplateDef> {
     let mut templates = Vec::new();
+    let mut current: Option<(TemplateDef, i32)> = None; // (template, brace_depth)
 
     for (line_idx, line_text) in source.lines().enumerate() {
         let line_num = (line_idx + 1) as u32;
         let trimmed = line_text.trim();
 
-        let after_template = if let Some(rest) = trimmed.strip_prefix("template ") {
-            rest
-        } else {
-            continue;
-        };
-        if let Some(paren_pos) = after_template.find('(') {
-            let name = after_template[..paren_pos].trim().to_string();
-            if !name.is_empty() {
-                templates.push(TemplateDef {
-                    name,
-                    line: line_num,
-                });
+        // Detect template-definition headers.  We only treat the line as a
+        // template start when there is no template currently in scope; nested
+        // templates are not legal in Circom.
+        if current.is_none() {
+            if let Some(after_template) = trimmed.strip_prefix("template ") {
+                if let Some(paren_pos) = after_template.find('(') {
+                    let name = after_template[..paren_pos].trim().to_string();
+                    if !name.is_empty() {
+                        current = Some((
+                            TemplateDef {
+                                name,
+                                line: line_num,
+                                input_signals: Vec::new(),
+                            },
+                            0,
+                        ));
+                    }
+                }
             }
         }
+
+        // Inside the current template, scan for `signal input` declarations
+        // and track brace depth so we know when the body ends.
+        if let Some((tmpl, depth)) = current.as_mut() {
+            if let Some(rest) = trimmed.strip_prefix("signal input ") {
+                let name = rest.trim().trim_end_matches(';').trim().to_string();
+                if !name.is_empty() {
+                    tmpl.input_signals.push(name);
+                }
+            }
+
+            // Update brace depth.  We do this *after* the input-signal scan
+            // so the `template Foo() {` header line itself counts as +1
+            // and a closing `}` on its own line correctly drops depth to 0.
+            for ch in trimmed.chars() {
+                match ch {
+                    '{' => *depth += 1,
+                    '}' => {
+                        *depth -= 1;
+                        if *depth <= 0 {
+                            // Body closed — emit the template and reset.
+                            let (tmpl, _) = current.take().unwrap();
+                            templates.push(tmpl);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // If parsing ended mid-template (malformed source), still surface what we
+    // collected so the recorder degrades gracefully.
+    if let Some((tmpl, _)) = current {
+        templates.push(tmpl);
     }
 
     templates
@@ -1102,6 +1172,34 @@ template FlowTest() {
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].name, "FlowTest");
         assert_eq!(templates[0].line, 1);
+        // Empty body — no `signal input` declarations.
+        assert!(templates[0].input_signals.is_empty());
+    }
+
+    #[test]
+    fn test_parse_template_definitions_collects_input_signals() {
+        // The parser must surface each `signal input <name>;` declaration
+        // inside a template body, in source order, so audit checklist (c)'s
+        // `writer.arg(name, NONE_VALUE)` staging path has data to emit.
+        // This mirrors the structure of `component_test.circom` where
+        // `Adder` has two input signals (`a`, `b`).
+        let source = "template Adder() {\n\
+                      \x20\x20\x20\x20signal input a;\n\
+                      \x20\x20\x20\x20signal input b;\n\
+                      \x20\x20\x20\x20signal output out;\n\
+                      \x20\x20\x20\x20out <== a + b;\n\
+                      }\n\
+                      template Outer() {\n\
+                      \x20\x20\x20\x20signal input x;\n\
+                      \x20\x20\x20\x20signal output y;\n\
+                      \x20\x20\x20\x20y <== x;\n\
+                      }\n";
+        let templates = parse_template_definitions(source);
+        assert_eq!(templates.len(), 2);
+        assert_eq!(templates[0].name, "Adder");
+        assert_eq!(templates[0].input_signals, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(templates[1].name, "Outer");
+        assert_eq!(templates[1].input_signals, vec!["x".to_string()]);
     }
 
     #[test]
