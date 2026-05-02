@@ -19,11 +19,18 @@ fn test_programs_dir() -> PathBuf {
 }
 
 /// Helper: run the tracer on a Circom source file and return the output directory.
+///
+/// Uses `TraceEventsFileFormat::Ctfs` explicitly so the test exercises the
+/// canonical multi-stream container path.  Pre-1.58 this passed `Json`; that
+/// only happened to produce a valid `.ct` because the underlying Nim writer
+/// dispatches `Json` and `Ctfs` identically for the multi-stream path today
+/// (see `TraceEventsFileFormat::to_ffi`).  Touching this to `Ctfs` removes
+/// the silent dependency on that quirk.
 fn run_tracer_on_file(source_path: &Path, out_dir: &Path) {
     codetracer_circom_recorder::recorder::record(
         source_path,
         out_dir,
-        TraceEventsFileFormat::Json,
+        TraceEventsFileFormat::Ctfs,
         false, // use WASM backend
     )
     .expect("trace_program should succeed");
@@ -169,7 +176,7 @@ fn test_circom_cli_record() {
             "--out-dir",
             out_dir.to_str().unwrap(),
             "--format",
-            "json",
+            "ctfs",
         ])
         .output()
         .expect("failed to run");
