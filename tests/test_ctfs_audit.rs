@@ -12,6 +12,8 @@
 //!     instantiate sub-component templates with input signals.
 //!   * Audit (d) — compile / witness failures route through
 //!     `register_special_event(EventLogKind::Error, ..., message)`.
+//!   * Audit (d) — Circom `log()` output routes through
+//!     `register_special_event(EventLogKind::EvmEvent, "circom_log", message)`.
 
 use std::path::PathBuf;
 
@@ -236,5 +238,46 @@ fn circom_compile_error_emits_error_special_event() {
                     || event.content.contains("failed to run circom compiler"))
         }),
         "expected circom_compile_error special event, got {special_events:?}"
+    );
+}
+
+#[test]
+fn circom_log_directive_emits_evm_event_special_event() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source_path = tmp.path().join("logged.circom");
+    let out_dir = tmp.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(
+        &source_path,
+        concat!(
+            "pragma circom 2.0.4;\n\n",
+            "template Logged() {\n",
+            "    signal input in;\n",
+            "    signal output out;\n",
+            "    out <== in + 1;\n",
+            "    log(\"input\", in, \"out\", out);\n",
+            "}\n\n",
+            "component main = Logged();\n",
+        ),
+    )
+    .unwrap();
+
+    codetracer_circom_recorder::recorder::record(
+        &source_path,
+        &out_dir,
+        TraceEventsFileFormat::Ctfs,
+        false,
+    )
+    .expect("record should succeed");
+
+    let ct_path = find_ct_file(&out_dir);
+    let special_events = read_special_events(&ct_path);
+    assert!(
+        special_events.iter().any(|event| {
+            event.kind == "stderr"
+                && event.content.contains("input 0")
+                && event.content.contains("out 1")
+        }),
+        "expected circom_log EvmEvent special event, got {special_events:?}"
     );
 }

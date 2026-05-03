@@ -13,7 +13,7 @@ use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
 use num_bigint::BigUint;
-use wasmtime::{Engine, Func, Linker, Module, Store, Val};
+use wasmtime::{Caller, Engine, Func, Linker, Module, Store, Val};
 
 use crate::cpp_witness::{self, CompilerSourceMap};
 use crate::signal_hierarchy::{build_hierarchy, SignalPath};
@@ -101,7 +101,7 @@ fn fnv_hash(name: &str) -> u64 {
 }
 
 /// Helper to call a WASM function that takes no args and returns one i32.
-fn call_i32(func: &Func, store: &mut Store<()>) -> Result<i32> {
+fn call_i32<T>(func: &Func, store: &mut Store<T>) -> Result<i32> {
     let mut results = [Val::I32(0)];
     func.call(store, &[], &mut results).map_err(wasm_err)?;
     match results[0] {
@@ -110,7 +110,75 @@ fn call_i32(func: &Func, store: &mut Store<()>) -> Result<i32> {
     }
 }
 
-/// Run the circom WASM witness generator and return all witness values.
+#[derive(Default)]
+struct WitnessRuntime {
+    log_buffer: String,
+    logs: Vec<String>,
+}
+
+struct WitnessCalculation {
+    witness: Vec<BigUint>,
+    logs: Vec<String>,
+}
+
+fn read_message_from_caller(caller: &mut Caller<'_, WitnessRuntime>) -> Option<String> {
+    let get_message_char = caller
+        .get_export("getMessageChar")
+        .and_then(|export| export.into_func())?;
+
+    let mut message = String::new();
+    loop {
+        let mut results = [Val::I32(0)];
+        get_message_char
+            .call(&mut *caller, &[], &mut results)
+            .ok()?;
+        let ch = results[0].unwrap_i32();
+        if ch == 0 {
+            break;
+        }
+        message.push(char::from_u32(ch as u32).unwrap_or(char::REPLACEMENT_CHARACTER));
+    }
+    Some(message)
+}
+
+fn shared_rw_memory_value_from_caller(caller: &mut Caller<'_, WitnessRuntime>) -> Option<BigUint> {
+    let get_field_num_len32 = caller
+        .get_export("getFieldNumLen32")
+        .and_then(|export| export.into_func())?;
+    let read_shared_rw_memory = caller
+        .get_export("readSharedRWMemory")
+        .and_then(|export| export.into_func())?;
+
+    let mut n32_result = [Val::I32(0)];
+    get_field_num_len32
+        .call(&mut *caller, &[], &mut n32_result)
+        .ok()?;
+    let n32 = n32_result[0].unwrap_i32() as usize;
+
+    let mut limbs = vec![0u32; n32];
+    for (j, limb) in limbs.iter_mut().enumerate() {
+        let mut results = [Val::I32(0)];
+        read_shared_rw_memory
+            .call(&mut *caller, &[Val::I32(j as i32)], &mut results)
+            .ok()?;
+        *limb = results[0].unwrap_i32() as u32;
+    }
+
+    Some(from_array32_le(&limbs))
+}
+
+fn append_log_part(runtime: &mut WitnessRuntime, part: &str) {
+    if !runtime.log_buffer.is_empty() {
+        runtime.log_buffer.push(' ');
+    }
+    runtime.log_buffer.push_str(part);
+}
+
+/// Run the circom WASM witness generator and return all witness values and
+/// `log()` directive output captured through the generated runtime callbacks.
+///
+/// Circom `log()` is documented as witness-generation debug output:
+/// https://docs.circom.io/circom-language/code-quality/debugging-operations/
 ///
 /// This implements the same protocol as Circom's JavaScript witness_calculator:
 /// 1. Load the WASM module via Wasmtime
@@ -122,14 +190,14 @@ fn call_i32(func: &Func, store: &mut Store<()>) -> Result<i32> {
 fn calculate_witness(
     wasm_path: &Path,
     inputs: &HashMap<String, Vec<String>>,
-) -> Result<Vec<BigUint>> {
+) -> Result<WitnessCalculation> {
     let wasm_bytes = std::fs::read(wasm_path)
         .with_context(|| format!("failed to read WASM file: {}", wasm_path.display()))?;
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm_bytes).map_err(wasm_err)?;
 
-    let mut store = Store::new(&engine, ());
+    let mut store = Store::new(&engine, WitnessRuntime::default());
     let mut linker = Linker::new(&engine);
 
     // Register runtime callbacks that the circom WASM module imports.
@@ -137,13 +205,42 @@ fn calculate_witness(
         .func_wrap("runtime", "exceptionHandler", |_code: i32| {})
         .map_err(wasm_err)?;
     linker
-        .func_wrap("runtime", "printErrorMessage", || {})
+        .func_wrap(
+            "runtime",
+            "printErrorMessage",
+            |mut caller: Caller<'_, WitnessRuntime>| {
+                let _ = read_message_from_caller(&mut caller);
+            },
+        )
         .map_err(wasm_err)?;
     linker
-        .func_wrap("runtime", "writeBufferMessage", || {})
+        .func_wrap(
+            "runtime",
+            "writeBufferMessage",
+            |mut caller: Caller<'_, WitnessRuntime>| {
+                if let Some(message) = read_message_from_caller(&mut caller) {
+                    if message == "\n" {
+                        let runtime = caller.data_mut();
+                        if !runtime.log_buffer.is_empty() {
+                            runtime.logs.push(std::mem::take(&mut runtime.log_buffer));
+                        }
+                    } else {
+                        append_log_part(caller.data_mut(), &message);
+                    }
+                }
+            },
+        )
         .map_err(wasm_err)?;
     linker
-        .func_wrap("runtime", "showSharedRWMemory", || {})
+        .func_wrap(
+            "runtime",
+            "showSharedRWMemory",
+            |mut caller: Caller<'_, WitnessRuntime>| {
+                if let Some(value) = shared_rw_memory_value_from_caller(&mut caller) {
+                    append_log_part(caller.data_mut(), &value.to_string());
+                }
+            },
+        )
         .map_err(wasm_err)?;
 
     let instance = linker.instantiate(&mut store, &module).map_err(wasm_err)?;
@@ -276,7 +373,15 @@ fn calculate_witness(
         witness.push(from_array32_le(&arr));
     }
 
-    Ok(witness)
+    let mut runtime = store.into_data();
+    if !runtime.log_buffer.is_empty() {
+        runtime.logs.push(runtime.log_buffer);
+    }
+
+    Ok(WitnessCalculation {
+        witness,
+        logs: runtime.logs,
+    })
 }
 
 /// Convert little-endian u32 limbs to BigUint.
@@ -533,7 +638,7 @@ impl CircomTracer {
         }
 
         // -- 4. Run the witness generator -------------------------------------------------
-        let witness = if use_cpp {
+        let witness_result = if use_cpp {
             // C++ backend: compile and run the C++ witness generator
             let binary = match cpp_witness::compile_cpp_witness(compile_dir.path(), &stem) {
                 Ok(binary) => binary,
@@ -551,7 +656,10 @@ impl CircomTracer {
                 return Err(eyre!(msg));
             }
             match cpp_witness::run_cpp_witness(&binary, &input_json, &wtns_path) {
-                Ok(witness) => witness,
+                Ok(witness) => WitnessCalculation {
+                    witness,
+                    logs: Vec::new(),
+                },
                 Err(err) => {
                     let msg = format!("C++ witness generator failed: {err}");
                     tracer.finish_with_error("cpp_witness_error", &msg)?;
@@ -561,7 +669,7 @@ impl CircomTracer {
         } else {
             // WASM backend: use wasmtime
             match calculate_witness(&wasm_path, &inputs) {
-                Ok(witness) => witness,
+                Ok(result) => result,
                 Err(err) => {
                     let msg = format!("wasmtime witness generation failed: {err}");
                     tracer.finish_with_error("wasmtime_witness_error", &msg)?;
@@ -569,7 +677,9 @@ impl CircomTracer {
                 }
             }
         };
+        let WitnessCalculation { witness, logs } = witness_result;
         eprintln!("Computed witness with {} elements", witness.len());
+        tracer.emit_circom_logs(&logs);
 
         // -- 5. Map symbol names to values ------------------------------------------------
         let mut values: HashMap<String, i64> = HashMap::new();
@@ -684,6 +794,17 @@ impl CircomTracer {
         self.finish_trace()
     }
 
+    fn emit_circom_logs(&mut self, logs: &[String]) {
+        for message in logs {
+            TraceWriter::register_special_event(
+                &mut *self.writer,
+                EventLogKind::EvmEvent,
+                "circom_log",
+                message,
+            );
+        }
+    }
+
     /// Fallback when --srcmap is not supported by the compiler.
     fn trace_program_no_srcmap_with_tracer(
         mut tracer: CircomTracer,
@@ -764,7 +885,7 @@ impl CircomTracer {
             inputs.insert(input_name.clone(), vec!["0".to_string()]);
         }
 
-        let witness = if use_cpp {
+        let witness_result = if use_cpp {
             let binary = match cpp_witness::compile_cpp_witness(compile_dir.path(), &stem) {
                 Ok(binary) => binary,
                 Err(err) => {
@@ -781,7 +902,10 @@ impl CircomTracer {
                 return Err(eyre!(msg));
             }
             match cpp_witness::run_cpp_witness(&binary, &input_json, &wtns_path) {
-                Ok(witness) => witness,
+                Ok(witness) => WitnessCalculation {
+                    witness,
+                    logs: Vec::new(),
+                },
                 Err(err) => {
                     let msg = format!("C++ witness generator failed: {err}");
                     tracer.finish_with_error("cpp_witness_error", &msg)?;
@@ -790,7 +914,7 @@ impl CircomTracer {
             }
         } else {
             match calculate_witness(&wasm_path, &inputs) {
-                Ok(witness) => witness,
+                Ok(result) => result,
                 Err(err) => {
                     let msg = format!("wasmtime witness generation failed: {err}");
                     tracer.finish_with_error("wasmtime_witness_error", &msg)?;
@@ -798,6 +922,8 @@ impl CircomTracer {
                 }
             }
         };
+        let WitnessCalculation { witness, logs } = witness_result;
+        tracer.emit_circom_logs(&logs);
 
         let mut values: HashMap<String, i64> = HashMap::new();
         let mut full_name_values: Vec<(String, i64)> = Vec::new();
