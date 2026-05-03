@@ -87,7 +87,11 @@ fn test_circom_compile_and_run() {
     // Verify a valid .ct file was produced.
     let ct_path = assert_valid_ct_file(&out_dir);
     let size = std::fs::metadata(&ct_path).unwrap().len();
-    assert!(size > 100, ".ct file should have substantial content, got {} bytes", size);
+    assert!(
+        size > 100,
+        ".ct file should have substantial content, got {} bytes",
+        size
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -343,5 +347,9 @@ fn test_circom_all_intermediate_values() {
     // Verify a valid CTFS trace was produced.
     let ct_path = assert_valid_ct_file(&out_dir);
     let size = std::fs::metadata(&ct_path).unwrap().len();
-    assert!(size > 100, ".ct file should have substantial content, got {} bytes", size);
+    assert!(
+        size > 100,
+        ".ct file should have substantial content, got {} bytes",
+        size
+    );
 }

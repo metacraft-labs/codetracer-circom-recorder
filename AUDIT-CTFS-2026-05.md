@@ -89,6 +89,19 @@ explicit function-call boundaries with parameter lists.
 | h   | Obsolete `add_event` calls                                                                | OK                                                       | OK                                                                              | `grep -r 'add_event' src/` returns nothing. Recorder uses dedicated `register_*` entry points exclusively.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | i   | `#[no_mangle]` stubs colliding with upstream Nim exports                                  | OK                                                       | OK                                                                              | `grep -r '#\[no_mangle\]' src/` returns nothing. Recorder uses the `codetracer_trace_writer_nim` Rust API directly (sibling-path dep), not the C FFI.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
+2026-05-03 follow-up: audit row (d)'s Error portion is now closed for
+the Rust recorder pipeline. `CircomTracer::trace_program_with_backend`
+creates and starts the trace writer before invoking `circom`; compiler
+spawn/diagnostic failures route through
+`register_special_event(EventLogKind::Error, "circom_compile_error",
+msg)`, missing/malformed generated WASM or `.sym` witness-map state
+routes through `"wasm_witness_error"`, and wasmtime witness execution
+failures route through `"wasmtime_witness_error"`. C++ witness failures
+also route through `"cpp_witness_error"` to preserve the alternate backend's
+error trace. The CLI still returns `Err` after finalising the partial trace.
+The EvmEvent half of row (d), `log()` directive routing through
+`"circom_log"`, remains open.
+
 ## Concrete fixes applied
 
 ### 1. CLI now exposes and defaults to `Ctfs`
@@ -161,7 +174,7 @@ Witness values _are_ available in the `.sym`-keyed `values` map (e.g.
 
 ## Tests added
 
-`tests/test_ctfs_audit.rs` (3 new cases):
+`tests/test_ctfs_audit.rs` (4 cases after the 2026-05-03 follow-up):
 
 - `ctfs_writer_produces_ct_container` — runs `flow_test.circom`
   through `recorder::record` with `TraceEventsFileFormat::Ctfs` and
@@ -183,6 +196,11 @@ Witness values _are_ available in the `.sym`-keyed `values` map (e.g.
   read-side helper lands (open follow-up), this should be upgraded
   to assert that `a` and `b` appear on the embedded
   `CallRecord.args` slice for the `Adder` call.
+- `circom_compile_error_emits_error_special_event` — writes an invalid
+  circuit, expects recording to fail, then reads the produced `.ct` via
+  `NimTraceReaderHandle` and asserts the failure was preserved as an
+  Error IO event. This guards the
+  `register_special_event(Error, "circom_compile_error", msg)` route.
 
 `src/tracer.rs` (added a unit test):
 
@@ -202,12 +220,11 @@ Witness values _are_ available in the `.sym`-keyed `values` map (e.g.
 - `test_circom_cli_record` now passes `--format ctfs` (was `--format
 json`). Same reasoning.
 
-Read-side end-to-end content assertions on the embedded event records
-(e.g. that `arg("a", NONE_VALUE)` actually appears as a `CallRecord`
-arg name in the event-log of the `.ct` container) need the
-`codetracer_trace_reader_nim` dev-dep added and a small reader-walk
-helper. Tracked as an open follow-up below (also open for Cairo,
-Cardano, Flow, Fuel, PolkaVM, Miden, TON).
+Read-side content assertions are now present for the Circom compile-error
+special event via the existing `codetracer_trace_writer_nim`
+`NimTraceReaderHandle`. Call-argument read-side assertions remain open:
+the next pass should use the same reader handle to assert that `Adder`'s
+`CallRecord.args` contains `"a"` and `"b"`.
 
 ## Verification
 
@@ -222,9 +239,9 @@ cargo test --release
   pre-existing `test_parse_template_definitions` is updated to assert
   the new `input_signals` field).
 - `test_tracer` (existing): 13 / 13 passing.
-- `test_ctfs_audit` (new): 3 / 3 passing.
+- `test_ctfs_audit`: 4 / 4 passing.
 
-Total: 55 / 55 passing across all suites, 0 regressions.
+Total: 56 / 56 passing across all suites, 0 regressions.
 `cargo build --release` clean.
 
 ### Targeted Playwright sweep
@@ -274,35 +291,18 @@ without further audit work. Parallel to PolkaVM 1.55 ink!-metadata
 symbolic decoding, Miden 1.56 per-procedure ABI parsing, and TON 1.57
 parser-extension follow-up.
 
-### `circom` / WASM / C++ pipeline error routing (audit d, Error)
+### `circom` / WASM / C++ pipeline error routing (audit d, Error) — CLOSED 2026-05-03
 
-Today every failure path in the recording pipeline (compiler error,
-missing `.sym`, malformed witness, WASM trap, gas exhaustion, C++
-binary non-zero exit) bubbles up via `?` _before_ the trace writer is
-created — the recorder exits non-zero with the message on the calling
-shell's stderr instead of routing through
-`register_special_event(EventLogKind::Error, …)` so it lands inside
-the `.ct` container.
-
-The Flow recorder (1.52) and Cardano recorder (1.48) had the same
-shape pre-fix and it was closed by:
-
-- Creating the trace writer first (with a placeholder source path /
-  metadata that can be filled in once the pipeline succeeds).
-- On failure, route through `register_special_event(Error,
-"circom_compile_error" / "wasm_witness_error" / "cpp_witness_error",
-msg)` and finalise the (partial, error-decorated) trace cleanly.
-- Then `?`-propagate so the CLI still exits non-zero.
-
-The trade-off is that the writer must be ready before the pipeline
-succeeds; today the recorder uses the input source's canonicalised
-path as the writer's `program` argument, which is known up-front
-anyway, so the refactor is mechanical. Concrete metadata strings:
+The recorder now creates the trace writer before invoking `circom`, routes
+pipeline failures through `register_special_event(EventLogKind::Error, …)`,
+finalises the partial trace, and then returns the original recorder error so
+the CLI still exits non-zero. Concrete metadata strings:
 
 - `circom_compile_error` for stderr from `circom --wasm --sym`.
-- `wasm_witness_error` for `wasmtime` traps and `setInputSignal` /
-  `getWitness` failures (gas exhaustion in WASM, missing exports,
-  size-mismatch errors from `getInputSignalSize`).
+- `wasm_witness_error` for missing generated WASM / `.sym` files and malformed
+  `.sym` witness maps.
+- `wasmtime_witness_error` for `wasmtime` traps and `setInputSignal` /
+  `getWitness` failures.
 - `cpp_witness_error` for non-zero exit from the C++ witness binary
   or `compile_cpp_witness` failures.
 
@@ -391,14 +391,11 @@ flagged as a writer-side fix in
 
 ### Read-side end-to-end content assertions
 
-The audit tests assert the `.ct` file starts with the CTFS magic and
-is materially populated. Verifying that the embedded event stream
-contains the expected `arg(...)` / `register_call(...)` /
-`register_special_event(...)` records (e.g. `Adder`'s `CallRecord.args`
-contains the names `"a"` and `"b"` after the audit fix) requires the
-`codetracer_trace_reader_nim` dep added as a `[dev-dependencies]`
-entry plus a small reader-walk helper. Tracked here for the next pass
-(also open for Cairo, Cardano, Flow, Fuel, PolkaVM, Miden, TON).
+The compile-error special-event route is covered by a read-side assertion via
+`NimTraceReaderHandle`. Call-argument content assertions remain open: verify
+that the embedded event stream contains the expected `arg(...)` /
+`register_call(...)` records (e.g. `Adder`'s `CallRecord.args` contains the
+names `"a"` and `"b"` after the 1.58 audit fix).
 
 ## Cross-cutting finding: zk-witness recorders differ structurally from VM recorders
 
@@ -434,9 +431,9 @@ checklist accordingly:
 
 Section 5.6's recorder list shows `codetracer-circom-recorder` as
 audited (gaps closed for default-Ctfs CLI + declared input-signal
-arg-name staging via `TraceWriter::arg(name, NONE_VALUE)`;
-per-instance live-value resolution + WASM-pipeline-error special-event
-routing + `log()` directive routing + `assert()` failure routing +
-per-WASM-instruction step emission + `.wtns` replay path open as
-recorder-side / parser / writer-API follow-ups). Audited recorder
-count: 14 → 15.
+arg-name staging via `TraceWriter::arg(name, NONE_VALUE)` + compile /
+WASM / wasmtime / C++ witness Error special-event routing;
+per-instance live-value resolution + `log()` directive routing +
+assert-specific classification + per-WASM-instruction step emission +
+`.wtns` replay path open as recorder-side / parser / writer-API
+follow-ups). Audited recorder count: 14 → 15.
