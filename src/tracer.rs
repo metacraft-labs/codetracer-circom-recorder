@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
-use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
+use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
@@ -402,6 +402,8 @@ impl CircomTracer {
         format: TraceEventsFileFormat,
         use_cpp: bool,
     ) -> Result<()> {
+        let mut tracer = Self::start_trace(source_path, out_dir, format)?;
+
         // -- 1. Compile the Circom source --------------------------------------------------
         let compile_dir = tempfile::tempdir()
             .with_context(|| "failed to create temp dir for circom compilation")?;
@@ -425,16 +427,22 @@ impl CircomTracer {
         // Request source map if the compiler supports it (forked circom)
         compile_cmd.arg("--srcmap");
 
-        let compile_output = compile_cmd
-            .output()
-            .with_context(|| format!("failed to run circom compiler ('{circom_bin}')"))?;
+        let compile_output = match compile_cmd.output() {
+            Ok(output) => output,
+            Err(err) => {
+                let msg = format!("failed to run circom compiler ('{circom_bin}'): {err}");
+                tracer.finish_with_error("circom_compile_error", &msg)?;
+                return Err(eyre!(msg));
+            }
+        };
 
         if !compile_output.status.success() {
             let stderr = String::from_utf8_lossy(&compile_output.stderr);
             // If --srcmap failed (stock circom), retry without it
             if stderr.contains("srcmap") || stderr.contains("unrecognized") {
                 eprintln!("Compiler doesn't support --srcmap, retrying without it");
-                return Self::trace_program_no_srcmap(
+                return Self::trace_program_no_srcmap_with_tracer(
+                    tracer,
                     source_path,
                     source_code,
                     out_dir,
@@ -443,9 +451,9 @@ impl CircomTracer {
                 );
             }
             let stdout = String::from_utf8_lossy(&compile_output.stdout);
-            return Err(eyre!(
-                "circom compilation failed:\nstdout: {stdout}\nstderr: {stderr}"
-            ));
+            let msg = format!("circom compilation failed:\nstdout: {stdout}\nstderr: {stderr}");
+            tracer.finish_with_error("circom_compile_error", &msg)?;
+            return Err(eyre!(msg));
         }
 
         eprintln!("Circom compilation succeeded");
@@ -464,16 +472,20 @@ impl CircomTracer {
         let srcmap_path = compile_dir.path().join(format!("{stem}.srcmap.json"));
 
         if !wasm_path.exists() {
-            return Err(eyre!(
+            let msg = format!(
                 "circom did not produce expected WASM file: {}",
                 wasm_path.display()
-            ));
+            );
+            tracer.finish_with_error("wasm_witness_error", &msg)?;
+            return Err(eyre!(msg));
         }
         if !sym_path.exists() {
-            return Err(eyre!(
+            let msg = format!(
                 "circom did not produce expected .sym file: {}",
                 sym_path.display()
-            ));
+            );
+            tracer.finish_with_error("wasm_witness_error", &msg)?;
+            return Err(eyre!(msg));
         }
 
         // Load compiler source map if available
@@ -498,7 +510,14 @@ impl CircomTracer {
         };
 
         // -- 2. Parse the .sym file -------------------------------------------------------
-        let symbols = parse_sym_file(&sym_path)?;
+        let symbols = match parse_sym_file(&sym_path) {
+            Ok(symbols) => symbols,
+            Err(err) => {
+                let msg = format!("failed to parse circom .sym witness map: {err}");
+                tracer.finish_with_error("wasm_witness_error", &msg)?;
+                return Err(eyre!(msg));
+            }
+        };
         eprintln!("Parsed {} symbols from .sym file", symbols.len());
 
         // -- 3. Prepare inputs ------------------------------------------------------------
@@ -516,14 +535,39 @@ impl CircomTracer {
         // -- 4. Run the witness generator -------------------------------------------------
         let witness = if use_cpp {
             // C++ backend: compile and run the C++ witness generator
-            let binary = cpp_witness::compile_cpp_witness(compile_dir.path(), &stem)?;
+            let binary = match cpp_witness::compile_cpp_witness(compile_dir.path(), &stem) {
+                Ok(binary) => binary,
+                Err(err) => {
+                    let msg = format!("C++ witness generator compilation failed: {err}");
+                    tracer.finish_with_error("cpp_witness_error", &msg)?;
+                    return Err(eyre!(msg));
+                }
+            };
             let input_json = compile_dir.path().join("input.json");
             let wtns_path = compile_dir.path().join("witness.wtns");
-            cpp_witness::write_input_json(&input_json, &inputs)?;
-            cpp_witness::run_cpp_witness(&binary, &input_json, &wtns_path)?
+            if let Err(err) = cpp_witness::write_input_json(&input_json, &inputs) {
+                let msg = format!("failed to write C++ witness input JSON: {err}");
+                tracer.finish_with_error("cpp_witness_error", &msg)?;
+                return Err(eyre!(msg));
+            }
+            match cpp_witness::run_cpp_witness(&binary, &input_json, &wtns_path) {
+                Ok(witness) => witness,
+                Err(err) => {
+                    let msg = format!("C++ witness generator failed: {err}");
+                    tracer.finish_with_error("cpp_witness_error", &msg)?;
+                    return Err(eyre!(msg));
+                }
+            }
         } else {
             // WASM backend: use wasmtime
-            calculate_witness(&wasm_path, &inputs)?
+            match calculate_witness(&wasm_path, &inputs) {
+                Ok(witness) => witness,
+                Err(err) => {
+                    let msg = format!("wasmtime witness generation failed: {err}");
+                    tracer.finish_with_error("wasmtime_witness_error", &msg)?;
+                    return Err(eyre!(msg));
+                }
+            }
         };
         eprintln!("Computed witness with {} elements", witness.len());
 
@@ -561,40 +605,7 @@ impl CircomTracer {
         let assignments = parse_signal_assignments(source_code);
         let templates = parse_template_definitions(source_code);
 
-        // -- 7. Create the trace writer ---------------------------------------------------
-        let program_str = source_path.to_string_lossy();
-        let mut tracer = CircomTracer {
-            writer: create_trace_writer(&program_str, &[], format),
-            field_type_id: None,
-        };
-
-        // -- 8. Initialise output files ---------------------------------------------------
-        std::fs::create_dir_all(out_dir)
-            .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
-
-        let events_filename = match format {
-            TraceEventsFileFormat::Json => "trace.json",
-            TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 | TraceEventsFileFormat::Ctfs => "trace.bin",
-        };
-        let events_path = out_dir.join(events_filename);
-        let metadata_path = out_dir.join("trace_metadata.json");
-        let paths_path = out_dir.join("trace_paths.json");
-
-        TraceWriter::begin_writing_trace_events(&mut *tracer.writer, &events_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_metadata(&mut *tracer.writer, &metadata_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_paths(&mut *tracer.writer, &paths_path)
-            .map_err(|e| eyre!("{e}"))?;
-
-        // -- 9. Start the trace -----------------------------------------------------------
-        TraceWriter::start(&mut *tracer.writer, source_path, Line(1));
-
-        let field_type_id =
-            TraceWriter::ensure_type_id(&mut *tracer.writer, TypeKind::Int, "field");
-        tracer.field_type_id = Some(field_type_id);
-
-        // -- 10. Emit trace events --------------------------------------------------------
+        // -- 7. Emit trace events --------------------------------------------------------
         tracer.emit_source_trace(
             source_path,
             &source_map,
@@ -608,22 +619,78 @@ impl CircomTracer {
         // Close the <toplevel> call that start() opened.
         TraceWriter::register_return(&mut *tracer.writer, NONE_VALUE);
 
-        // -- 11. Finish writing -----------------------------------------------------------
-        TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
-        tracer.writer.close().map_err(|e| eyre!("{e}"))?;
+        // -- 8. Finish writing -----------------------------------------------------------
+        tracer.finish_trace()?;
 
         Ok(())
     }
 
-    /// Fallback when --srcmap is not supported by the compiler.
-    fn trace_program_no_srcmap(
+    fn start_trace(
         source_path: &Path,
-        source_code: &str,
         out_dir: &Path,
         format: TraceEventsFileFormat,
+    ) -> Result<Self> {
+        let program_str = source_path.to_string_lossy();
+        let mut tracer = CircomTracer {
+            writer: create_trace_writer(&program_str, &[], format),
+            field_type_id: None,
+        };
+
+        std::fs::create_dir_all(out_dir)
+            .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
+
+        let events_filename = match format {
+            TraceEventsFileFormat::Json => "trace.json",
+            TraceEventsFileFormat::Binary
+            | TraceEventsFileFormat::BinaryV0
+            | TraceEventsFileFormat::Ctfs => "trace.bin",
+        };
+        let events_path = out_dir.join(events_filename);
+        let metadata_path = out_dir.join("trace_metadata.json");
+        let paths_path = out_dir.join("trace_paths.json");
+
+        TraceWriter::begin_writing_trace_events(&mut *tracer.writer, &events_path)
+            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::begin_writing_trace_metadata(&mut *tracer.writer, &metadata_path)
+            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::begin_writing_trace_paths(&mut *tracer.writer, &paths_path)
+            .map_err(|e| eyre!("{e}"))?;
+
+        TraceWriter::start(&mut *tracer.writer, source_path, Line(1));
+
+        let field_type_id =
+            TraceWriter::ensure_type_id(&mut *tracer.writer, TypeKind::Int, "field");
+        tracer.field_type_id = Some(field_type_id);
+
+        Ok(tracer)
+    }
+
+    fn finish_trace(&mut self) -> Result<()> {
+        TraceWriter::finish_writing_trace_events(&mut *self.writer).map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_metadata(&mut *self.writer).map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_paths(&mut *self.writer).map_err(|e| eyre!("{e}"))?;
+        self.writer.close().map_err(|e| eyre!("{e}"))?;
+        Ok(())
+    }
+
+    fn finish_with_error(&mut self, metadata: &str, message: &str) -> Result<()> {
+        TraceWriter::register_special_event(
+            &mut *self.writer,
+            EventLogKind::Error,
+            metadata,
+            message,
+        );
+        TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
+        self.finish_trace()
+    }
+
+    /// Fallback when --srcmap is not supported by the compiler.
+    fn trace_program_no_srcmap_with_tracer(
+        mut tracer: CircomTracer,
+        source_path: &Path,
+        source_code: &str,
+        _out_dir: &Path,
+        _format: TraceEventsFileFormat,
         use_cpp: bool,
     ) -> Result<()> {
         let compile_dir = tempfile::tempdir()
@@ -644,16 +711,21 @@ impl CircomTracer {
             compile_cmd.arg("--c");
         }
 
-        let compile_output = compile_cmd
-            .output()
-            .with_context(|| format!("failed to run circom compiler ('{circom_bin}')"))?;
+        let compile_output = match compile_cmd.output() {
+            Ok(output) => output,
+            Err(err) => {
+                let msg = format!("failed to run circom compiler ('{circom_bin}'): {err}");
+                tracer.finish_with_error("circom_compile_error", &msg)?;
+                return Err(eyre!(msg));
+            }
+        };
 
         if !compile_output.status.success() {
             let stderr = String::from_utf8_lossy(&compile_output.stderr);
             let stdout = String::from_utf8_lossy(&compile_output.stdout);
-            return Err(eyre!(
-                "circom compilation failed:\nstdout: {stdout}\nstderr: {stderr}"
-            ));
+            let msg = format!("circom compilation failed:\nstdout: {stdout}\nstderr: {stderr}");
+            tracer.finish_with_error("circom_compile_error", &msg)?;
+            return Err(eyre!(msg));
         }
 
         let stem = source_path
@@ -668,13 +740,22 @@ impl CircomTracer {
         let sym_path = compile_dir.path().join(format!("{stem}.sym"));
 
         if !wasm_path.exists() {
-            return Err(eyre!(
+            let msg = format!(
                 "circom did not produce expected WASM file: {}",
                 wasm_path.display()
-            ));
+            );
+            tracer.finish_with_error("wasm_witness_error", &msg)?;
+            return Err(eyre!(msg));
         }
 
-        let symbols = parse_sym_file(&sym_path)?;
+        let symbols = match parse_sym_file(&sym_path) {
+            Ok(symbols) => symbols,
+            Err(err) => {
+                let msg = format!("failed to parse circom .sym witness map: {err}");
+                tracer.finish_with_error("wasm_witness_error", &msg)?;
+                return Err(eyre!(msg));
+            }
+        };
         let signal_decls = parse_signal_declarations(source_code);
         let main_template_name = find_main_template_name(source_code);
         let main_template_inputs = find_template_inputs(source_code, main_template_name.as_deref());
@@ -684,13 +765,38 @@ impl CircomTracer {
         }
 
         let witness = if use_cpp {
-            let binary = cpp_witness::compile_cpp_witness(compile_dir.path(), &stem)?;
+            let binary = match cpp_witness::compile_cpp_witness(compile_dir.path(), &stem) {
+                Ok(binary) => binary,
+                Err(err) => {
+                    let msg = format!("C++ witness generator compilation failed: {err}");
+                    tracer.finish_with_error("cpp_witness_error", &msg)?;
+                    return Err(eyre!(msg));
+                }
+            };
             let input_json = compile_dir.path().join("input.json");
             let wtns_path = compile_dir.path().join("witness.wtns");
-            cpp_witness::write_input_json(&input_json, &inputs)?;
-            cpp_witness::run_cpp_witness(&binary, &input_json, &wtns_path)?
+            if let Err(err) = cpp_witness::write_input_json(&input_json, &inputs) {
+                let msg = format!("failed to write C++ witness input JSON: {err}");
+                tracer.finish_with_error("cpp_witness_error", &msg)?;
+                return Err(eyre!(msg));
+            }
+            match cpp_witness::run_cpp_witness(&binary, &input_json, &wtns_path) {
+                Ok(witness) => witness,
+                Err(err) => {
+                    let msg = format!("C++ witness generator failed: {err}");
+                    tracer.finish_with_error("cpp_witness_error", &msg)?;
+                    return Err(eyre!(msg));
+                }
+            }
         } else {
-            calculate_witness(&wasm_path, &inputs)?
+            match calculate_witness(&wasm_path, &inputs) {
+                Ok(witness) => witness,
+                Err(err) => {
+                    let msg = format!("wasmtime witness generation failed: {err}");
+                    tracer.finish_with_error("wasmtime_witness_error", &msg)?;
+                    return Err(eyre!(msg));
+                }
+            }
         };
 
         let mut values: HashMap<String, i64> = HashMap::new();
@@ -709,36 +815,6 @@ impl CircomTracer {
         let assignments = parse_signal_assignments(source_code);
         let templates = parse_template_definitions(source_code);
 
-        let program_str = source_path.to_string_lossy();
-        let mut tracer = CircomTracer {
-            writer: create_trace_writer(&program_str, &[], format),
-            field_type_id: None,
-        };
-
-        std::fs::create_dir_all(out_dir)
-            .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
-
-        let events_filename = match format {
-            TraceEventsFileFormat::Json => "trace.json",
-            TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 | TraceEventsFileFormat::Ctfs => "trace.bin",
-        };
-        let events_path = out_dir.join(events_filename);
-        let metadata_path = out_dir.join("trace_metadata.json");
-        let paths_path = out_dir.join("trace_paths.json");
-
-        TraceWriter::begin_writing_trace_events(&mut *tracer.writer, &events_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_metadata(&mut *tracer.writer, &metadata_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_paths(&mut *tracer.writer, &paths_path)
-            .map_err(|e| eyre!("{e}"))?;
-
-        TraceWriter::start(&mut *tracer.writer, source_path, Line(1));
-
-        let field_type_id =
-            TraceWriter::ensure_type_id(&mut *tracer.writer, TypeKind::Int, "field");
-        tracer.field_type_id = Some(field_type_id);
-
         tracer.emit_source_trace(
             source_path,
             &source_map,
@@ -752,11 +828,7 @@ impl CircomTracer {
         // Close the <toplevel> call that start() opened.
         TraceWriter::register_return(&mut *tracer.writer, NONE_VALUE);
 
-        TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
-        tracer.writer.close().map_err(|e| eyre!("{e}"))?;
+        tracer.finish_trace()?;
 
         Ok(())
     }
@@ -1197,7 +1269,10 @@ template FlowTest() {
         let templates = parse_template_definitions(source);
         assert_eq!(templates.len(), 2);
         assert_eq!(templates[0].name, "Adder");
-        assert_eq!(templates[0].input_signals, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            templates[0].input_signals,
+            vec!["a".to_string(), "b".to_string()]
+        );
         assert_eq!(templates[1].name, "Outer");
         assert_eq!(templates[1].input_signals, vec!["x".to_string()]);
     }

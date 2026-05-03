@@ -10,16 +10,12 @@
 //!   * Audit (c) — `writer.arg(name, NONE_VALUE)` staging path keeps
 //!     producing a valid CTFS container even for circuits that
 //!     instantiate sub-component templates with input signals.
-//!
-//! Read-side end-to-end content assertions (i.e. that the embedded
-//! event stream contains the expected `register_call` /
-//! `register_special_event` records) need the
-//! `codetracer_trace_reader_nim` dev-dep added and a small reader-walk
-//! helper.  Tracked in AUDIT-CTFS-2026-05.md as an open follow-up
-//! (also open for Cairo, Cardano, Flow, Fuel, PolkaVM, Miden, TON).
+//!   * Audit (d) — compile / witness failures route through
+//!     `register_special_event(EventLogKind::Error, ..., message)`.
 
 use std::path::PathBuf;
 
+use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
 /// CTFS magic bytes: `C0 DE 72 AC E2`.  Defined in
@@ -49,6 +45,39 @@ fn find_ct_file(out_dir: &std::path::Path) -> PathBuf {
         entries
     );
     entries.into_iter().next().unwrap()
+}
+
+#[derive(Debug)]
+struct SpecialEvent {
+    kind: String,
+    content: String,
+}
+
+fn read_special_events(ct_path: &std::path::Path) -> Vec<SpecialEvent> {
+    let reader = NimTraceReaderHandle::open(ct_path.to_str().unwrap()).expect("open Nim CT reader");
+    let mut events = Vec::new();
+    for index in 0..reader.event_count() {
+        let json = reader.event_json(index).expect("read IO event JSON");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse IO event JSON");
+        let kind = value
+            .get("kind")
+            .and_then(|kind| kind.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let data = value
+            .get("data")
+            .and_then(|data| data.as_array())
+            .expect("IO event JSON data array");
+        let bytes: Vec<u8> = data
+            .iter()
+            .map(|byte| byte.as_u64().expect("IO event byte") as u8)
+            .collect();
+        events.push(SpecialEvent {
+            kind,
+            content: String::from_utf8_lossy(&bytes).to_string(),
+        });
+    }
+    events
 }
 
 // ---------------------------------------------------------------------------
@@ -169,5 +198,43 @@ fn call_arg_staging_does_not_empty_trace() {
         writer.arg(name, NONE_VALUE) staging path may have aborted \
         the trace prematurely",
         bytes.len()
+    );
+}
+
+#[test]
+fn circom_compile_error_emits_error_special_event() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source_path = tmp.path().join("broken.circom");
+    let out_dir = tmp.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(
+        &source_path,
+        "pragma circom 2.0.0;\n\ntemplate Broken() {\n    signal input a\n}\n\ncomponent main = Broken();\n",
+    )
+    .unwrap();
+
+    let err = codetracer_circom_recorder::recorder::record(
+        &source_path,
+        &out_dir,
+        TraceEventsFileFormat::Ctfs,
+        false,
+    )
+    .expect_err("invalid circom source should fail to record");
+
+    assert!(
+        err.to_string().contains("circom compilation failed")
+            || err.to_string().contains("failed to run circom compiler"),
+        "unexpected recorder error: {err}"
+    );
+
+    let ct_path = find_ct_file(&out_dir);
+    let special_events = read_special_events(&ct_path);
+    assert!(
+        special_events.iter().any(|event| {
+            event.kind == "error"
+                && (event.content.contains("circom compilation failed")
+                    || event.content.contains("failed to run circom compiler"))
+        }),
+        "expected circom_compile_error special event, got {special_events:?}"
     );
 }
