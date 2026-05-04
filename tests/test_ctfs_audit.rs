@@ -10,6 +10,8 @@
 //!   * Audit (c) — `writer.arg(name, NONE_VALUE)` staging path keeps
 //!     producing a valid CTFS container even for circuits that
 //!     instantiate sub-component templates with input signals.
+//!   * Audit (c) — concrete component-instance witness values are staged
+//!     onto `CallRecord.args` before the sub-template call record.
 //!   * Audit (d) — compile / witness failures route through
 //!     `register_special_event(EventLogKind::Error, ..., message)`.
 //!   * Audit (d) — Circom `log()` output routes through
@@ -17,6 +19,7 @@
 
 use std::path::PathBuf;
 
+use codetracer_trace_types::ValueRecord;
 use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
@@ -80,6 +83,76 @@ fn read_special_events(ct_path: &std::path::Path) -> Vec<SpecialEvent> {
         });
     }
     events
+}
+
+fn read_calls(reader: &NimTraceReaderHandle) -> Vec<serde_json::Value> {
+    (0..reader.call_count())
+        .map(|key| {
+            let json = reader.call_json(key).expect("read call JSON");
+            serde_json::from_str(&json).unwrap_or_else(|e| panic!("invalid call JSON: {e}: {json}"))
+        })
+        .collect()
+}
+
+fn bytes_from_json_array(value: &serde_json::Value) -> Vec<u8> {
+    value
+        .as_array()
+        .unwrap_or_else(|| panic!("expected byte array JSON, got {value:#}"))
+        .iter()
+        .map(|byte| {
+            byte.as_u64()
+                .unwrap_or_else(|| panic!("expected byte value, got {byte:#}")) as u8
+        })
+        .collect()
+}
+
+fn decode_value_record(value: &serde_json::Value) -> ValueRecord {
+    let bytes = bytes_from_json_array(value);
+    cbor4ii::serde::from_slice(&bytes)
+        .unwrap_or_else(|e| panic!("failed to decode ValueRecord from {bytes:?}: {e}"))
+}
+
+fn value_as_i64(value: &ValueRecord) -> Option<i64> {
+    match value {
+        ValueRecord::Int { i, .. } => Some(*i),
+        _ => None,
+    }
+}
+
+fn assert_call_args(
+    reader: &NimTraceReaderHandle,
+    calls: &[serde_json::Value],
+    expected: &[(&str, i64)],
+) {
+    let found = calls.iter().any(|call| {
+        let Some(args) = call["args"].as_array() else {
+            return false;
+        };
+        if args.len() != expected.len() {
+            return false;
+        }
+
+        args.iter()
+            .zip(expected.iter())
+            .all(|(arg, (expected_name, expected_value))| {
+                let Some(varname_id) = arg["varname_id"].as_u64() else {
+                    return false;
+                };
+                let Ok(actual_name) = reader.varname(varname_id) else {
+                    return false;
+                };
+                if actual_name != *expected_name {
+                    return false;
+                }
+
+                value_as_i64(&decode_value_record(&arg["value"])) == Some(*expected_value)
+            })
+    });
+
+    assert!(
+        found,
+        "expected a call with args {expected:?}; calls={calls:#?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -163,25 +236,45 @@ fn ctfs_format_advertised_in_record_help() {
 }
 
 // ---------------------------------------------------------------------------
-// (c) call-arg staging path -- structural smoke test.
+// (c) call-arg staging path -- read-side live-value assertion.
 //
 // component_test.circom instantiates an Adder sub-component whose template
-// has two `signal input` declarations (`a`, `b`).  Post-fix the recorder
-// stages each name through `writer.arg(name, NONE_VALUE)` immediately
-// before `register_call`.  This test asserts that the staging branch
-// still produces a valid CTFS container -- the more thorough assertion
-// (that the staged names appear on `CallRecord.args` in the embedded
-// event stream) needs the `codetracer_trace_reader_nim` dev-dep + a
-// reader-walk helper, tracked as an open follow-up.
+// has two `signal input` declarations (`a`, `b`). The recorder now stages
+// typed witness values for `adder.a` and `adder.b` before emitting the
+// `Adder` call record. This test uses main inputs because the recorder's
+// public record API currently hardcodes generated witness input JSON to 0.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn call_arg_staging_does_not_empty_trace() {
+fn call_arg_staging_records_live_component_input_values() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let source_path = tmp.path().join("live_args.circom");
     let out_dir = tmp.path().join("traces");
     std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(
+        &source_path,
+        concat!(
+            "pragma circom 2.0.0;\n\n",
+            "template Adder() {\n",
+            "    signal input a;\n",
+            "    signal input b;\n",
+            "    signal output out;\n",
+            "    out <== a + b;\n",
+            "}\n\n",
+            "template Main() {\n",
+            "    signal input x;\n",
+            "    signal input y;\n",
+            "    signal output result;\n",
+            "    component adder = Adder();\n",
+            "    adder.a <== x;\n",
+            "    adder.b <== y;\n",
+            "    result <== adder.out;\n",
+            "}\n\n",
+            "component main = Main();\n",
+        ),
+    )
+    .unwrap();
 
-    let source_path = test_programs_dir().join("component_test.circom");
     codetracer_circom_recorder::recorder::record(
         &source_path,
         &out_dir,
@@ -201,6 +294,10 @@ fn call_arg_staging_does_not_empty_trace() {
         the trace prematurely",
         bytes.len()
     );
+
+    let reader = NimTraceReaderHandle::open(ct_path.to_str().unwrap()).expect("open Nim CT reader");
+    let calls = read_calls(&reader);
+    assert_call_args(&reader, &calls, &[("a", 0), ("b", 0)]);
 }
 
 #[test]
