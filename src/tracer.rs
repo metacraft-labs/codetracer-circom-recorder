@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
-use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord, NONE_VALUE};
+use codetracer_trace_types::{EventLogKind, FunctionId, Line, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
@@ -444,6 +444,17 @@ struct SignalAssignment {
     line: u32,
 }
 
+/// A parsed component instantiation (`component name = Template(...)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComponentInstance {
+    /// Component instance name relative to `main` (e.g. `adder`).
+    name: String,
+    /// Template being instantiated (e.g. `Adder`).
+    template_name: String,
+    /// 1-based line number where the component is instantiated.
+    line: u32,
+}
+
 /// A parsed template definition.
 #[derive(Debug, Clone)]
 struct TemplateDef {
@@ -453,7 +464,7 @@ struct TemplateDef {
     line: u32,
     /// Names of `signal input` declarations inside this template, in source
     /// order.  Used as the formal-parameter list when staging `register_call`
-    /// arguments through `writer.arg(name, NONE_VALUE)` (audit checklist (c)).
+    /// arguments through `writer.arg(name, value)` (audit checklist (c)).
     /// Circom templates do not have a conventional parameter list at the AST
     /// level for their *signal* inputs (only their generic `template T(N)`
     /// numeric parameters do, and those are compile-time); the recorder
@@ -714,6 +725,7 @@ impl CircomTracer {
         let source_map = SourceMap::from_source(source_path, source_code);
         let assignments = parse_signal_assignments(source_code);
         let templates = parse_template_definitions(source_code);
+        let component_instances = parse_component_instances(source_code);
 
         // -- 7. Emit trace events --------------------------------------------------------
         tracer.emit_source_trace(
@@ -722,6 +734,7 @@ impl CircomTracer {
             &signal_decls,
             &assignments,
             &templates,
+            &component_instances,
             &values,
             compiler_srcmap.as_ref(),
         )?;
@@ -940,6 +953,7 @@ impl CircomTracer {
         let source_map = SourceMap::from_source(source_path, source_code);
         let assignments = parse_signal_assignments(source_code);
         let templates = parse_template_definitions(source_code);
+        let component_instances = parse_component_instances(source_code);
 
         tracer.emit_source_trace(
             source_path,
@@ -947,6 +961,7 @@ impl CircomTracer {
             &signal_decls,
             &assignments,
             &templates,
+            &component_instances,
             &values,
             None,
         )?;
@@ -968,46 +983,64 @@ impl CircomTracer {
         signals: &[SignalDecl],
         assignments: &[SignalAssignment],
         templates: &[TemplateDef],
+        component_instances: &[ComponentInstance],
         values: &HashMap<String, i64>,
         _compiler_srcmap: Option<&CompilerSourceMap>,
     ) -> Result<()> {
         let field_type_id = self.field_type_id.unwrap();
 
-        // Emit a Call for each template.
+        // Register function metadata for each template and emit calls for the
+        // concrete component instantiations in source order.
         //
-        // The first template (the "main" component) is NOT emitted as a nested
-        // Call because TraceWriter::start() already created a <toplevel> Call at
-        // depth 0. Emitting register_call for the main template would push all
-        // subsequent steps to depth 1, which breaks the db-backend's step-over
-        // logic: step-over from the initial position (depth 0) would skip every
-        // step at depth 1 and land at the end of the trace.
+        // The `component main = ...` instance is intentionally skipped because
+        // TraceWriter::start() already created a <toplevel> Call at depth 0.
+        // Emitting a nested call for the main component would push all
+        // subsequent steps to depth 1, breaking the db-backend's step-over
+        // behavior from the initial depth-0 position.
         //
-        // We still register the function metadata via ensure_function_id so it
-        // appears in the function list, but we only emit Call/Return events for
-        // sub-component templates (index > 0).
-        for (i, template) in templates.iter().enumerate() {
-            let _fn_id = TraceWriter::ensure_function_id(
+        // Sub-component signal values are available by this point via the
+        // witness `.sym` map, using keys such as `adder.a` and `adder.b`.
+        let mut template_fns: HashMap<String, FunctionId> = HashMap::new();
+        let templates_by_name: HashMap<&str, &TemplateDef> = templates
+            .iter()
+            .map(|template| (template.name.as_str(), template))
+            .collect();
+        for template in templates {
+            let fn_id = TraceWriter::ensure_function_id(
                 &mut *self.writer,
                 &template.name,
                 source_path,
                 Line(template.line as i64),
             );
-            if i > 0 {
-                // Audit checklist (c): stage each declared input-signal name
-                // through `writer.arg(name, NONE_VALUE)` immediately before
-                // `register_call` so the calltrace pane's `.call-arg` rows
-                // match the source.  Run-time values remain `NONE_VALUE`
-                // because the recorder does not yet propagate per-component
-                // input bindings (the `comp.in <== expr` assignment is parsed
-                // but not threaded back to its template's parameter list);
-                // tracked as an open follow-up in AUDIT-CTFS-2026-05.md.
-                // Same staging shape as Miden 1.56 (operand stack), TON 1.57
-                // (declared func.params), and PolkaVM 1.55 (Ecalli A0..A5).
-                for input_name in &template.input_signals {
-                    let _ = TraceWriter::arg(&mut *self.writer, input_name, NONE_VALUE);
-                }
-                TraceWriter::register_call(&mut *self.writer, _fn_id, vec![]);
+            template_fns.insert(template.name.clone(), fn_id);
+        }
+
+        let mut emitted_component_calls = 0usize;
+        for component in component_instances {
+            if component.name == "main" {
+                continue;
             }
+            let Some(template) = templates_by_name.get(component.template_name.as_str()) else {
+                continue;
+            };
+            let Some(&fn_id) = template_fns.get(&component.template_name) else {
+                continue;
+            };
+
+            TraceWriter::register_step(&mut *self.writer, source_path, Line(component.line as i64));
+            for input_name in &template.input_signals {
+                let signal_key = format!("{}.{}", component.name, input_name);
+                let value = values
+                    .get(&signal_key)
+                    .map(|&val| ValueRecord::Int {
+                        i: val,
+                        type_id: field_type_id,
+                    })
+                    .unwrap_or(NONE_VALUE);
+                let _ = TraceWriter::arg(&mut *self.writer, input_name, value);
+            }
+            TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
+            emitted_component_calls += 1;
         }
 
         // Emit Step events for signal declarations.
@@ -1032,12 +1065,10 @@ impl CircomTracer {
             }
         }
 
-        // Emit Return for each template (skip the first/main template — its
-        // steps live under <toplevel> which is closed by finalize()).
-        for (i, _template) in templates.iter().enumerate() {
-            if i > 0 {
-                TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
-            }
+        // Close each concrete sub-component call. The <toplevel> frame for
+        // `component main` is closed by the caller after this method returns.
+        for _ in 0..emitted_component_calls {
+            TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
         }
 
         Ok(())
@@ -1131,6 +1162,40 @@ fn parse_signal_assignments(source: &str) -> Vec<SignalAssignment> {
     }
 
     assignments
+}
+
+/// Parse component instantiations from Circom source code.
+fn parse_component_instances(source: &str) -> Vec<ComponentInstance> {
+    let mut components = Vec::new();
+
+    for (line_idx, line_text) in source.lines().enumerate() {
+        let line_num = (line_idx + 1) as u32;
+        let trimmed = line_text.trim();
+
+        let Some(after_component) = trimmed.strip_prefix("component ") else {
+            continue;
+        };
+        let Some(eq_pos) = after_component.find('=') else {
+            continue;
+        };
+
+        let name = after_component[..eq_pos].trim();
+        let after_eq = after_component[eq_pos + 1..].trim();
+        let Some(paren_pos) = after_eq.find('(') else {
+            continue;
+        };
+        let template_name = after_eq[..paren_pos].trim();
+
+        if !name.is_empty() && !template_name.is_empty() {
+            components.push(ComponentInstance {
+                name: name.to_string(),
+                template_name: template_name.to_string(),
+                line: line_num,
+            });
+        }
+    }
+
+    components
 }
 
 /// Parse template definitions from Circom source code.
@@ -1378,7 +1443,7 @@ template FlowTest() {
     fn test_parse_template_definitions_collects_input_signals() {
         // The parser must surface each `signal input <name>;` declaration
         // inside a template body, in source order, so audit checklist (c)'s
-        // `writer.arg(name, NONE_VALUE)` staging path has data to emit.
+        // `writer.arg(name, value)` staging path has data to emit.
         // This mirrors the structure of `component_test.circom` where
         // `Adder` has two input signals (`a`, `b`).
         let source = "template Adder() {\n\
@@ -1401,6 +1466,30 @@ template FlowTest() {
         );
         assert_eq!(templates[1].name, "Outer");
         assert_eq!(templates[1].input_signals, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_component_instances() {
+        let source = "template ComponentTest() {\n\
+                      \x20\x20\x20\x20component adder = Adder();\n\
+                      }\n\
+                      component main = ComponentTest();\n";
+        let components = parse_component_instances(source);
+        assert_eq!(
+            components,
+            vec![
+                ComponentInstance {
+                    name: "adder".to_string(),
+                    template_name: "Adder".to_string(),
+                    line: 2,
+                },
+                ComponentInstance {
+                    name: "main".to_string(),
+                    template_name: "ComponentTest".to_string(),
+                    line: 4,
+                },
+            ]
+        );
     }
 
     #[test]
