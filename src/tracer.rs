@@ -492,13 +492,17 @@ impl CircomTracer {
     /// 2. Runs the WASM witness generator via Wasmtime to compute all signal values.
     /// 3. Maps signal names to witness values using the .sym file.
     /// 4. Emits Step, Call, Return, and Value trace events at the correct source lines.
+    ///
+    /// The output format is fixed to CTFS — see
+    /// `Recorder-CLI-Conventions.md` §4 in `codetracer-specs`.  Use
+    /// `ct print` (from `codetracer-trace-format-nim`) to convert the
+    /// produced bundle to JSON or other text forms.
     pub fn trace_program(
         source_path: &Path,
         source_code: &str,
         out_dir: &Path,
-        format: TraceEventsFileFormat,
     ) -> Result<()> {
-        Self::trace_program_with_backend(source_path, source_code, out_dir, format, false)
+        Self::trace_program_with_backend(source_path, source_code, out_dir, false)
     }
 
     /// Trace using the C++ witness generator backend (faster for large circuits).
@@ -506,19 +510,21 @@ impl CircomTracer {
         source_path: &Path,
         source_code: &str,
         out_dir: &Path,
-        format: TraceEventsFileFormat,
     ) -> Result<()> {
-        Self::trace_program_with_backend(source_path, source_code, out_dir, format, true)
+        Self::trace_program_with_backend(source_path, source_code, out_dir, true)
     }
 
     fn trace_program_with_backend(
         source_path: &Path,
         source_code: &str,
         out_dir: &Path,
-        format: TraceEventsFileFormat,
         use_cpp: bool,
     ) -> Result<()> {
-        let mut tracer = Self::start_trace(source_path, out_dir, format)?;
+        // CTFS-only.  Pre-2026-05-08 the recorder accepted a format
+        // parameter (`TraceEventsFileFormat::{Json,Binary,Ctfs}`) and the
+        // CLI exposed a `--format` flag.  The convention now mandates
+        // CTFS exclusively.
+        let mut tracer = Self::start_trace(source_path, out_dir)?;
 
         // -- 1. Compile the Circom source --------------------------------------------------
         let compile_dir = tempfile::tempdir()
@@ -562,7 +568,6 @@ impl CircomTracer {
                     source_path,
                     source_code,
                     out_dir,
-                    format,
                     use_cpp,
                 );
             }
@@ -748,11 +753,12 @@ impl CircomTracer {
         Ok(())
     }
 
-    fn start_trace(
-        source_path: &Path,
-        out_dir: &Path,
-        format: TraceEventsFileFormat,
-    ) -> Result<Self> {
+    fn start_trace(source_path: &Path, out_dir: &Path) -> Result<Self> {
+        // CTFS-only.  Pre-2026-05-08 this method accepted a
+        // `TraceEventsFileFormat` parameter and switched the events
+        // filename on it; now it pins to the canonical CTFS multi-stream
+        // container.
+        let format = TraceEventsFileFormat::Ctfs;
         let program_str = source_path.to_string_lossy();
         let mut tracer = CircomTracer {
             writer: create_trace_writer(&program_str, &[], format),
@@ -762,13 +768,7 @@ impl CircomTracer {
         std::fs::create_dir_all(out_dir)
             .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-        let events_filename = match format {
-            TraceEventsFileFormat::Json => "trace.json",
-            TraceEventsFileFormat::Binary
-            | TraceEventsFileFormat::BinaryV0
-            | TraceEventsFileFormat::Ctfs => "trace.bin",
-        };
-        let events_path = out_dir.join(events_filename);
+        let events_path = out_dir.join("trace.bin");
         let metadata_path = out_dir.join("trace_metadata.json");
         let paths_path = out_dir.join("trace_paths.json");
 
@@ -824,7 +824,6 @@ impl CircomTracer {
         source_path: &Path,
         source_code: &str,
         _out_dir: &Path,
-        _format: TraceEventsFileFormat,
         use_cpp: bool,
     ) -> Result<()> {
         let compile_dir = tempfile::tempdir()

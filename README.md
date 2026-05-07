@@ -9,9 +9,10 @@ A recorder for Circom zero-knowledge circuits that produces [CodeTracer](https:/
 
 `codetracer-circom-recorder` compiles Circom circuits, generates and
 executes the witness (via WASM or C++ backend), and captures
-signal-level execution traces in the CodeTracer trace format. Signal
-values are recorded with their full hierarchical paths so you can
-inspect every intermediate computation in the circuit.
+signal-level execution traces in the canonical CodeTracer CTFS
+multi-stream format. Signal values are recorded with their full
+hierarchical paths so you can inspect every intermediate computation in
+the circuit.
 
 ### Building
 
@@ -31,13 +32,35 @@ cargo build
 #### Record a Circom circuit
 
 ```bash
-codetracer-circom-recorder record <file.circom> --out-dir <dir> [--format binary|json] [--backend wasm|cpp]
+codetracer-circom-recorder record <file.circom> --out-dir <dir> [--backend wasm|cpp]
 ```
 
-Parses the `.circom` source file, evaluates signal assignments, captures
-the execution trace, and writes CodeTracer trace files to `--out-dir`.
-The `--backend` flag selects the witness generation strategy (WASM by
-default, or C++ for native compilation).
+Compiles the `.circom` source file, runs the generated witness
+calculator, captures the execution trace, and writes a CTFS trace
+bundle to `--out-dir`. The `--backend` flag selects the witness
+generation strategy (WASM by default, or C++ for native compilation).
+
+The recorder always writes traces in the canonical CodeTracer CTFS
+multi-stream format (a single `.ct` container plus
+`trace_metadata.json` / `trace_paths.json` sidecars). There is no
+`--format` flag — see "Converting traces" below for human-readable
+output.
+
+#### Converting traces to JSON / text
+
+The recorder is CTFS-only. To convert a recorded `.ct` bundle to a
+human-readable form, use `ct print` from
+[`codetracer-trace-format-nim`](../codetracer-trace-format-nim):
+
+```bash
+ct-print --json <recording-dir>/<program>.ct
+```
+
+`ct-print` accepts `--json`, `--json-events`, `--summary`, and
+`--follow` modes; see its `--help` for details. This conversion path
+is the canonical way to produce textual oracles for golden-snapshot
+tests, debugging, and interop with non-CodeTracer tools — see
+`Recorder-CLI-Conventions.md` §4 in the `codetracer-specs` repo.
 
 ### Architecture
 
@@ -57,6 +80,13 @@ The recorder is structured around the following modules in `src/`:
 
 ```bash
 cargo test
+bash tests/verify-cli-convention-no-silent-skip.sh
+```
+
+Or via `just`:
+
+```bash
+just test
 ```
 
 Test programs live in:
@@ -65,9 +95,15 @@ Test programs live in:
 
 ### Environment variables
 
-| Variable     | Description                                                                                                       |
-| ------------ | ----------------------------------------------------------------------------------------------------------------- |
-| `CIRCOM_BIN` | Path to the `circom` compiler binary. Defaults to `circom` on `$PATH`. Use `nix develop` to get it automatically. |
+The recorder respects the standard CodeTracer recorder env-var contract
+defined in `Recorder-CLI-Conventions.md` §5:
+
+| Variable                               | CLI equivalent | Description                                                                                                                |
+| -------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `CODETRACER_CIRCOM_RECORDER_OUT_DIR`   | `--out-dir`    | Fallback output directory when `--out-dir` is omitted. The CLI flag always wins.                                           |
+| `CODETRACER_CIRCOM_RECORDER_DISABLED`  | —              | Set to `1` or `true` to run the recorder in pass-through mode (no trace artefacts written).                                |
+| `CODETRACER_CIRCOM_RECORDER_LOG_LEVEL` | —              | Recorder log verbosity (advisory; the Circom recorder currently logs to stderr unconditionally).                           |
+| `CIRCOM_BIN`                           | —              | Path to the upstream `circom` compiler binary. Defaults to `circom` on `$PATH`. Use `nix develop` to get it automatically. |
 
 ### Contributing
 

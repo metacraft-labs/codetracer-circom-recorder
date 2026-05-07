@@ -1,14 +1,28 @@
 //! Integration tests for the Circom tracer.
 //!
-//! These tests parse and evaluate real Circom circuit files through the
-//! source-level signal tracer and verify the resulting CodeTracer trace output.
+//! These tests cover three areas:
 //!
-//! Tests verify that the recorder produces a valid CTFS trace file (.ct)
-//! with the correct magic bytes.
+//! 1. End-to-end recording of `flow_test.circom` (and the other bundled
+//!    circuits) through the Circom → witness → CTFS pipeline; assertions
+//!    are made on the CTFS bundle either directly (CTFS magic bytes /
+//!    `.ct` file presence) or via `ct print` (the canonical conversion
+//!    tool shipped with `codetracer-trace-format-nim`).
+//! 2. Pure unit tests for the signal-hierarchy data model.
+//! 3. The CLI env-var contract for the recorder
+//!    (`CODETRACER_CIRCOM_RECORDER_OUT_DIR` /
+//!    `CODETRACER_CIRCOM_RECORDER_DISABLED`) plus the no-`--format`
+//!    invariant.
+//!
+//! History note: pre-2026-05-08 the recorder shipped a `--format
+//! ctfs|binary|json` flag and the CLI integration test
+//! (`test_circom_cli_record`) drove it with `--format ctfs`.  When the
+//! convention switched to CTFS-only the flag was removed and the test
+//! was rewritten to invoke `record` without `--format`.  See
+//! `AUDIT-CTFS-2026-05.md` ("Convention compliance follow-up") for
+//! the full record.
 
 use std::path::{Path, PathBuf};
-
-use codetracer_trace_writer_nim::TraceEventsFileFormat;
+use std::process::Command;
 
 /// CTFS magic bytes: C0 DE 72 AC E2
 const CTFS_MAGIC: [u8; 5] = [0xC0, 0xDE, 0x72, 0xAC, 0xE2];
@@ -18,19 +32,35 @@ fn test_programs_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-programs/circom")
 }
 
-/// Helper: run the tracer on a Circom source file and return the output directory.
+/// Path to the `ct-print` binary shipped with `codetracer-trace-format-nim`.
 ///
-/// Uses `TraceEventsFileFormat::Ctfs` explicitly so the test exercises the
-/// canonical multi-stream container path.  Pre-1.58 this passed `Json`; that
-/// only happened to produce a valid `.ct` because the underlying Nim writer
-/// dispatches `Json` and `Ctfs` identically for the multi-stream path today
-/// (see `TraceEventsFileFormat::to_ffi`).  Touching this to `Ctfs` removes
-/// the silent dependency on that quirk.
+/// The Circom recorder is CTFS-only; tests that need to make
+/// content-level assertions on a recorded trace pipe the `.ct`
+/// container through `ct-print --json` and assert on the resulting
+/// JSON.  This is the same workflow that `Recorder-CLI-Conventions.md`
+/// §4 prescribes for downstream tools / golden snapshots.
+fn ct_print_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("codetracer-trace-format-nim")
+        .join("ct-print")
+}
+
+/// Helper: collect every `.ct` file in `out_dir`.
+fn ct_files_in(out_dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(out_dir)
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
+        .collect()
+}
+
+/// Helper: run the tracer on a Circom source file and return the output directory.
 fn run_tracer_on_file(source_path: &Path, out_dir: &Path) {
     codetracer_circom_recorder::recorder::record(
         source_path,
         out_dir,
-        TraceEventsFileFormat::Ctfs,
         false, // use WASM backend
     )
     .expect("trace_program should succeed");
@@ -38,12 +68,7 @@ fn run_tracer_on_file(source_path: &Path, out_dir: &Path) {
 
 /// Helper: find a .ct file in the output directory and verify CTFS magic bytes.
 fn assert_valid_ct_file(out_dir: &Path) -> PathBuf {
-    let ct_files: Vec<_> = std::fs::read_dir(out_dir)
-        .expect("failed to read output directory")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
-        .collect();
+    let ct_files = ct_files_in(out_dir);
 
     assert!(
         !ct_files.is_empty(),
@@ -162,6 +187,12 @@ fn test_circom_metadata_structure() {
 
 // ---------------------------------------------------------------------------
 // Test 6: CLI record end-to-end test
+//
+// Pre-2026-05-08 this test passed `--format ctfs`; the convention now
+// mandates CTFS-only output, so the test simply verifies the CLI runs
+// to completion and produces a `.ct` container in the requested output
+// dir.  Content-level assertions live in
+// `test_recorded_trace_via_ct_print_json` below.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -170,18 +201,11 @@ fn test_circom_cli_record() {
     let out_dir = tmp_dir.path().join("cli-traces");
     let source_path = test_programs_dir().join("flow_test.circom");
 
-    let output = std::process::Command::new(env!("CARGO"))
-        .args([
-            "run",
-            "--quiet",
-            "--",
-            "record",
-            source_path.to_str().unwrap(),
-            "--out-dir",
-            out_dir.to_str().unwrap(),
-            "--format",
-            "ctfs",
-        ])
+    let output = Command::new(env!("CARGO_BIN_EXE_codetracer-circom-recorder"))
+        .args(["record"])
+        .arg(&source_path)
+        .args(["--out-dir"])
+        .arg(&out_dir)
         .output()
         .expect("failed to run");
 
@@ -351,5 +375,194 @@ fn test_circom_all_intermediate_values() {
         size > 100,
         ".ct file should have substantial content, got {} bytes",
         size
+    );
+}
+
+// ===========================================================================
+// CTFS content via `ct-print` — replaces the legacy `--format json` test
+// ===========================================================================
+
+/// Record `flow_test.circom`, then convert the produced `.ct` container
+/// to JSON via `ct-print --json` and assert on the textual representation.
+///
+/// Pre-2026-05-08 the test_tracer suite asserted CTFS magic on a file
+/// produced under the `--format ctfs` CLI flag.  The convention now
+/// mandates CTFS-only output; `ct print` is the canonical conversion
+/// tool.  See `Recorder-CLI-Conventions.md` §4.
+///
+/// Content assertions: the Circom recorder's variable values are
+/// emitted via `register_variable_with_full_value` with
+/// `ValueRecord::Int` payloads, but the integer values do not
+/// round-trip through `ct-print --json` today (same pre-existing
+/// limitation as the cardano recorder; see `AUDIT-CTFS-2026-05.md`
+/// "Variable types are always Int" for the open follow-up).  We
+/// therefore assert on **structural anchors** that the recorder must
+/// surface for any CodeTracer consumer to function:
+///   * the source path (`flow_test.circom`) in the metadata,
+///   * the `FlowTest` template name in the function table,
+///   * each signal name (`a`, `b`, `sum_val`, `doubled`, `out`) in
+///     the values stream.
+#[test]
+fn test_recorded_trace_via_ct_print_json() {
+    let ct_print = ct_print_path();
+    if !ct_print.exists() {
+        eprintln!(
+            "SKIP: ct-print not found at {} — only available within the \
+            metacraft workspace where codetracer-trace-format-nim is a sibling.",
+            ct_print.display()
+        );
+        return;
+    }
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = tmp_dir.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let source_path = test_programs_dir().join("flow_test.circom");
+    codetracer_circom_recorder::recorder::record(&source_path, &out_dir, false)
+        .expect("recorder::record should succeed");
+
+    let ct_files = ct_files_in(&out_dir);
+    assert!(
+        !ct_files.is_empty(),
+        "expected a .ct container in {:?}",
+        out_dir
+    );
+
+    let output = Command::new(&ct_print)
+        .args(["--json"])
+        .arg(&ct_files[0])
+        .output()
+        .expect("failed to run ct-print");
+
+    assert!(
+        output.status.success(),
+        "ct-print should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.is_empty(), "ct-print --json produced empty output");
+
+    assert!(
+        stdout.contains("flow_test.circom"),
+        "ct-print --json output should mention the source file; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"FlowTest\""),
+        "ct-print --json output should mention the `FlowTest` template; got:\n{stdout}"
+    );
+    for varname in ["a", "b", "sum_val", "doubled", "out"] {
+        assert!(
+            stdout.contains(&format!("\"{varname}\"")),
+            "ct-print --json output should mention the `{varname}` signal; got:\n{stdout}"
+        );
+    }
+}
+
+// ===========================================================================
+// CLI env-var contract
+// ===========================================================================
+
+/// `CODETRACER_CIRCOM_RECORDER_OUT_DIR` must be honoured as a fallback
+/// for `--out-dir`.  Convention: `Recorder-CLI-Conventions.md` §5.
+#[test]
+fn test_env_out_dir_used_when_flag_omitted() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let env_out_dir = tmp_dir.path().join("via-env");
+
+    let source_path = test_programs_dir().join("flow_test.circom");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codetracer-circom-recorder"))
+        .args(["record"])
+        .arg(&source_path)
+        .env("CODETRACER_CIRCOM_RECORDER_OUT_DIR", &env_out_dir)
+        // Make sure the env-var doesn't bleed in from the developer's shell.
+        .env_remove("CODETRACER_CIRCOM_RECORDER_DISABLED")
+        .output()
+        .expect("failed to run recorder");
+
+    assert!(
+        output.status.success(),
+        "recorder should succeed when CODETRACER_CIRCOM_RECORDER_OUT_DIR is set; \
+        stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let ct_files = ct_files_in(&env_out_dir);
+    assert!(
+        !ct_files.is_empty(),
+        "expected the env-supplied output dir {:?} to receive the .ct container",
+        env_out_dir
+    );
+}
+
+/// `CODETRACER_CIRCOM_RECORDER_DISABLED=1` must skip recording entirely.
+/// The recorder process should still exit 0 (the Circom recorder
+/// doesn't run a separate target subprocess — it shells out to `circom`
+/// and runs the witness calculator itself — so "disabled" simply means
+/// "don't write any trace artefacts").
+#[test]
+fn test_env_disabled_skips_recording() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = tmp_dir.path().join("should-stay-empty");
+
+    let source_path = test_programs_dir().join("flow_test.circom");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codetracer-circom-recorder"))
+        .args(["record"])
+        .arg(&source_path)
+        .args(["--out-dir"])
+        .arg(&out_dir)
+        .env("CODETRACER_CIRCOM_RECORDER_DISABLED", "1")
+        .output()
+        .expect("failed to run recorder");
+
+    assert!(
+        output.status.success(),
+        "recorder should succeed in disabled mode; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // No .ct file should have been written.
+    assert!(
+        !out_dir.exists() || ct_files_in(&out_dir).is_empty(),
+        "no .ct container should be written when CODETRACER_CIRCOM_RECORDER_DISABLED=1; \
+        got files in {:?}",
+        out_dir
+    );
+}
+
+/// `--format` is no longer accepted at any level — clap must reject it.
+/// Convention: §4 (CTFS-only).
+#[test]
+fn test_format_flag_rejected_by_clap() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = tmp_dir.path().join("traces");
+    let source_path = test_programs_dir().join("flow_test.circom");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codetracer-circom-recorder"))
+        .args(["record"])
+        .arg(&source_path)
+        .args(["--out-dir"])
+        .arg(&out_dir)
+        .args(["--format", "json"])
+        .output()
+        .expect("failed to run recorder");
+
+    assert!(
+        !output.status.success(),
+        "--format should be rejected by clap; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--format")
+            || stderr.contains("unexpected argument")
+            || stderr.contains("unrecognized")
+            || stderr.contains("found argument"),
+        "clap error should mention the unknown --format flag; got stderr:\n{stderr}"
     );
 }
