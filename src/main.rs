@@ -1,39 +1,82 @@
 //! CLI entry point for the CodeTracer Circom recorder.
 //!
 //! Supports the `record` subcommand which takes a Circom source file,
-//! parses and evaluates signal assignments, and writes CodeTracer trace
-//! output files.
+//! compiles it via the upstream `circom` compiler, runs the generated
+//! witness calculator (WASM or C++ backend), and writes a CodeTracer
+//! CTFS trace bundle.
 //!
 //! # Usage
 //!
 //! ```text
-//! codetracer-circom-recorder record <circom-file> \
-//!     --out-dir <output-dir> \
-//!     [--format ctfs|binary|json]
+//! codetracer-circom-recorder record <circom-file> --out-dir <output-dir>
 //! ```
 //!
-//! The default output format is `ctfs` — the canonical CodeTracer
-//! multi-stream container that the Nim `ct_reader_*` FFI and the
-//! db-backend's `CTFSTraceReader` consume directly.  `binary`
-//! (legacy CBOR + Zstd) and `json` (human-readable) are kept for
-//! compatibility / debugging.
+//! The recorder always writes traces in the canonical CodeTracer multi-stream
+//! CTFS format (see `Recorder-CLI-Conventions.md` §4 in `codetracer-specs`).
+//! No `--format` flag is exposed: human-readable conversion is handled
+//! out-of-band by `ct print` (shipped with `codetracer-trace-format-nim`).
+//!
+//! # Environment variables
+//!
+//! * `CODETRACER_CIRCOM_RECORDER_OUT_DIR` — fallback for `--out-dir` when the
+//!   flag is not given. The CLI flag always wins.
+//! * `CODETRACER_CIRCOM_RECORDER_DISABLED` — set to `1` or `true` to skip
+//!   recording entirely. The Circom recorder doesn't run a separate target
+//!   subprocess (it parses, compiles, and witness-generates the source
+//!   itself), so "disabled" simply means "don't write any trace artefacts".
+//! * `CODETRACER_CIRCOM_RECORDER_LOG_LEVEL` — recorder log verbosity (advisory;
+//!   the Circom recorder currently logs to stderr unconditionally).
+//! * `CIRCOM_BIN` — path to the upstream `circom` compiler binary
+//!   (Circom-specific; not part of the standard recorder env-var set).
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use codetracer_trace_writer_nim::TraceEventsFileFormat;
 use eyre::{Context, Result};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Environment variable used as a fallback for `--out-dir` when the CLI
+/// flag is omitted.  Convention: see `Recorder-CLI-Conventions.md` §5.
+const ENV_OUT_DIR: &str = "CODETRACER_CIRCOM_RECORDER_OUT_DIR";
+
+/// Environment variable that, when set to `1`/`true`, disables tracing
+/// entirely — the recorder runs as a transparent pass-through.
+const ENV_DISABLED: &str = "CODETRACER_CIRCOM_RECORDER_DISABLED";
+
+/// Default output directory used when neither `--out-dir` nor
+/// `CODETRACER_CIRCOM_RECORDER_OUT_DIR` is set.
+const DEFAULT_OUT_DIR: &str = "./ct-traces/";
 
 // ---------------------------------------------------------------------------
 // CLI definition
 // ---------------------------------------------------------------------------
 
 /// CodeTracer Circom recorder -- record Circom circuit execution traces.
+///
+/// Traces are always written in the canonical CTFS multi-stream format.
+/// To convert a recorded `.ct` bundle to JSON / text for inspection, use
+/// `ct print` from `codetracer-trace-format-nim`.
 #[derive(Debug, Parser)]
 #[command(
     name = "codetracer-circom-recorder",
     version,
-    about = "Record Circom circuit execution traces for CodeTracer"
+    about = "Record Circom circuit execution traces for CodeTracer (CTFS-only). \
+            Use `ct print` from codetracer-trace-format-nim for human-readable conversion.",
+    long_about = "Record Circom circuit execution traces for CodeTracer.\n\
+                  \n\
+                  Output is always written in the canonical CodeTracer CTFS\n\
+                  multi-stream format. Use `ct print` (shipped with the\n\
+                  codetracer-trace-format-nim sibling) to convert a recorded\n\
+                  `.ct` bundle to JSON or other human-readable forms.\n\
+                  \n\
+                  Environment variables:\n\
+                    CODETRACER_CIRCOM_RECORDER_OUT_DIR    fallback for --out-dir\n\
+                    CODETRACER_CIRCOM_RECORDER_DISABLED   set to 1/true to skip recording\n\
+                    CODETRACER_CIRCOM_RECORDER_LOG_LEVEL  log verbosity (advisory)\n\
+                    CIRCOM_BIN                            path to the upstream circom compiler"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,61 +87,13 @@ struct Cli {
 enum Commands {
     /// Record execution of a Circom circuit.
     ///
-    /// Parses the given .circom source file, evaluates signal assignments,
-    /// captures the execution trace, and writes CodeTracer trace files
+    /// Compiles the given .circom source file, runs the generated witness
+    /// calculator, captures the execution trace, and writes a CTFS bundle
     /// to `--out-dir`.
     Record(RecordArgs),
 
     /// Print version information.
     Version,
-}
-
-/// Output format for the trace files.
-///
-/// `Ctfs` is the canonical CodeTracer multi-stream container (the
-/// format the Nim `ct_reader_*` FFI and the db-backend's
-/// `CTFSTraceReader` consume directly) and is the default.  `Binary`
-/// is the legacy CBOR + Zstd container kept for compatibility with
-/// older readers.  `Json` is a slower, human-readable form useful
-/// for debugging.
-///
-/// Same shape as the audited recorders (EVM 1.39, Solana 1.44, Move
-/// 1.46, Cardano 1.48, Cairo 1.50, Flow 1.52, Fuel 1.53, PolkaVM
-/// 1.55, Miden 1.56, TON 1.57) so `From<OutputFormat>` collapses each
-/// dispatch site to `args.format.into()`.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum OutputFormat {
-    /// Canonical CodeTracer multi-stream container (recommended; default).
-    Ctfs,
-    /// Legacy CBOR + Zstd binary format.
-    Binary,
-    /// Human-readable JSON (slower; useful for debugging).
-    Json,
-}
-
-impl From<OutputFormat> for TraceEventsFileFormat {
-    fn from(fmt: OutputFormat) -> Self {
-        match fmt {
-            OutputFormat::Ctfs => TraceEventsFileFormat::Ctfs,
-            OutputFormat::Binary => TraceEventsFileFormat::Binary,
-            OutputFormat::Json => TraceEventsFileFormat::Json,
-        }
-    }
-}
-
-impl OutputFormat {
-    /// Stable string representation suitable for `trace_metadata.json`'s
-    /// `format` field.  Wired here for forward compatibility with the
-    /// audit-aligned metadata emission path used by other recorders;
-    /// not yet consumed by the writer plumbing in this crate.
-    #[allow(dead_code)]
-    fn as_str(self) -> &'static str {
-        match self {
-            OutputFormat::Ctfs => "ctfs",
-            OutputFormat::Binary => "binary",
-            OutputFormat::Json => "json",
-        }
-    }
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -116,13 +111,11 @@ struct RecordArgs {
 
     /// Directory where the trace files will be written.
     ///
-    /// The directory will be created if it does not exist.
-    #[arg(short = 'o', long, default_value = "./ct-traces/")]
-    out_dir: PathBuf,
-
-    /// Output format for the trace data.
-    #[arg(short = 'f', long, default_value = "ctfs")]
-    format: OutputFormat,
+    /// The directory will be created if it does not exist.  Falls back to
+    /// the `CODETRACER_CIRCOM_RECORDER_OUT_DIR` environment variable when
+    /// the flag is omitted.
+    #[arg(short = 'o', long)]
+    out_dir: Option<PathBuf>,
 
     /// Witness generator backend to use.
     ///
@@ -130,6 +123,39 @@ struct RecordArgs {
     /// gcc/make in the dev shell.
     #[arg(short = 'b', long, default_value = "wasm")]
     backend: WitnessBackend,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve the effective output directory:
+///   1. `--out-dir` if given on the CLI.
+///   2. `CODETRACER_CIRCOM_RECORDER_OUT_DIR` env var.
+///   3. `DEFAULT_OUT_DIR` ("./ct-traces/").
+fn resolve_out_dir(cli_out_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = cli_out_dir {
+        return path;
+    }
+    if let Some(value) = std::env::var_os(ENV_OUT_DIR) {
+        if !value.is_empty() {
+            return PathBuf::from(value);
+        }
+    }
+    PathBuf::from(DEFAULT_OUT_DIR)
+}
+
+/// Whether the recorder is disabled via env var.  When true, the CLI
+/// must execute its target operation in pass-through mode without
+/// emitting any trace artefacts.
+fn recording_disabled() -> bool {
+    match std::env::var(ENV_DISABLED) {
+        Ok(value) => {
+            let v = value.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        }
+        Err(_) => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,20 +187,27 @@ fn record(args: RecordArgs) -> Result<()> {
 
     eprintln!("Source file: {}", source_path.display());
 
-    let format: TraceEventsFileFormat = args.format.into();
+    if recording_disabled() {
+        // Pass-through: the Circom recorder doesn't run a separate target
+        // process — it shells out to `circom` and runs the witness
+        // calculator itself — so disabling recording simply means "don't
+        // emit any trace artefacts".
+        eprintln!("{ENV_DISABLED} is set; skipping trace recording (no output written).");
+        return Ok(());
+    }
 
     let use_cpp = matches!(args.backend, WitnessBackend::Cpp);
     if use_cpp {
         eprintln!("Using C++ witness generator backend");
     }
 
-    // 2. Create the output directory
-    let out_dir = &args.out_dir;
-    std::fs::create_dir_all(out_dir)
+    // 2. Resolve and create the output directory
+    let out_dir = resolve_out_dir(args.out_dir);
+    std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-    // 3. Run the recorder
-    codetracer_circom_recorder::recorder::record(&source_path, out_dir, format, use_cpp)?;
+    // 3. Run the recorder (CTFS only)
+    codetracer_circom_recorder::recorder::record(&source_path, &out_dir, use_cpp)?;
 
     eprintln!("Trace files written to {}", out_dir.display());
 

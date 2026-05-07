@@ -3,10 +3,10 @@
 //!
 //! These tests guard the audit's concrete fixes:
 //!
-//!   * Audit (a) — CLI defaults to `--format ctfs` for `record`.
+//!   * Audit (a) — CLI is CTFS-only (no `--format` flag).  Locked in
+//!     by `test_no_format_flag_in_help` and `test_help_mentions_ct_print`.
 //!   * Audit (g) — recorder produces a canonical `.ct` multi-stream
-//!     container starting with the CTFS magic bytes (`C0 DE 72 AC E2`)
-//!     when invoked with `TraceEventsFileFormat::Ctfs`.
+//!     container starting with the CTFS magic bytes (`C0 DE 72 AC E2`).
 //!   * Audit (c) — `writer.arg(name, NONE_VALUE)` staging path keeps
 //!     producing a valid CTFS container even for circuits that
 //!     instantiate sub-component templates with input signals.
@@ -16,12 +16,17 @@
 //!     `register_special_event(EventLogKind::Error, ..., message)`.
 //!   * Audit (d) — Circom `log()` output routes through
 //!     `register_special_event(EventLogKind::EvmEvent, "circom_log", message)`.
+//!
+//! 2026-05-08 convention compliance follow-up: `Recorder-CLI-Conventions.md`
+//! §4 was tightened to require CTFS-only output. `--format` was dropped
+//! and the old `ctfs_format_advertised_in_record_help` test (which
+//! would have locked in the regression) was replaced with
+//! `test_no_format_flag_in_help` and `test_help_mentions_ct_print`.
 
 use std::path::PathBuf;
 
 use codetracer_trace_types::ValueRecord;
 use codetracer_trace_writer_nim::NimTraceReaderHandle;
-use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
 /// CTFS magic bytes: `C0 DE 72 AC E2`.  Defined in
 /// `codetracer-trace-format-spec/`.
@@ -169,7 +174,6 @@ fn ctfs_writer_produces_ct_container() {
     codetracer_circom_recorder::recorder::record(
         &source_path,
         &out_dir,
-        TraceEventsFileFormat::Ctfs,
         false, // WASM backend
     )
     .expect("record should succeed");
@@ -197,41 +201,71 @@ fn ctfs_writer_produces_ct_container() {
 }
 
 // ---------------------------------------------------------------------------
-// (a) CLI defaults to ctfs for `record --help`.
+// (a) CLI is CTFS-only — no `--format` flag, `--help` mentions `ct print`.
 // ---------------------------------------------------------------------------
 
 /// Locate the just-built `codetracer-circom-recorder` binary via Cargo's
 /// `CARGO_BIN_EXE_<name>` env var.  Same idiom used by Flow 1.52,
-/// Fuel 1.53, PolkaVM 1.55, Miden 1.56, TON 1.57.
+/// Fuel 1.53, PolkaVM 1.55, Miden 1.56, TON 1.57, Cairo 1.50, Cardano 1.48.
 fn recorder_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codetracer-circom-recorder"))
 }
 
+/// The CLI binary must not expose a `--format` flag at any level.
+/// This catches accidental regressions to the pre-2026-05-08 shape
+/// (where `--format ctfs|binary|json` lived on `record`).
+///
+/// Convention: `Recorder-CLI-Conventions.md` §4 — recorders are
+/// CTFS-only.  Same shape as the Cairo (2026-05-08) and Cardano
+/// (2026-05-08) audit follow-ups.
 #[test]
-fn ctfs_format_advertised_in_record_help() {
-    let output = std::process::Command::new(recorder_bin())
-        .args(["record", "--help"])
+fn test_no_format_flag_in_help() {
+    use std::process::Command;
+
+    for subcmd in [None, Some("record")] {
+        let mut cmd = Command::new(recorder_bin());
+        if let Some(s) = subcmd {
+            cmd.arg(s);
+        }
+        cmd.arg("--help");
+
+        let output = cmd.output().expect("failed to run --help");
+        assert!(
+            output.status.success(),
+            "--help (subcmd={:?}) should exit 0",
+            subcmd
+        );
+
+        let help = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !help.contains("--format"),
+            "--help (subcmd={:?}) must not advertise --format; got:\n{help}",
+            subcmd
+        );
+        assert!(
+            !help.contains("CODETRACER_FORMAT"),
+            "--help (subcmd={:?}) must not advertise CODETRACER_FORMAT; got:\n{help}",
+            subcmd
+        );
+    }
+}
+
+/// `--help` must mention `ct print` so users know where to go for
+/// human-readable conversion of the recorded CTFS bundle.
+#[test]
+fn test_help_mentions_ct_print() {
+    use std::process::Command;
+
+    let output = Command::new(recorder_bin())
+        .arg("--help")
         .output()
-        .expect("spawn record --help");
-    assert!(
-        output.status.success(),
-        "record --help should succeed; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let help = String::from_utf8(output.stdout).expect("utf-8 help");
+        .expect("failed to run --help");
+    assert!(output.status.success(), "--help should exit 0");
 
-    // `ctfs` must appear as a possible value (clap renders ValueEnum
-    // variants in lower-snake-case).
+    let help = String::from_utf8_lossy(&output.stdout);
     assert!(
-        help.contains("ctfs"),
-        "record --help did not advertise `ctfs` as a --format value:\n{help}"
-    );
-
-    // The default must be `ctfs` -- catching accidental regressions of
-    // the audit's default-format fix.  Clap renders `[default: <value>]`.
-    assert!(
-        help.contains("[default: ctfs]"),
-        "record --help did not show `[default: ctfs]`:\n{help}"
+        help.contains("ct print"),
+        "--help must mention `ct print` as the conversion tool; got:\n{help}"
     );
 }
 
@@ -275,13 +309,8 @@ fn call_arg_staging_records_live_component_input_values() {
     )
     .unwrap();
 
-    codetracer_circom_recorder::recorder::record(
-        &source_path,
-        &out_dir,
-        TraceEventsFileFormat::Ctfs,
-        false,
-    )
-    .expect("record should succeed");
+    codetracer_circom_recorder::recorder::record(&source_path, &out_dir, false)
+        .expect("record should succeed");
 
     let ct_path = find_ct_file(&out_dir);
     let bytes = std::fs::read(&ct_path).expect("read .ct");
@@ -312,13 +341,8 @@ fn circom_compile_error_emits_error_special_event() {
     )
     .unwrap();
 
-    let err = codetracer_circom_recorder::recorder::record(
-        &source_path,
-        &out_dir,
-        TraceEventsFileFormat::Ctfs,
-        false,
-    )
-    .expect_err("invalid circom source should fail to record");
+    let err = codetracer_circom_recorder::recorder::record(&source_path, &out_dir, false)
+        .expect_err("invalid circom source should fail to record");
 
     assert!(
         err.to_string().contains("circom compilation failed")
@@ -359,13 +383,8 @@ fn circom_log_directive_emits_evm_event_special_event() {
     )
     .unwrap();
 
-    codetracer_circom_recorder::recorder::record(
-        &source_path,
-        &out_dir,
-        TraceEventsFileFormat::Ctfs,
-        false,
-    )
-    .expect("record should succeed");
+    codetracer_circom_recorder::recorder::record(&source_path, &out_dir, false)
+        .expect("record should succeed");
 
     let ct_path = find_ct_file(&out_dir);
     let special_events = read_special_events(&ct_path);
