@@ -383,25 +383,37 @@ fn test_circom_all_intermediate_values() {
 // ===========================================================================
 
 /// Record `flow_test.circom`, then convert the produced `.ct` container
-/// to JSON via `ct-print --json` and assert on the textual representation.
+/// to JSON via `ct-print` and assert on:
+///
+/// 1. **Structural anchors** (legacy layer): `ct-print --json` output
+///    contains the source filename / template name / signal names
+///    somewhere in the textual rendering.
+/// 2. **Exact decoded values** (the layer enabled by `ct-print --full`):
+///    the `flow_test.circom` template executes `(10 + 32) * 2 + 10 = 94`
+///    via the `FlowTest` template, with intermediate signal assignments
+///    `a=10`, `b=32`, `sum_val=42`, `doubled=84`, `out=94`.  Each
+///    signal must surface in the trace as a step event with a decoded
+///    `Int` ValueRecord whose `i` field matches the literal value
+///    derived in the source program.
 ///
 /// Pre-2026-05-08 the test_tracer suite asserted CTFS magic on a file
 /// produced under the `--format ctfs` CLI flag.  The convention now
 /// mandates CTFS-only output; `ct print` is the canonical conversion
-/// tool.  See `Recorder-CLI-Conventions.md` §4.
+/// tool.  See `Recorder-CLI-Conventions.md` §4.  `ct-print --full`
+/// (added 2026-05 in `codetracer-trace-format-nim`) is what enables the
+/// exact-value layer — its output is a deterministic JSON document with
+/// every CBOR `ValueRecord` decoded to a structured form like
+/// `{"kind":"Int","i":42,"type_id":N}`.
 ///
-/// Content assertions: the Circom recorder's variable values are
-/// emitted via `register_variable_with_full_value` with
-/// `ValueRecord::Int` payloads, but the integer values do not
-/// round-trip through `ct-print --json` today (same pre-existing
-/// limitation as the cardano recorder; see `AUDIT-CTFS-2026-05.md`
-/// "Variable types are always Int" for the open follow-up).  We
-/// therefore assert on **structural anchors** that the recorder must
-/// surface for any CodeTracer consumer to function:
-///   * the source path (`flow_test.circom`) in the metadata,
-///   * the `FlowTest` template name in the function table,
-///   * each signal name (`a`, `b`, `sum_val`, `doubled`, `out`) in
-///     the values stream.
+/// The note in the previous version of this test about the Circom
+/// recorder's `register_variable_with_full_value` integer payloads not
+/// round-tripping through `ct-print --json` is empirically obsolete for
+/// `--full`: each of `a=10, b=32, sum_val=42, doubled=84, out=94`
+/// decodes back to `{"kind":"Int","i":<n>,"type_id":1}` with values
+/// intact.  The remaining open follow-up from `AUDIT-CTFS-2026-05.md`
+/// is the type-naming gap (every variable carries a generic `type_id`
+/// rather than a named type like "Int") — a separate concern that does
+/// not block exact-value assertions on the integer payloads.
 #[test]
 fn test_recorded_trace_via_ct_print_json() {
     let ct_print = ct_print_path();
@@ -429,6 +441,11 @@ fn test_recorded_trace_via_ct_print_json() {
         out_dir
     );
 
+    // -----------------------------------------------------------------
+    // Layer 1 (legacy): ct-print --json — substring presence checks.
+    // Kept as a safety net so a regression in the textual rendering
+    // is caught even if --full's JSON shape evolves.
+    // -----------------------------------------------------------------
     let output = Command::new(&ct_print)
         .args(["--json"])
         .arg(&ct_files[0])
@@ -437,25 +454,175 @@ fn test_recorded_trace_via_ct_print_json() {
 
     assert!(
         output.status.success(),
-        "ct-print should succeed; stderr: {}",
+        "ct-print --json should succeed; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.is_empty(), "ct-print --json produced empty output");
+    let stdout_json = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout_json.is_empty(),
+        "ct-print --json produced empty output"
+    );
 
     assert!(
-        stdout.contains("flow_test.circom"),
-        "ct-print --json output should mention the source file; got:\n{stdout}"
+        stdout_json.contains("flow_test.circom"),
+        "ct-print --json output should mention the source file; got:\n{stdout_json}"
     );
     assert!(
-        stdout.contains("\"FlowTest\""),
-        "ct-print --json output should mention the `FlowTest` template; got:\n{stdout}"
+        stdout_json.contains("\"FlowTest\""),
+        "ct-print --json output should mention the `FlowTest` template; got:\n{stdout_json}"
     );
     for varname in ["a", "b", "sum_val", "doubled", "out"] {
         assert!(
-            stdout.contains(&format!("\"{varname}\"")),
-            "ct-print --json output should mention the `{varname}` signal; got:\n{stdout}"
+            stdout_json.contains(&format!("\"{varname}\"")),
+            "ct-print --json output should mention the `{varname}` signal; got:\n{stdout_json}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Layer 2 (the upgrade): ct-print --full — exact decoded values.
+    // -----------------------------------------------------------------
+    let full_output = Command::new(&ct_print)
+        .args(["--full", "--strip-paths"])
+        .arg(&ct_files[0])
+        .output()
+        .expect("failed to run ct-print --full");
+
+    assert!(
+        full_output.status.success(),
+        "ct-print --full should succeed; stderr: {}",
+        String::from_utf8_lossy(&full_output.stderr)
+    );
+
+    let doc: serde_json::Value = serde_json::from_slice(&full_output.stdout)
+        .expect("ct-print --full should emit valid JSON");
+
+    // ----- Function table: FlowTest must appear -----------------------
+    // The Circom recorder currently registers template names as bare
+    // identifiers (no module qualifier), but downstream tooling may
+    // qualify them in the future (e.g. `circom::flow_test::FlowTest`),
+    // so we use `ends_with` to stay platform-agnostic.
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        functions.iter().any(|f| f.ends_with("FlowTest")),
+        "expected `FlowTest` in functions table; got {:?}",
+        functions
+    );
+
+    // ----- Path table: the canonical fixture path must appear ---------
+    let paths: Vec<&str> = doc["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        paths.iter().any(|p| p.ends_with("flow_test.circom")),
+        "expected flow_test.circom in paths table; got {:?}",
+        paths
+    );
+
+    // ----- Step / call counts ----------------------------------------
+    // The Circom recorder emits one step per witness-calculator step
+    // for the FlowTest template's body (12 events total: dispatch +
+    // signal-declaration steps + the five signal-assignment steps that
+    // surface variable values).  It emits no `call_entry` events
+    // (Circom is single-template here — there are no nested component
+    // invocations and the recorder doesn't synthesise a call event for
+    // the top-level main component).  Stable properties of the
+    // canonical fixture — if they change, that's a real regression to
+    // investigate, not a flake.
+    let counts = &doc["counts"];
+    assert_eq!(
+        counts["steps"].as_u64(),
+        Some(12),
+        "expected 12 step events for flow_test.circom; counts={counts}",
+    );
+    assert_eq!(
+        counts["calls"].as_u64(),
+        Some(0),
+        "expected 0 call events (Circom flow_test has no nested components); \
+        counts={counts}",
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+
+    // ----- Call sequence: empty for a single-template circuit ---------
+    let call_sequence: Vec<&str> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .filter_map(|e| e["function"].as_str())
+        .collect();
+    assert!(
+        call_sequence.is_empty(),
+        "expected no call_entry events for flow_test.circom; got {:?}",
+        call_sequence
+    );
+
+    // ----- Exact decoded variable values ------------------------------
+    // Collect every (varname, i64) pair surfaced by step events.  These
+    // come from the recorder writing `ValueRecord::Int` CBOR blobs, then
+    // ct-print --full decoding them back to `{"kind":"Int","i":<n>,...}`.
+    let observed_vars: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .filter_map(|v| {
+            let name = v["varname"].as_str()?.to_string();
+            let value = &v["value"];
+            // The Circom recorder encodes signal values as
+            // ValueRecord::Int.  If something else surfaces (e.g.
+            // BigInt for out-of-range field elements that exceed
+            // i64), fail loudly so the test author can decide whether
+            // to extend the assertions or accept the new variant.
+            assert_eq!(
+                value["kind"].as_str(),
+                Some("Int"),
+                "variable `{}` should decode as Int, got {}; \
+                if a new ValueRecord variant has landed for Circom \
+                field elements (e.g. BigInt), extend this test to \
+                assert on it explicitly rather than weakening the \
+                check",
+                name,
+                value
+            );
+            let i = value["i"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("Int.i must be i64 for `{name}`; got {value}"));
+            Some((name, i))
+        })
+        .collect();
+
+    // The canonical flow: a=10, b=32, sum_val=a+b=42, doubled=sum_val*2=84,
+    // out=doubled+a=94.  Same canonical computation as cairo, cardano,
+    // leo, and the other recorders' flow_test fixtures — if your
+    // recorder runs flow_test.circom and these five signal assignments
+    // don't surface, that's the bug to chase.
+    let expected: &[(&str, i64)] = &[
+        ("a", 10),
+        ("b", 32),
+        ("sum_val", 42),
+        ("doubled", 84),
+        ("out", 94),
+    ];
+    for (name, value) in expected {
+        assert!(
+            observed_vars
+                .iter()
+                .any(|(n, v)| n == name && v == value),
+            "expected step variable `{name}` = {value} in --full output; \
+            observed = {observed_vars:?}"
         );
     }
 }
