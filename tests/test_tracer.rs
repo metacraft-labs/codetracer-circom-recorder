@@ -528,39 +528,42 @@ fn test_recorded_trace_via_ct_print_json() {
     );
 
     // ----- Step / call counts ----------------------------------------
-    // The Circom recorder emits one step per witness-calculator step
-    // for the FlowTest template's body (12 events total: dispatch +
-    // signal-declaration steps + the five signal-assignment steps that
-    // surface variable values).  It emits no `call_entry` events
-    // (Circom is single-template here — there are no nested component
-    // invocations and the recorder doesn't synthesise a call event for
-    // the top-level main component).  Stable properties of the
-    // canonical fixture — if they change, that's a real regression to
-    // investigate, not a flake.
+    // The Circom recorder surfaces the `component main` template as
+    // the outermost user-defined Call frame (cross-recorder convention;
+    // see PHP recorder commit 423e4ba).  flow_test.circom therefore
+    // emits:
+    //   * 13 steps: 1 toplevel dispatch + 1 step on the
+    //     `component main = FlowTest()` line + 6 signal-declaration
+    //     steps + 5 signal-assignment steps.
+    //   * 1 call pair (entry/exit) for `FlowTest`.
+    // Stable properties of the canonical fixture — if they change,
+    // that's a real regression to investigate, not a flake.
     let counts = &doc["counts"];
     assert_eq!(
         counts["steps"].as_u64(),
-        Some(12),
-        "expected 12 step events for flow_test.circom; counts={counts}",
+        Some(13),
+        "expected 13 step events for flow_test.circom; counts={counts}",
     );
     assert_eq!(
         counts["calls"].as_u64(),
-        Some(0),
-        "expected 0 call events (Circom flow_test has no nested components); \
-        counts={counts}",
+        Some(1),
+        "expected 1 call event for `FlowTest` (the outermost user-defined \
+        template frame); counts={counts}",
     );
 
     let events = doc["events"].as_array().expect("events array");
 
-    // ----- Call sequence: empty for a single-template circuit ---------
+    // ----- Call sequence: the outermost user-defined template --------
     let call_sequence: Vec<&str> = events
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .filter_map(|e| e["function"].as_str())
         .collect();
-    assert!(
-        call_sequence.is_empty(),
-        "expected no call_entry events for flow_test.circom; got {:?}",
+    assert_eq!(
+        call_sequence,
+        vec!["FlowTest"],
+        "expected a single `FlowTest` call_entry for flow_test.circom; \
+        got {:?}",
         call_sequence
     );
 
@@ -858,9 +861,9 @@ fn test_control_flow_test_via_ct_print_full() {
     assert_metadata_program_ends_with(&doc, &source_path);
 
     // ----- Function table ---------------------------------------------
-    // Only the `ControlFlow` template is defined; `component main` does
-    // not appear because the recorder skips the synthesised toplevel
-    // call and registers only template definitions.
+    // Only the `ControlFlow` template is defined; the synthetic
+    // `<toplevel>` frame opened by `TraceWriter::start` is not surfaced
+    // in the user-facing functions array.
     let functions: Vec<&str> = doc["functions"]
         .as_array()
         .expect("functions array")
@@ -870,15 +873,16 @@ fn test_control_flow_test_via_ct_print_full() {
     assert_eq!(functions, vec!["ControlFlow"]);
 
     // ----- counts -----------------------------------------------------
-    // 7 step events: 1 toplevel start step (line 1) + 3 signal-decl
+    // 8 step events: 1 toplevel start step (line 1) + 1 step on the
+    // `component main = ControlFlow()` line (line 40) + 3 signal-decl
     // steps (lines 17,18,19 for the three output declarations) + 3
     // assignment steps (lines 35,36,37 for `total/bonus/result`).
-    // No call_entry/exit because the only template instantiation is
-    // `component main = ControlFlow()` which the recorder does not
-    // emit as a call (the toplevel frame already covers it).
+    // 1 call_entry/exit for the outermost user-defined frame
+    // (`ControlFlow`) — see PHP recorder commit 423e4ba for the
+    // cross-recorder convention.
     let counts = &doc["counts"];
-    assert_eq!(counts["steps"].as_u64(), Some(7), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(0), "calls; counts={counts}");
+    assert_eq!(counts["steps"].as_u64(), Some(8), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -886,30 +890,37 @@ fn test_control_flow_test_via_ct_print_full() {
     );
     assert_eq!(
         counts["values"].as_u64(),
-        Some(7),
+        Some(8),
         "values; counts={counts}"
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 7, "events.len()");
+    assert_eq!(events.len(), 10, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
-    // RECORDER BUG: spec-compliant output would include a call_entry
-    // for the main `ControlFlow` template (depth 0), and ideally a
-    // step-per-iteration of the `for` loop and a step on the chosen
-    // `if` branch.  Today the for/if constructs are completely
-    // invisible — they're not parsed at all, only the surrounding
-    // `<==` lines are.
-    assert_eq!(observed_call_sequence(&doc), Vec::<String>::new());
+    // `ControlFlow` is the outermost user-defined template; the
+    // recorder surfaces it as a single call pair around the body's
+    // step events.  RECORDER BUG (separate issue): a spec-compliant
+    // recorder would also emit a step-per-iteration of the `for` loop
+    // and a step on the chosen `if` branch — today both constructs are
+    // invisible because the parser only handles `<==` lines.  See
+    // `test_control_flow_test_for_and_if_steps_emitted` for the
+    // tracking expectation.
+    assert_eq!(observed_call_sequence(&doc), vec!["ControlFlow".to_string()]);
+    assert_eq!(observed_exit_sequence(&doc), vec!["ControlFlow".to_string()]);
 
     // ----- Exact step lines (in order) --------------------------------
+    // Line 40 is the `component main = ControlFlow()` declaration; it
+    // precedes the template body's signal-decl/assignment steps
+    // because the recorder emits the component-line step immediately
+    // before issuing `register_call`.
     let step_lines: Vec<i64> = events
         .iter()
         .filter(|e| e["kind"] == "step")
         .map(|e| e["line"].as_i64().expect("step.line i64"))
         .collect();
-    assert_eq!(step_lines, vec![1, 17, 18, 19, 35, 36, 37]);
+    assert_eq!(step_lines, vec![1, 40, 17, 18, 19, 35, 36, 37]);
 
     // ----- Decoded variable values ------------------------------------
     // RECORDER BUG: spec-correct output would surface
@@ -1014,16 +1025,14 @@ fn test_nested_template_test_via_ct_print_full() {
     assert_eq!(functions, vec!["Inner", "Middle", "NestedTemplate"]);
 
     // ----- counts -----------------------------------------------------
-    // 9 step events + 2 call_entry + 2 call_exit = 13 events.
-    // RECORDER BUG: spec-compliant output would emit 3 call pairs
-    // (one for each level: NestedTemplate, Middle, Inner) — not 2 —
-    // since the chain is genuinely 3 deep.  Today the recorder skips
-    // the call for `component main = NestedTemplate()` because it
-    // would shadow the synthesised toplevel frame, dropping the
-    // observable depth from 3 to 2.
+    // 10 step events + 3 call_entry + 3 call_exit = 16 events.
+    // The recorder now surfaces the outermost user-defined template
+    // (`NestedTemplate`, instantiated as `component main`) as a real
+    // Call event so the genuinely 3-deep chain
+    // `NestedTemplate -> Middle -> Inner` produces 3 call pairs.
     let counts = &doc["counts"];
-    assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -1031,31 +1040,34 @@ fn test_nested_template_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 13, "events.len()");
+    assert_eq!(events.len(), 16, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call entry order -------------------------------------------
-    // RECORDER BUG: the entry order today is [Inner, Middle] because
-    // the recorder iterates `parse_component_instances(source_code)`
-    // in source-line order and `inner` (line 24) appears before
-    // `middle` (line 31) in the file even though semantically Middle
-    // is the parent of Inner.  Spec-compliant output would be
-    // [NestedTemplate, Middle, Inner] in nesting order.
+    // The recorder emits component calls in *nesting* order
+    // (root → leaf), starting at `component main` and recursing into
+    // each template body's declared sub-components.  This is the
+    // structural depth-3 chain the source program declares.
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["Inner".to_string(), "Middle".to_string()],
+        vec![
+            "NestedTemplate".to_string(),
+            "Middle".to_string(),
+            "Inner".to_string(),
+        ],
     );
 
-    // ----- Call exit order: matches entry order, not LIFO -------------
-    // RECORDER BUG: spec-compliant output would be the LIFO closure of
-    // the entry order ([Inner, Middle, NestedTemplate]).  Today the
-    // recorder closes the calls in entry order — [Middle, Inner] —
-    // because `emit_source_trace` issues `register_return` in a flat
-    // counted loop after emitting all assignment steps, not paired
-    // with each call_entry.
+    // ----- Call exit order: LIFO closure ------------------------------
+    // `register_return` pops the most recent call frame, so closing
+    // three returns at the end of `emit_source_trace` yields the
+    // expected reverse-order exits.
     assert_eq!(
         observed_exit_sequence(&doc),
-        vec!["Middle".to_string(), "Inner".to_string()],
+        vec![
+            "Inner".to_string(),
+            "Middle".to_string(),
+            "NestedTemplate".to_string(),
+        ],
     );
 
     // ----- Exact decoded variable values ------------------------------
@@ -1098,15 +1110,16 @@ fn test_nested_template_test_intermediate_outputs_decode() {
     }
 }
 
+/// `nested_template_test.circom` exercises a genuinely 3-deep template
+/// chain (`NestedTemplate -> Middle -> Inner`).  The recorder must
+/// surface every level — including `component main`'s own template — so
+/// the trace contains 3 call pairs in nesting order with LIFO exits.
+/// Previously `component main` was elided to avoid shadowing the
+/// synthesised `<toplevel>` frame, collapsing the visible depth from 3
+/// to 2.  The cross-recorder convention (see PHP recorder commit
+/// 423e4ba) is that the outermost user-defined frame surfaces as a real
+/// Call event, so this test now passes.
 #[test]
-#[ignore = "RECORDER BUG: `component main` is dropped from the \
-            call-entry sequence to avoid shadowing the toplevel \
-            frame, which collapses an N-deep template chain into N-1 \
-            visible calls.  Tracking expectation: \
-            nested_template_test.circom is genuinely 3 deep \
-            (NestedTemplate -> Middle -> Inner) and the recorder \
-            should surface 3 call pairs in nesting order \
-            [NestedTemplate, Middle, Inner] with LIFO exits."]
 fn test_nested_template_test_three_deep_call_sequence() {
     let Some((doc, _)) = record_and_dump_full(
         "test_nested_template_test_three_deep_call_sequence",
@@ -1162,14 +1175,17 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
     assert_eq!(functions, vec!["Add5", "Mul2", "SignalHierarchy"]);
 
     // ----- counts -----------------------------------------------------
-    // 13 step events + 2 call_entry + 2 call_exit = 17 events.
+    // 14 step events + 3 call_entry + 3 call_exit = 20 events.  The
+    // outermost user-defined template (`SignalHierarchy`,
+    // instantiated as `component main`) now surfaces as its own Call
+    // event, bracketing the two sibling sub-component calls.
     let counts = &doc["counts"];
     assert_eq!(
         counts["steps"].as_u64(),
-        Some(13),
+        Some(14),
         "steps; counts={counts}"
     );
-    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -1177,35 +1193,56 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 17, "events.len()");
+    assert_eq!(events.len(), 20, "events.len()");
     assert_step_indices_monotonic(&doc);
 
-    // ----- Call sequence: [Add5, Mul2] in source-instantiation order -
+    // ----- Call sequence in nesting order ----------------------------
+    // The outermost user-defined template (`SignalHierarchy`,
+    // instantiated as `component main`) comes first; siblings inside
+    // its body (`add5` then `mul2`) follow in source-instantiation
+    // order.  Exits are LIFO.
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["Add5".to_string(), "Mul2".to_string()],
+        vec![
+            "SignalHierarchy".to_string(),
+            "Add5".to_string(),
+            "Mul2".to_string(),
+        ],
     );
     assert_eq!(
         observed_exit_sequence(&doc),
-        vec!["Mul2".to_string(), "Add5".to_string()],
+        vec![
+            "Mul2".to_string(),
+            "Add5".to_string(),
+            "SignalHierarchy".to_string(),
+        ],
     );
 
-    // ----- Call_entry args: each sub-component's input signal is staged
-    // with its current witness value (0 today — see RECORDER BUG note
-    // on `test_control_flow_test_via_ct_print_full`).
+    // ----- Call_entry args: each call carries its template's `signal
+    // input` declarations as staged arguments (or none if the template
+    // has no inputs).  `SignalHierarchy` has no input signals
+    // (`total` is an *output*), so its args list is empty.  Each
+    // sub-component's input signal is staged with its current witness
+    // value (0 today — see RECORDER BUG note on
+    // `test_control_flow_test_via_ct_print_full`).
     let call_entries: Vec<&serde_json::Value> = events
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
-    assert_eq!(call_entries.len(), 2);
+    assert_eq!(call_entries.len(), 3);
 
-    let add5_args = call_entries[0]["args"].as_array().expect("Add5 args");
+    let sig_hier_args = call_entries[0]["args"]
+        .as_array()
+        .expect("SignalHierarchy args");
+    assert_eq!(sig_hier_args.len(), 0);
+
+    let add5_args = call_entries[1]["args"].as_array().expect("Add5 args");
     assert_eq!(add5_args.len(), 1);
     assert_eq!(add5_args[0]["varname"].as_str(), Some("x"));
     assert_eq!(add5_args[0]["value"]["kind"].as_str(), Some("Int"));
     assert_eq!(add5_args[0]["value"]["i"].as_i64(), Some(0));
 
-    let mul2_args = call_entries[1]["args"].as_array().expect("Mul2 args");
+    let mul2_args = call_entries[2]["args"].as_array().expect("Mul2 args");
     assert_eq!(mul2_args.len(), 1);
     assert_eq!(mul2_args[0]["varname"].as_str(), Some("in"));
     assert_eq!(mul2_args[0]["value"]["kind"].as_str(), Some("Int"));
@@ -1283,14 +1320,17 @@ fn test_constraint_assert_test_via_ct_print_full() {
     assert_eq!(functions, vec!["ConstraintAssert"]);
 
     // ----- counts -----------------------------------------------------
-    // 9 step events: 1 toplevel + 4 signal-decl + 4 assignment.
+    // 10 step events: 1 toplevel + 1 step on the
+    // `component main = ConstraintAssert()` line + 4 signal-decl +
+    // 4 assignment.  1 call_entry/exit for the outermost user-defined
+    // frame (`ConstraintAssert`).
     // RECORDER BUG: the two `===` assertion lines (26 and 27) do
     // **not** surface as steps or as a dedicated event kind — the
     // parser only handles `<==`.  See
     // test_constraint_assert_test_emits_assertion_steps below.
     let counts = &doc["counts"];
-    assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(0), "calls; counts={counts}");
+    assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -1298,21 +1338,25 @@ fn test_constraint_assert_test_via_ct_print_full() {
     );
     assert_eq!(
         counts["values"].as_u64(),
-        Some(9),
+        Some(10),
         "values; counts={counts}"
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 9, "events.len()");
+    assert_eq!(events.len(), 12, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Exact step lines (in order) --------------------------------
+    // Line 30 is the `component main = ConstraintAssert()` declaration;
+    // it precedes the body's signal-decl/assignment steps because the
+    // recorder emits the component-line step immediately before the
+    // outermost call.
     let step_lines: Vec<i64> = events
         .iter()
         .filter(|e| e["kind"] == "step")
         .map(|e| e["line"].as_i64().expect("step.line i64"))
         .collect();
-    assert_eq!(step_lines, vec![1, 14, 15, 17, 18, 20, 21, 23, 24]);
+    assert_eq!(step_lines, vec![1, 30, 14, 15, 17, 18, 20, 21, 23, 24]);
 
     // ----- Decoded variable values ------------------------------------
     // RECORDER BUG: spec-correct output would surface
