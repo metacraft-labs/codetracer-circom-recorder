@@ -628,6 +628,760 @@ fn test_recorded_trace_via_ct_print_json() {
 }
 
 // ===========================================================================
+// Per-program ct-print --full coverage tests
+// ===========================================================================
+//
+// These tests follow the recorder-test-requirements policy
+// (`metacraft-specs/policies/recorder-test-requirements.md`):
+//
+// * Each test records one Circom program through the recorder's
+//   normal entry point.
+// * The produced `.ct` is piped through `ct-print --full --strip-paths`.
+// * Assertions are made on the **decoded JSON document** with EXACT
+//   counts (`assert_eq!(events.len(), N)` — never `>=`), EXACT
+//   ordering (later step from a strictly later source line where
+//   applicable), and EXACT decoded values
+//   (`value["i"] == 42`, `value["kind"] == "Int"`).
+//
+// `ValueRecord` variants outside the expected set are rejected with
+// a hard error message asking the test author to extend the test
+// rather than weaken the assertion.
+//
+// Where the recorder's current behaviour deviates from what the
+// language semantics dictate (e.g. constants on the RHS of `<==`
+// surfacing as 0 when the circuit has no `signal input` declarations,
+// or `===` constraint asserts not producing a dedicated event), the
+// deviation is documented inline as `RECORDER BUG: ...` and a
+// parallel `#[ignore]`d assertion captures the spec-correct
+// expectation so it surfaces the moment the recorder catches up.
+//
+// Universal-checklist categories that are **n/a for Circom** and
+// therefore have no test program here:
+//
+// * Exceptions / errors with a handler — Circom has no `try`/`catch`;
+//   the only failure mode is a constraint violation (`===`), which
+//   aborts the witness calculator.  Covered by
+//   `constraint_assert_test.circom` (the success branch — failure
+//   would mean the recorder couldn't produce a trace at all).
+// * Mutable state outside templates / global variables — Circom has
+//   none.
+// * Concurrency — Circom is single-threaded by construction.
+// * General I/O (stdout, file read) — Circom has no I/O surface
+//   beyond `log()` (already covered by
+//   `circom_log_directive_emits_evm_event_special_event` in the
+//   integration_tests suite).
+
+/// Skip-helper: returns `Some(path)` to ct-print or logs a clear
+/// `SKIP:` diagnostic and returns `None`.  The
+/// `verify-cli-convention-no-silent-skip.sh` script greps for the
+/// literal `SKIP:` token, so silent skips remain forbidden.
+fn ct_print_or_skip(test_name: &str) -> Option<PathBuf> {
+    let p = ct_print_path();
+    if !p.exists() {
+        eprintln!(
+            "SKIP: {test_name} requires ct-print at {} — only available \
+            within the metacraft workspace where codetracer-trace-format-nim \
+            is a sibling.",
+            p.display()
+        );
+        return None;
+    }
+    Some(p)
+}
+
+/// Record a program and return the `ct-print --full --strip-paths`
+/// JSON document plus the absolute path to the source file (so the
+/// caller can match `metadata.program`).  Returns `None` when
+/// `ct-print` is unavailable (the caller has already emitted a
+/// `SKIP:` line via `ct_print_or_skip`).
+fn record_and_dump_full(test_name: &str, program: &str) -> Option<(serde_json::Value, PathBuf)> {
+    let ct_print = ct_print_or_skip(test_name)?;
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = tmp_dir.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let source_path = test_programs_dir().join(program);
+    codetracer_circom_recorder::recorder::record(&source_path, &out_dir, false)
+        .expect("recorder::record should succeed");
+
+    let ct_files = ct_files_in(&out_dir);
+    assert!(
+        !ct_files.is_empty(),
+        "expected a .ct container in {:?}",
+        out_dir
+    );
+
+    let output = Command::new(&ct_print)
+        .args(["--full", "--strip-paths"])
+        .arg(&ct_files[0])
+        .output()
+        .expect("failed to run ct-print --full");
+
+    assert!(
+        output.status.success(),
+        "ct-print --full should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("ct-print --full should emit valid JSON");
+
+    drop(tmp_dir);
+
+    Some((doc, source_path))
+}
+
+/// Decode every (varname, i64) pair from step events, in event-emission
+/// order.  Rejects any `ValueRecord` variant other than `Int` with a
+/// hard error that asks the test author to extend the test rather
+/// than weaken it.
+fn observed_int_vars(doc: &serde_json::Value) -> Vec<(String, i64)> {
+    let events = doc["events"].as_array().expect("events array");
+    let mut out = Vec::new();
+    for ev in events {
+        if ev["kind"] != "step" {
+            continue;
+        }
+        let Some(vars) = ev["vars"].as_array() else {
+            continue;
+        };
+        for v in vars {
+            let name = v["varname"].as_str().expect("varname str").to_string();
+            let value = &v["value"];
+            assert_eq!(
+                value["kind"].as_str(),
+                Some("Int"),
+                "variable `{}` should decode as Int, got {}; \
+                if a new ValueRecord variant has landed for Circom \
+                (e.g. BigInt for out-of-range field elements), extend \
+                this test to assert on it explicitly rather than \
+                weakening the check",
+                name,
+                value
+            );
+            let i = value["i"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("Int.i must be i64 for `{name}`; got {value}"));
+            out.push((name, i));
+        }
+    }
+    out
+}
+
+/// Decode the call-entry sequence as a vector of function names.
+fn observed_call_sequence(doc: &serde_json::Value) -> Vec<String> {
+    doc["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .map(|e| {
+            e["function"]
+                .as_str()
+                .expect("call_entry.function str")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Decode the call-exit sequence as a vector of function names.
+fn observed_exit_sequence(doc: &serde_json::Value) -> Vec<String> {
+    doc["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            e["function"]
+                .as_str()
+                .expect("call_exit.function str")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Assert that every `step` event carries a strictly increasing
+/// `step_index`.  This is the recorder's only ordering guarantee
+/// against duplicates / reorderings.
+fn assert_step_indices_monotonic(doc: &serde_json::Value) {
+    let mut last = -1i64;
+    for ev in doc["events"].as_array().expect("events array") {
+        if ev["kind"] != "step" {
+            continue;
+        }
+        let idx = ev["step_index"]
+            .as_i64()
+            .expect("step_index must be present on step events");
+        assert!(
+            idx > last,
+            "step_index must strictly increase; got {idx} after {last}"
+        );
+        last = idx;
+    }
+}
+
+/// Assert `metadata.program` ends with the expected source filename.
+fn assert_metadata_program_ends_with(doc: &serde_json::Value, source_path: &Path) {
+    let prog = doc["metadata"]["program"]
+        .as_str()
+        .expect("metadata.program str");
+    let want = source_path.file_name().unwrap().to_string_lossy();
+    assert!(
+        prog.ends_with(&*want),
+        "metadata.program {prog} must end with {want}"
+    );
+}
+
+// --- control_flow_test.circom ---------------------------------------------
+
+/// Records `control_flow_test.circom` and asserts on the **current
+/// observed** event shape.  The program exercises Circom's `var`
+/// mutability, `if`/`else`, and `for` loops over a compile-time `var`
+/// bound — all of which the compiler unrolls/folds before the witness
+/// calculator runs.  RECORDER BUG: Circom 2.1.5 with `--O0` produces
+/// only the three top-level output signals in the witness when no
+/// `signal input` is declared, AND every output value comes through
+/// as 0 instead of the constant the source program assigns.  The
+/// `#[ignore]`d sibling test pins the spec-correct expectation
+/// (total=20, bonus=100, result=120) so it surfaces the moment the
+/// recorder catches up.
+#[test]
+fn test_control_flow_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_control_flow_test_via_ct_print_full",
+        "control_flow_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    // Only the `ControlFlow` template is defined; `component main` does
+    // not appear because the recorder skips the synthesised toplevel
+    // call and registers only template definitions.
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["ControlFlow"]);
+
+    // ----- counts -----------------------------------------------------
+    // 7 step events: 1 toplevel start step (line 1) + 3 signal-decl
+    // steps (lines 17,18,19 for the three output declarations) + 3
+    // assignment steps (lines 35,36,37 for `total/bonus/result`).
+    // No call_entry/exit because the only template instantiation is
+    // `component main = ControlFlow()` which the recorder does not
+    // emit as a call (the toplevel frame already covers it).
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(7), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(0), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(7),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 7, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    // RECORDER BUG: spec-compliant output would include a call_entry
+    // for the main `ControlFlow` template (depth 0), and ideally a
+    // step-per-iteration of the `for` loop and a step on the chosen
+    // `if` branch.  Today the for/if constructs are completely
+    // invisible — they're not parsed at all, only the surrounding
+    // `<==` lines are.
+    assert_eq!(observed_call_sequence(&doc), Vec::<String>::new());
+
+    // ----- Exact step lines (in order) --------------------------------
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(step_lines, vec![1, 17, 18, 19, 35, 36, 37]);
+
+    // ----- Decoded variable values ------------------------------------
+    // RECORDER BUG: spec-correct output would surface
+    // total=20, bonus=100, result=120.  Today every signal value comes
+    // through as 0 because the witness calculator returns 0 for every
+    // signal in a circuit with no declared `signal input` — see the
+    // `#[ignore]`d sibling test for the spec-correct expectation.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("total".to_string(), 0),
+            ("bonus".to_string(), 0),
+            ("result".to_string(), 0),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "RECORDER BUG: in a Circom circuit with no `signal input` \
+            declarations, every output signal surfaces as 0 in the \
+            trace even though the source assigns a constant via \
+            `<==`.  Tracking expectation: control_flow_test.circom \
+            should yield [(\"total\", 20), (\"bonus\", 100), \
+            (\"result\", 120)]."]
+fn test_control_flow_test_constants_decode() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_control_flow_test_constants_decode",
+        "control_flow_test.circom",
+    ) else {
+        return;
+    };
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("total".to_string(), 20),
+            ("bonus".to_string(), 100),
+            ("result".to_string(), 120),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "RECORDER BUG: `for` loop iterations and `if`/`else` branch \
+            selection are not surfaced in the trace at all — neither \
+            as iteration steps nor as branch markers.  Tracking \
+            expectation: control_flow_test.circom should emit at least \
+            one step per loop iteration and one step on the taken \
+            `if` branch (lines 28-29 in this fixture)."]
+fn test_control_flow_test_for_and_if_steps_emitted() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_control_flow_test_for_and_if_steps_emitted",
+        "control_flow_test.circom",
+    ) else {
+        return;
+    };
+    let events = doc["events"].as_array().unwrap();
+    let step_lines: std::collections::BTreeSet<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().unwrap())
+        .collect();
+    // Loop body line is 24; the taken-branch body line is 29.  Both
+    // should be visited at least once.
+    assert!(
+        step_lines.contains(&24),
+        "expected a step at the for-loop body (line 24); got {step_lines:?}"
+    );
+    assert!(
+        step_lines.contains(&29),
+        "expected a step at the taken if-branch (line 29); got {step_lines:?}"
+    );
+}
+
+// --- nested_template_test.circom ------------------------------------------
+
+/// Records `nested_template_test.circom`, which exercises a
+/// three-deep template chain (`NestedTemplate` -> `Middle` -> `Inner`)
+/// where each template instantiates exactly one sub-component and
+/// forwards its single output.  The recorder is expected to surface
+/// every template definition in the function table and emit one
+/// `call_entry` / `call_exit` pair per concrete sub-component
+/// instance (skipping `component main` which the toplevel frame
+/// already covers).
+#[test]
+fn test_nested_template_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_nested_template_test_via_ct_print_full",
+        "nested_template_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table — order is writer-assignment order ---------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["Inner", "Middle", "NestedTemplate"]);
+
+    // ----- counts -----------------------------------------------------
+    // 9 step events + 2 call_entry + 2 call_exit = 13 events.
+    // RECORDER BUG: spec-compliant output would emit 3 call pairs
+    // (one for each level: NestedTemplate, Middle, Inner) — not 2 —
+    // since the chain is genuinely 3 deep.  Today the recorder skips
+    // the call for `component main = NestedTemplate()` because it
+    // would shadow the synthesised toplevel frame, dropping the
+    // observable depth from 3 to 2.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 13, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call entry order -------------------------------------------
+    // RECORDER BUG: the entry order today is [Inner, Middle] because
+    // the recorder iterates `parse_component_instances(source_code)`
+    // in source-line order and `inner` (line 24) appears before
+    // `middle` (line 31) in the file even though semantically Middle
+    // is the parent of Inner.  Spec-compliant output would be
+    // [NestedTemplate, Middle, Inner] in nesting order.
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["Inner".to_string(), "Middle".to_string()],
+    );
+
+    // ----- Call exit order: matches entry order, not LIFO -------------
+    // RECORDER BUG: spec-compliant output would be the LIFO closure of
+    // the entry order ([Inner, Middle, NestedTemplate]).  Today the
+    // recorder closes the calls in entry order — [Middle, Inner] —
+    // because `emit_source_trace` issues `register_return` in a flat
+    // counted loop after emitting all assignment steps, not paired
+    // with each call_entry.
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Middle".to_string(), "Inner".to_string()],
+    );
+
+    // ----- Exact decoded variable values ------------------------------
+    // RECORDER BUG: spec-correct output would surface
+    // outer_result=113 (and ideally also middle.out=13 and inner.out=3).
+    // Today the only sub-template output that surfaces is the
+    // top-level signal `outer_result`, and its value comes through
+    // as 0 because the recorder maps sub-template outputs through the
+    // `main.<comp>.<signal>` .sym entries which are absent for
+    // intermediate output signals in this fixture's optimised witness.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![("outer_result".to_string(), 0)],
+    );
+}
+
+#[test]
+#[ignore = "RECORDER BUG: nested-template intermediate output values \
+            are not surfaced in the trace.  Tracking expectation: \
+            nested_template_test.circom should yield decoded values \
+            for `inner.out` (=3), `middle.out` (=13), and \
+            `outer_result` (=113)."]
+fn test_nested_template_test_intermediate_outputs_decode() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_nested_template_test_intermediate_outputs_decode",
+        "nested_template_test.circom",
+    ) else {
+        return;
+    };
+    let observed = observed_int_vars(&doc);
+    for want in [
+        ("inner.out".to_string(), 3i64),
+        ("middle.out".to_string(), 13i64),
+        ("outer_result".to_string(), 113i64),
+    ] {
+        assert!(
+            observed.contains(&want),
+            "expected {want:?} in observed = {observed:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "RECORDER BUG: `component main` is dropped from the \
+            call-entry sequence to avoid shadowing the toplevel \
+            frame, which collapses an N-deep template chain into N-1 \
+            visible calls.  Tracking expectation: \
+            nested_template_test.circom is genuinely 3 deep \
+            (NestedTemplate -> Middle -> Inner) and the recorder \
+            should surface 3 call pairs in nesting order \
+            [NestedTemplate, Middle, Inner] with LIFO exits."]
+fn test_nested_template_test_three_deep_call_sequence() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_nested_template_test_three_deep_call_sequence",
+        "nested_template_test.circom",
+    ) else {
+        return;
+    };
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "NestedTemplate".to_string(),
+            "Middle".to_string(),
+            "Inner".to_string(),
+        ],
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "Inner".to_string(),
+            "Middle".to_string(),
+            "NestedTemplate".to_string(),
+        ],
+    );
+}
+
+// --- signal_hierarchy_test.circom -----------------------------------------
+
+/// Records `signal_hierarchy_test.circom`, which exercises the
+/// recorder's per-component argument-staging path: the top-level
+/// template instantiates two sub-templates and wires the first
+/// sub-template's output (`add5.y`) into the second sub-template's
+/// input (`mul2.in`).  This is the only construct that drives
+/// `writer.arg(name, value)` followed by `register_call` in the
+/// emitted trace.
+#[test]
+fn test_signal_hierarchy_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_signal_hierarchy_test_via_ct_print_full",
+        "signal_hierarchy_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table — definition order in the source file -------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["Add5", "Mul2", "SignalHierarchy"]);
+
+    // ----- counts -----------------------------------------------------
+    // 13 step events + 2 call_entry + 2 call_exit = 17 events.
+    let counts = &doc["counts"];
+    assert_eq!(
+        counts["steps"].as_u64(),
+        Some(13),
+        "steps; counts={counts}"
+    );
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 17, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence: [Add5, Mul2] in source-instantiation order -
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["Add5".to_string(), "Mul2".to_string()],
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Mul2".to_string(), "Add5".to_string()],
+    );
+
+    // ----- Call_entry args: each sub-component's input signal is staged
+    // with its current witness value (0 today — see RECORDER BUG note
+    // on `test_control_flow_test_via_ct_print_full`).
+    let call_entries: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .collect();
+    assert_eq!(call_entries.len(), 2);
+
+    let add5_args = call_entries[0]["args"].as_array().expect("Add5 args");
+    assert_eq!(add5_args.len(), 1);
+    assert_eq!(add5_args[0]["varname"].as_str(), Some("x"));
+    assert_eq!(add5_args[0]["value"]["kind"].as_str(), Some("Int"));
+    assert_eq!(add5_args[0]["value"]["i"].as_i64(), Some(0));
+
+    let mul2_args = call_entries[1]["args"].as_array().expect("Mul2 args");
+    assert_eq!(mul2_args.len(), 1);
+    assert_eq!(mul2_args[0]["varname"].as_str(), Some("in"));
+    assert_eq!(mul2_args[0]["value"]["kind"].as_str(), Some("Int"));
+    assert_eq!(mul2_args[0]["value"]["i"].as_i64(), Some(0));
+
+    // ----- Decoded variable values ------------------------------------
+    // RECORDER BUG: spec-correct output would surface the wired chain
+    // add5.x=4, add5.y=9, mul2.in=9, mul2.out=18, total=19.  Today
+    // every value is 0 — see the constants-decode #[ignore]d test on
+    // control_flow.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("x".to_string(), 0),
+            ("in".to_string(), 0),
+            ("add5.x".to_string(), 0),
+            ("mul2.in".to_string(), 0),
+            ("total".to_string(), 0),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "RECORDER BUG: signal-hierarchy chain values do not \
+            round-trip through the witness.  Tracking expectation: \
+            signal_hierarchy_test.circom should yield \
+            add5.x=4, add5.y=9, mul2.in=9, mul2.out=18, total=19."]
+fn test_signal_hierarchy_test_chain_values_decode() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_signal_hierarchy_test_chain_values_decode",
+        "signal_hierarchy_test.circom",
+    ) else {
+        return;
+    };
+    let observed = observed_int_vars(&doc);
+    for want in [
+        ("add5.x".to_string(), 4i64),
+        ("add5.y".to_string(), 9i64),
+        ("mul2.in".to_string(), 9i64),
+        ("mul2.out".to_string(), 18i64),
+        ("total".to_string(), 19i64),
+    ] {
+        assert!(
+            observed.contains(&want),
+            "expected {want:?} in observed = {observed:?}"
+        );
+    }
+}
+
+// --- constraint_assert_test.circom ----------------------------------------
+
+/// Records `constraint_assert_test.circom`, which exercises Circom's
+/// `===` constraint-assertion operator (the only language-level
+/// "panic" primitive).  Every `===` in this fixture holds, so the
+/// witness calculator succeeds; the recorder is expected to register
+/// the assertion lines in the trace.
+#[test]
+fn test_constraint_assert_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_constraint_assert_test_via_ct_print_full",
+        "constraint_assert_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["ConstraintAssert"]);
+
+    // ----- counts -----------------------------------------------------
+    // 9 step events: 1 toplevel + 4 signal-decl + 4 assignment.
+    // RECORDER BUG: the two `===` assertion lines (26 and 27) do
+    // **not** surface as steps or as a dedicated event kind — the
+    // parser only handles `<==`.  See
+    // test_constraint_assert_test_emits_assertion_steps below.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(0), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(9),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 9, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Exact step lines (in order) --------------------------------
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(step_lines, vec![1, 14, 15, 17, 18, 20, 21, 23, 24]);
+
+    // ----- Decoded variable values ------------------------------------
+    // RECORDER BUG: spec-correct output would surface
+    // a=6, b=7, sum=13, prod=42.  Today every value is 0 — see the
+    // constants-decode #[ignore]d test on control_flow.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("a".to_string(), 0),
+            ("b".to_string(), 0),
+            ("sum".to_string(), 0),
+            ("prod".to_string(), 0),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "RECORDER BUG: `===` constraint-assertion lines are not \
+            surfaced as steps or as a dedicated event kind — the \
+            parser only matches `<==`.  Tracking expectation: \
+            constraint_assert_test.circom lines 26 and 27 (the two \
+            `===` assertions) should each emit a step event."]
+fn test_constraint_assert_test_emits_assertion_steps() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_constraint_assert_test_emits_assertion_steps",
+        "constraint_assert_test.circom",
+    ) else {
+        return;
+    };
+    let events = doc["events"].as_array().unwrap();
+    let step_lines: std::collections::BTreeSet<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().unwrap())
+        .collect();
+    assert!(
+        step_lines.contains(&26),
+        "expected a step at line 26 (sum === a + b); got {step_lines:?}"
+    );
+    assert!(
+        step_lines.contains(&27),
+        "expected a step at line 27 (prod === 42); got {step_lines:?}"
+    );
+}
+
+#[test]
+#[ignore = "RECORDER BUG: constants on the RHS of `<==` surface as 0 \
+            in a circuit with no `signal input` declarations.  \
+            Tracking expectation: constraint_assert_test.circom \
+            should yield a=6, b=7, sum=13, prod=42."]
+fn test_constraint_assert_test_constants_decode() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_constraint_assert_test_constants_decode",
+        "constraint_assert_test.circom",
+    ) else {
+        return;
+    };
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("a".to_string(), 6),
+            ("b".to_string(), 7),
+            ("sum".to_string(), 13),
+            ("prod".to_string(), 42),
+        ],
+    );
+}
+
+// ===========================================================================
 // CLI env-var contract
 // ===========================================================================
 
