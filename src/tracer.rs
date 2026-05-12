@@ -453,6 +453,15 @@ struct ComponentInstance {
     template_name: String,
     /// 1-based line number where the component is instantiated.
     line: u32,
+    /// Name of the template body this component is declared inside, or
+    /// `None` if it appears at file scope (i.e. `component main = ...`).
+    /// Used to build the nesting tree so the recorder can emit
+    /// `register_call` events in nesting order (root → leaf) rather than
+    /// in raw source-line order.  Required to surface a 3-deep template
+    /// chain (`NestedTemplate -> Middle -> Inner`) as three calls in
+    /// nesting order — see
+    /// `tests/test_tracer.rs::test_nested_template_test_three_deep_call_sequence`.
+    parent_template: Option<String>,
 }
 
 /// A parsed template definition.
@@ -988,17 +997,22 @@ impl CircomTracer {
     ) -> Result<()> {
         let field_type_id = self.field_type_id.unwrap();
 
-        // Register function metadata for each template and emit calls for the
-        // concrete component instantiations in source order.
-        //
-        // The `component main = ...` instance is intentionally skipped because
-        // TraceWriter::start() already created a <toplevel> Call at depth 0.
-        // Emitting a nested call for the main component would push all
-        // subsequent steps to depth 1, breaking the db-backend's step-over
-        // behavior from the initial depth-0 position.
+        // Register function metadata for each template, then emit Call /
+        // Return events for the concrete component instantiations in
+        // *nesting* order (root → leaf).  The `component main = ...`
+        // instance is the outermost frame — every other recorder in the
+        // CodeTracer family surfaces its entry-point function as a Call
+        // event so the calltrace pane shows the full N-deep stack rather
+        // than N-1 visible frames (see the PHP recorder's synthetic
+        // `<toplevel>` Call in `codetracer-php-recorder@423e4ba`).  For
+        // Circom the natural entry point is the `main` component's own
+        // template, so we emit a real Call for it instead of a synthetic
+        // marker.
         //
         // Sub-component signal values are available by this point via the
-        // witness `.sym` map, using keys such as `adder.a` and `adder.b`.
+        // witness `.sym` map, using keys such as `adder.a` and `adder.b`
+        // (and the top-level template's own input signals, keyed without
+        // the `main.` prefix because `parse_sym_file` strips it).
         let mut template_fns: HashMap<String, FunctionId> = HashMap::new();
         let templates_by_name: HashMap<&str, &TemplateDef> = templates
             .iter()
@@ -1014,11 +1028,17 @@ impl CircomTracer {
             template_fns.insert(template.name.clone(), fn_id);
         }
 
+        // Order the component instances so that `main` comes first and
+        // each child is emitted immediately after its parent (depth-first).
+        // Without this re-ordering the source-line iteration would visit
+        // the innermost `component inner = Inner()` before its enclosing
+        // `component middle = Middle()`, producing a call sequence that
+        // contradicts the template nesting.
+        let ordered_components: Vec<&ComponentInstance> =
+            order_components_by_nesting(component_instances);
+
         let mut emitted_component_calls = 0usize;
-        for component in component_instances {
-            if component.name == "main" {
-                continue;
-            }
+        for component in &ordered_components {
             let Some(template) = templates_by_name.get(component.template_name.as_str()) else {
                 continue;
             };
@@ -1027,10 +1047,19 @@ impl CircomTracer {
             };
 
             TraceWriter::register_step(&mut *self.writer, source_path, Line(component.line as i64));
+            // For sub-components, signal values appear in `values` keyed
+            // as `<component>.<signal>`; for the `main` component, the
+            // .sym parser has already stripped the `main.` prefix, so we
+            // look up bare signal names.
+            let is_main = component.name == "main";
             for input_name in &template.input_signals {
-                let signal_key = format!("{}.{}", component.name, input_name);
+                let lookup_key: String = if is_main {
+                    input_name.clone()
+                } else {
+                    format!("{}.{}", component.name, input_name)
+                };
                 let value = values
-                    .get(&signal_key)
+                    .get(&lookup_key)
                     .map(|&val| ValueRecord::Int {
                         i: val,
                         type_id: field_type_id,
@@ -1163,34 +1192,148 @@ fn parse_signal_assignments(source: &str) -> Vec<SignalAssignment> {
     assignments
 }
 
+/// Order component instances depth-first by template-nesting so each
+/// parent precedes every component declared inside that parent's
+/// template body.
+///
+/// The root is the file-scope `component main = TemplateX()` declaration
+/// (`parent_template == None`); from there we walk every component whose
+/// `parent_template` matches the parent's *template_name*, recursively.
+/// Within a single template body, sub-components stay in source-line
+/// order — which matches the convention of every other recorder in the
+/// CodeTracer family that emits sibling calls in source-instantiation
+/// order (`signal_hierarchy_test.circom` keeps `[Add5, Mul2]` because
+/// they are declared in that order in `SignalHierarchy`'s body).
+///
+/// Components whose parent template is missing from the input slice
+/// (defensive against malformed sources) are appended at the end in
+/// source order so the recorder still surfaces them.
+fn order_components_by_nesting(components: &[ComponentInstance]) -> Vec<&ComponentInstance> {
+    let mut out: Vec<&ComponentInstance> = Vec::with_capacity(components.len());
+    let mut emitted = vec![false; components.len()];
+
+    // Locate the file-scope `main` component (parent_template == None).
+    // There is at most one in a well-formed Circom program.
+    let Some(main_idx) = components.iter().position(|c| c.parent_template.is_none()) else {
+        // No `component main` line — fall back to source order so the
+        // recorder still emits *something* sensible.
+        return components.iter().collect();
+    };
+
+    // Depth-first walk starting at main.  At each node we visit every
+    // component whose `parent_template` equals the current node's
+    // *template_name* (i.e. the components declared inside the current
+    // node's template body), in source-line order.
+    fn dfs<'a>(
+        idx: usize,
+        components: &'a [ComponentInstance],
+        emitted: &mut [bool],
+        out: &mut Vec<&'a ComponentInstance>,
+    ) {
+        if emitted[idx] {
+            return;
+        }
+        emitted[idx] = true;
+        out.push(&components[idx]);
+        let parent_template_name = components[idx].template_name.as_str();
+        // Children are every component whose declaring template body is
+        // `parent_template_name`.  Source-line order is preserved because
+        // we scan `components` in input order (which `parse_component_instances`
+        // builds in source-line order).
+        for (child_idx, child) in components.iter().enumerate() {
+            if emitted[child_idx] {
+                continue;
+            }
+            if let Some(parent) = &child.parent_template {
+                if parent == parent_template_name {
+                    dfs(child_idx, components, emitted, out);
+                }
+            }
+        }
+    }
+
+    dfs(main_idx, components, &mut emitted, &mut out);
+
+    // Append any leftover components (orphans whose parent template is
+    // missing or unreachable from `main`) in source order.
+    for (i, c) in components.iter().enumerate() {
+        if !emitted[i] {
+            out.push(c);
+        }
+    }
+
+    out
+}
+
 /// Parse component instantiations from Circom source code.
+///
+/// Tracks the *parent* template body each component is declared inside so
+/// the recorder can later walk the resulting tree in nesting order.
+/// Components declared at file scope (the `component main = ...` line)
+/// receive `parent_template = None`.
 fn parse_component_instances(source: &str) -> Vec<ComponentInstance> {
     let mut components = Vec::new();
+    // The template body currently in scope (or `None` at file scope) and
+    // the brace depth inside it.  Circom does not allow nested template
+    // definitions, so a single-entry stack is sufficient.
+    let mut current_template: Option<String> = None;
+    let mut brace_depth: i32 = 0;
 
     for (line_idx, line_text) in source.lines().enumerate() {
         let line_num = (line_idx + 1) as u32;
         let trimmed = line_text.trim();
 
-        let Some(after_component) = trimmed.strip_prefix("component ") else {
-            continue;
-        };
-        let Some(eq_pos) = after_component.find('=') else {
-            continue;
-        };
+        // Detect a template-header line *before* updating brace depth so
+        // the body's opening `{` on the same line is counted toward that
+        // template.
+        if current_template.is_none() {
+            if let Some(after_template) = trimmed.strip_prefix("template ") {
+                if let Some(paren_pos) = after_template.find('(') {
+                    let name = after_template[..paren_pos].trim().to_string();
+                    if !name.is_empty() {
+                        current_template = Some(name);
+                        brace_depth = 0;
+                    }
+                }
+            }
+        }
 
-        let name = after_component[..eq_pos].trim();
-        let after_eq = after_component[eq_pos + 1..].trim();
-        let Some(paren_pos) = after_eq.find('(') else {
-            continue;
-        };
-        let template_name = after_eq[..paren_pos].trim();
+        // Detect a component instantiation on this line.  The recorded
+        // parent is the template body we're currently inside (if any).
+        if let Some(after_component) = trimmed.strip_prefix("component ") {
+            if let Some(eq_pos) = after_component.find('=') {
+                let name = after_component[..eq_pos].trim();
+                let after_eq = after_component[eq_pos + 1..].trim();
+                if let Some(paren_pos) = after_eq.find('(') {
+                    let template_name = after_eq[..paren_pos].trim();
+                    if !name.is_empty() && !template_name.is_empty() {
+                        components.push(ComponentInstance {
+                            name: name.to_string(),
+                            template_name: template_name.to_string(),
+                            line: line_num,
+                            parent_template: current_template.clone(),
+                        });
+                    }
+                }
+            }
+        }
 
-        if !name.is_empty() && !template_name.is_empty() {
-            components.push(ComponentInstance {
-                name: name.to_string(),
-                template_name: template_name.to_string(),
-                line: line_num,
-            });
+        // Update brace depth and pop the current template when its body
+        // closes.
+        if current_template.is_some() {
+            for ch in trimmed.chars() {
+                match ch {
+                    '{' => brace_depth += 1,
+                    '}' => {
+                        brace_depth -= 1;
+                        if brace_depth <= 0 {
+                            current_template = None;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -1481,14 +1624,88 @@ template FlowTest() {
                     name: "adder".to_string(),
                     template_name: "Adder".to_string(),
                     line: 2,
+                    // `adder` is declared inside the `ComponentTest`
+                    // template body, so its parent_template tracks that.
+                    parent_template: Some("ComponentTest".to_string()),
                 },
                 ComponentInstance {
                     name: "main".to_string(),
                     template_name: "ComponentTest".to_string(),
                     line: 4,
+                    // `component main = ...` is at file scope, so it has
+                    // no parent template body — it's the root.
+                    parent_template: None,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_order_components_by_nesting_three_deep_chain() {
+        // Mirror the nesting structure of nested_template_test.circom:
+        // file scope:  component main = NestedTemplate()  (line 35)
+        // NestedTemplate body: component middle = Middle()  (line 31)
+        // Middle body:         component inner = Inner()    (line 24)
+        //
+        // The parser visits them in source-line order [inner, middle, main],
+        // but `order_components_by_nesting` must reshape that into nesting
+        // order [main (NestedTemplate), middle, inner] so the recorder
+        // emits an N-deep template chain as N nested call_entry events.
+        let inner = ComponentInstance {
+            name: "inner".to_string(),
+            template_name: "Inner".to_string(),
+            line: 24,
+            parent_template: Some("Middle".to_string()),
+        };
+        let middle = ComponentInstance {
+            name: "middle".to_string(),
+            template_name: "Middle".to_string(),
+            line: 31,
+            parent_template: Some("NestedTemplate".to_string()),
+        };
+        let main = ComponentInstance {
+            name: "main".to_string(),
+            template_name: "NestedTemplate".to_string(),
+            line: 35,
+            parent_template: None,
+        };
+        let components = vec![inner.clone(), middle.clone(), main.clone()];
+
+        let ordered = order_components_by_nesting(&components);
+        let names: Vec<&str> = ordered.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["main", "middle", "inner"]);
+    }
+
+    #[test]
+    fn test_order_components_by_nesting_two_siblings() {
+        // Mirror signal_hierarchy_test.circom: `main = SignalHierarchy()`
+        // contains two siblings `add5` and `mul2`, in source order.  The
+        // nesting-order traversal must preserve sibling source order so
+        // recorders emit the calls in the order users see them in the
+        // file (`[SignalHierarchy, add5, mul2]`).
+        let add5 = ComponentInstance {
+            name: "add5".to_string(),
+            template_name: "Add5".to_string(),
+            line: 33,
+            parent_template: Some("SignalHierarchy".to_string()),
+        };
+        let mul2 = ComponentInstance {
+            name: "mul2".to_string(),
+            template_name: "Mul2".to_string(),
+            line: 34,
+            parent_template: Some("SignalHierarchy".to_string()),
+        };
+        let main = ComponentInstance {
+            name: "main".to_string(),
+            template_name: "SignalHierarchy".to_string(),
+            line: 41,
+            parent_template: None,
+        };
+        let components = vec![add5.clone(), mul2.clone(), main.clone()];
+
+        let ordered = order_components_by_nesting(&components);
+        let names: Vec<&str> = ordered.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["main", "add5", "mul2"]);
     }
 
     #[test]
