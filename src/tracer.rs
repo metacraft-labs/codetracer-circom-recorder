@@ -16,6 +16,7 @@ use num_bigint::BigUint;
 use wasmtime::{Caller, Engine, Func, Linker, Module, Store, Val};
 
 use crate::cpp_witness::{self, CompilerSourceMap};
+use crate::evaluator::{self as eval_mod, EvalContext, EvalEventKind, Template as ETemplate};
 use crate::signal_hierarchy::{build_hierarchy, SignalPath};
 use crate::source_map::SourceMap;
 
@@ -982,14 +983,35 @@ impl CircomTracer {
         Ok(())
     }
 
-    /// Emit trace events by walking through the source code.
+    /// Emit trace events by evaluating the parsed Circom source.
+    ///
+    /// 2026-05-13: this used to be a flat brace-tracking parser that
+    /// emitted *all* component calls first, then *all* signal-decl
+    /// steps, then *all* assignment steps, then *all* call-exits — and
+    /// took every signal value from the witness regardless of whether
+    /// the witness had been driven by user-visible inputs.  The result
+    /// was that circuits without `signal input` declarations surfaced
+    /// every output as 0, `for`/`if` body lines never produced step
+    /// events, `===` constraint-assertion lines were silently dropped,
+    /// and sub-template intermediate outputs were invisible.
+    ///
+    /// The new flow uses the structured `evaluator` module: parse each
+    /// template body into `Stmt`s, walk the main template in source
+    /// order, recurse into sub-component instantiations as
+    /// `ComponentEnter` events surface, and emit step / variable
+    /// events from the evaluator's per-line trace.  Sub-template
+    /// signal names are prefixed with their component path so the
+    /// trace surfaces `add5.y`, `inner.out`, etc. as the user-visible
+    /// signal names — and the values are the evaluator's
+    /// compile-time-folded results, not the witness's "every signal is
+    /// 0" output for inputless circuits.
     #[allow(clippy::too_many_arguments)]
     fn emit_source_trace(
         &mut self,
         source_path: &Path,
         _source_map: &SourceMap,
-        signals: &[SignalDecl],
-        assignments: &[SignalAssignment],
+        _signals: &[SignalDecl],
+        _assignments: &[SignalAssignment],
         templates: &[TemplateDef],
         component_instances: &[ComponentInstance],
         values: &HashMap<String, i64>,
@@ -997,22 +1019,315 @@ impl CircomTracer {
     ) -> Result<()> {
         let field_type_id = self.field_type_id.unwrap();
 
-        // Register function metadata for each template, then emit Call /
-        // Return events for the concrete component instantiations in
-        // *nesting* order (root → leaf).  The `component main = ...`
-        // instance is the outermost frame — every other recorder in the
-        // CodeTracer family surfaces its entry-point function as a Call
-        // event so the calltrace pane shows the full N-deep stack rather
-        // than N-1 visible frames (see the PHP recorder's synthetic
-        // `<toplevel>` Call in `codetracer-php-recorder@423e4ba`).  For
-        // Circom the natural entry point is the `main` component's own
-        // template, so we emit a real Call for it instead of a synthetic
-        // marker.
+        // Register function metadata for each template *defined* in the
+        // file.  The function table is what `ct print` surfaces, so we
+        // must register every user-defined template name regardless of
+        // whether it gets called from `main` (cross-recorder convention
+        // for `functions[]` ordering).
+        let mut template_fns: HashMap<String, FunctionId> = HashMap::new();
+        for template in templates {
+            let fn_id = TraceWriter::ensure_function_id(
+                &mut *self.writer,
+                &template.name,
+                source_path,
+                Line(template.line as i64),
+            );
+            template_fns.insert(template.name.clone(), fn_id);
+        }
+
+        // The `component main = X()` instance is the entry point.
+        // Without it there is no chain to evaluate; degrade to the
+        // legacy flat flow so circuits that lack a main component
+        // still produce *some* trace output.
+        let Some(main_inst) = component_instances
+            .iter()
+            .find(|c| c.parent_template.is_none())
+        else {
+            return self.emit_legacy_flat(
+                source_path,
+                _signals,
+                _assignments,
+                templates,
+                component_instances,
+                values,
+            );
+        };
+
+        // Parse every template body using the evaluator's structured
+        // parser.  Template definitions that the evaluator can't parse
+        // (e.g. they use language constructs the evaluator doesn't
+        // model) won't appear in the map; we'll degrade to a flat
+        // signal-decl/assignment dump for those.
+        let source_code = std::fs::read_to_string(source_path)
+            .with_context(|| format!("failed to re-read {}", source_path.display()))?;
+        let parsed: Vec<ETemplate> = eval_mod::parse_templates(&source_code);
+        let mut tmpl_map: HashMap<String, ETemplate> = HashMap::new();
+        for t in parsed {
+            tmpl_map.insert(t.name.clone(), t);
+        }
+
+        // ------------------------------------------------------------
+        // Step 1 — main component step (visible at file scope).
+        // ------------------------------------------------------------
+        TraceWriter::register_step(
+            &mut *self.writer,
+            source_path,
+            Line(main_inst.line as i64),
+        );
+
+        // ------------------------------------------------------------
+        // Step 2 — main template's input signal values.  Today the
+        // recorder defaults all main inputs to 0 (no JSON wiring).
+        // The witness map (`values`) is the source of truth here.
+        // ------------------------------------------------------------
+        let main_input_values: HashMap<String, i64> = if let Some(t) = tmpl_map.get(&main_inst.template_name) {
+            t.input_signals
+                .iter()
+                .map(|name| (name.clone(), values.get(name).copied().unwrap_or(0)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        // ------------------------------------------------------------
+        // Step 3 — emit call_entry for main, recurse, emit call_exit.
+        // ------------------------------------------------------------
+        let Some(&main_fn_id) = template_fns.get(&main_inst.template_name) else {
+            return self.emit_legacy_flat(
+                source_path,
+                _signals,
+                _assignments,
+                templates,
+                component_instances,
+                values,
+            );
+        };
+
+        // Stage main's input signal arguments before register_call.
+        if let Some(t) = tmpl_map.get(&main_inst.template_name) {
+            for input_name in &t.input_signals {
+                let v = main_input_values.get(input_name).copied().unwrap_or(0);
+                let value = ValueRecord::Int {
+                    i: v,
+                    type_id: field_type_id,
+                };
+                let _ = TraceWriter::arg(&mut *self.writer, input_name, value);
+            }
+        }
+        TraceWriter::register_call(&mut *self.writer, main_fn_id, vec![]);
+
+        if tmpl_map.contains_key(&main_inst.template_name) {
+            self.evaluate_and_emit(
+                source_path,
+                &main_inst.template_name,
+                "", // main has no name prefix for its signals
+                &main_input_values,
+                Vec::new(),
+                &tmpl_map,
+                &template_fns,
+            );
+        }
+
+        // Close the call_entry above for `main`.
+        TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
+
+        Ok(())
+    }
+
+    /// Recursively evaluate a template instantiation and emit trace
+    /// events for every step / variable / sub-component call.  Returns
+    /// the map of output-signal values (in the *unprefixed* sub-template
+    /// signal namespace) so the caller can resolve `comp.signal`
+    /// references.
+    ///
+    /// `signal_prefix` is the component path under which this template
+    /// is being called (e.g. `add5.`, `middle.inner.`).  Empty for the
+    /// outermost (main) frame.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_and_emit(
+        &mut self,
+        source_path: &Path,
+        template_name: &str,
+        signal_prefix: &str,
+        input_signals: &HashMap<String, i64>,
+        generic_args: Vec<i64>,
+        tmpl_map: &HashMap<String, ETemplate>,
+        template_fns: &HashMap<String, FunctionId>,
+    ) -> HashMap<String, i64> {
+        let field_type_id = self.field_type_id.unwrap();
+        let Some(template) = tmpl_map.get(template_name) else {
+            return HashMap::new();
+        };
+
+        // Pre-walk: collect wires per sub-component so we know each
+        // sub-component's input values *before* its call_entry fires.
+        // A wire is `comp.signal <== expr` (or `<--`); we evaluate the
+        // RHS in the parent's environment, with the inputs already
+        // bound and any prior var/signal updates applied.
         //
-        // Sub-component signal values are available by this point via the
-        // witness `.sym` map, using keys such as `adder.a` and `adder.b`
-        // (and the top-level template's own input signals, keyed without
-        // the `main.` prefix because `parse_sym_file` strips it).
+        // Pre-evaluating the parent body to harvest wires would
+        // double-evaluate, so we instead run the evaluator end-to-end
+        // and *replay* its event stream into the writer.  When a
+        // ComponentEnter event fires we look ahead through the
+        // evaluator stream for the sub-component's wires to compute
+        // its input values.
+
+        let ctx = EvalContext {
+            templates: tmpl_map,
+            input_signals: input_signals.clone(),
+            generic_args,
+        };
+        let result = eval_mod::evaluate_template(template, &ctx);
+
+        // Build a per-component wire map by scanning the evaluator
+        // events that follow each ComponentEnter — the next
+        // ComponentEnter (or end of stream) terminates that
+        // component's wire set.
+        //
+        // We then emit events in source order, recursing into
+        // sub-components when we hit their ComponentEnter event.
+        let events = &result.events;
+
+        // Pre-compute per-component input values from the Wire events
+        // anywhere in the stream (wires can appear after the
+        // ComponentEnter line).  A wire's `value` field is already the
+        // RHS evaluated in the parent's env (see Stmt::Assign in the
+        // evaluator), so we just collect them here.
+        let mut comp_inputs: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        for ev in events {
+            if let EvalEventKind::Wire {
+                comp_name,
+                signal_name,
+                value,
+            } = &ev.kind
+            {
+                comp_inputs
+                    .entry(comp_name.clone())
+                    .or_default()
+                    .insert(signal_name.clone(), *value);
+            }
+        }
+
+        // Per-component output map, populated as sub-components
+        // finish.  Used to resolve `comp.signal` reads if the
+        // evaluator's lookahead misses them.
+        let mut comp_outputs: HashMap<String, HashMap<String, i64>> = HashMap::new();
+
+        for ev in events {
+            match &ev.kind {
+                EvalEventKind::Step => {
+                    TraceWriter::register_step(
+                        &mut *self.writer,
+                        source_path,
+                        Line(ev.line as i64),
+                    );
+                }
+                EvalEventKind::Variable { name, value } => {
+                    TraceWriter::register_step(
+                        &mut *self.writer,
+                        source_path,
+                        Line(ev.line as i64),
+                    );
+                    let printable = if signal_prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        // Wires already use the form `comp.signal` —
+                        // don't double-prefix them.  A prefixed form is
+                        // only desirable for *plain* signal names
+                        // (`y` -> `add5.y`); names that already contain
+                        // a `.` belong to a sub-component the parent is
+                        // wiring and should be emitted as-is from the
+                        // recurse-down call (where signal_prefix
+                        // empty).  Inside a recursed call, the prefix
+                        // captures the component path from main.
+                        format!("{signal_prefix}{name}")
+                    };
+                    let value_record = ValueRecord::Int {
+                        i: *value,
+                        type_id: field_type_id,
+                    };
+                    TraceWriter::register_variable_with_full_value(
+                        &mut *self.writer,
+                        &printable,
+                        value_record,
+                    );
+                }
+                EvalEventKind::Wire { .. } => {
+                    // Wire events are bookkeeping only — the
+                    // accompanying Variable event (emitted from the
+                    // evaluator on the same line) carries the user-
+                    // visible step + variable for the parent frame.
+                }
+                EvalEventKind::ComponentEnter {
+                    comp_name,
+                    template: child_template,
+                    args,
+                } => {
+                    // Step at the component-decl line.
+                    TraceWriter::register_step(
+                        &mut *self.writer,
+                        source_path,
+                        Line(ev.line as i64),
+                    );
+                    let Some(&child_fn_id) = template_fns.get(child_template) else {
+                        continue;
+                    };
+                    let child_inputs = comp_inputs.remove(comp_name).unwrap_or_default();
+                    if let Some(child_tmpl) = tmpl_map.get(child_template) {
+                        for input_name in &child_tmpl.input_signals {
+                            let v = child_inputs.get(input_name).copied().unwrap_or(0);
+                            let value = ValueRecord::Int {
+                                i: v,
+                                type_id: field_type_id,
+                            };
+                            let _ = TraceWriter::arg(&mut *self.writer, input_name, value);
+                        }
+                    }
+                    TraceWriter::register_call(&mut *self.writer, child_fn_id, vec![]);
+
+                    // Recurse with a *single-level* signal prefix —
+                    // every recorder consumer (calltrace pane, locals
+                    // pane) names sub-template signals relative to
+                    // their immediate parent, e.g. `inner.out` rather
+                    // than `middle.inner.out`.  Accumulating the full
+                    // path makes signal names balloon and breaks
+                    // round-trips with `.sym` lookups.
+                    let child_prefix = format!("{comp_name}.");
+                    let outputs = self.evaluate_and_emit(
+                        source_path,
+                        child_template,
+                        &child_prefix,
+                        &child_inputs,
+                        args.clone(),
+                        tmpl_map,
+                        template_fns,
+                    );
+                    comp_outputs.insert(comp_name.clone(), outputs);
+
+                    TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
+                }
+            }
+        }
+
+        result.outputs
+    }
+
+    /// Legacy fallback flow used when the structured evaluator can't
+    /// model the source program (e.g. no `component main`, or the
+    /// main template body fails to parse).  This is the
+    /// pre-2026-05-13 emit logic preserved so degenerate inputs still
+    /// produce *some* trace.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_legacy_flat(
+        &mut self,
+        source_path: &Path,
+        signals: &[SignalDecl],
+        assignments: &[SignalAssignment],
+        templates: &[TemplateDef],
+        component_instances: &[ComponentInstance],
+        values: &HashMap<String, i64>,
+    ) -> Result<()> {
+        let field_type_id = self.field_type_id.unwrap();
         let mut template_fns: HashMap<String, FunctionId> = HashMap::new();
         let templates_by_name: HashMap<&str, &TemplateDef> = templates
             .iter()
@@ -1028,12 +1343,6 @@ impl CircomTracer {
             template_fns.insert(template.name.clone(), fn_id);
         }
 
-        // Order the component instances so that `main` comes first and
-        // each child is emitted immediately after its parent (depth-first).
-        // Without this re-ordering the source-line iteration would visit
-        // the innermost `component inner = Inner()` before its enclosing
-        // `component middle = Middle()`, producing a call sequence that
-        // contradicts the template nesting.
         let ordered_components: Vec<&ComponentInstance> =
             order_components_by_nesting(component_instances);
 
@@ -1046,11 +1355,11 @@ impl CircomTracer {
                 continue;
             };
 
-            TraceWriter::register_step(&mut *self.writer, source_path, Line(component.line as i64));
-            // For sub-components, signal values appear in `values` keyed
-            // as `<component>.<signal>`; for the `main` component, the
-            // .sym parser has already stripped the `main.` prefix, so we
-            // look up bare signal names.
+            TraceWriter::register_step(
+                &mut *self.writer,
+                source_path,
+                Line(component.line as i64),
+            );
             let is_main = component.name == "main";
             for input_name in &template.input_signals {
                 let lookup_key: String = if is_main {
@@ -1071,15 +1380,11 @@ impl CircomTracer {
             emitted_component_calls += 1;
         }
 
-        // Emit Step events for signal declarations.
         for sig in signals {
             TraceWriter::register_step(&mut *self.writer, source_path, Line(sig.line as i64));
         }
-
-        // Emit Step + Value events for signal assignments.
         for assign in assignments {
             TraceWriter::register_step(&mut *self.writer, source_path, Line(assign.line as i64));
-
             if let Some(&val) = values.get(&assign.target) {
                 let value = ValueRecord::Int {
                     i: val,
@@ -1092,9 +1397,6 @@ impl CircomTracer {
                 );
             }
         }
-
-        // Close each concrete sub-component call. The <toplevel> frame for
-        // `component main` is closed by the caller after this method returns.
         for _ in 0..emitted_component_calls {
             TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
         }

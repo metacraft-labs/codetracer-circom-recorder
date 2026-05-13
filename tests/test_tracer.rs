@@ -873,78 +873,103 @@ fn test_control_flow_test_via_ct_print_full() {
     assert_eq!(functions, vec!["ControlFlow"]);
 
     // ----- counts -----------------------------------------------------
-    // 8 step events: 1 toplevel start step (line 1) + 1 step on the
-    // `component main = ControlFlow()` line (line 40) + 3 signal-decl
-    // steps (lines 17,18,19 for the three output declarations) + 3
-    // assignment steps (lines 35,36,37 for `total/bonus/result`).
-    // 1 call_entry/exit for the outermost user-defined frame
-    // (`ControlFlow`) — see PHP recorder commit 423e4ba for the
-    // cross-recorder convention.
+    // The structured Circom evaluator (added 2026-05-13) emits a
+    // step per executed source line — including for-loop iterations,
+    // the taken if-branch, and `var` declarations / mutations — and
+    // emits Variable events for each `<==` / `<--` signal assignment.
+    //
+    // Step breakdown for control_flow_test.circom:
+    //   * 1 toplevel start step (line 1)
+    //   * 1 step on `component main = ControlFlow()` (line 40)
+    //   * 3 signal-output decl steps (lines 17, 18, 19)
+    //   * 1 step on `var start = 7` (line 21)
+    //   * 1 step on `var acc = 0` (line 23)
+    //   * 1 step on the `for` header (line 24)
+    //   * 5 steps on the loop body line (line 25 × 5 iterations)
+    //   * 1 step on `var b;` (line 28)
+    //   * 1 step on the `if` header (line 29)
+    //   * 1 step on the taken if-body `b = 100;` (line 30)
+    //   * 3 signal-assignment steps (lines 35, 36, 37) carrying the
+    //     evaluated total/bonus/result values
+    // = 19 step events.  +1 call_entry +1 call_exit = 21 events.
     let counts = &doc["counts"];
-    assert_eq!(counts["steps"].as_u64(), Some(8), "steps; counts={counts}");
+    assert_eq!(counts["steps"].as_u64(), Some(19), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
         "io_events; counts={counts}"
     );
+    // Values: every step-with-vars carries one Variable event;
+    // here that's the 3 signal assignments (total/bonus/result).
+    // Each non-vars step still counts as a "step" but emits 0 Variable
+    // events.  The values-count below mirrors that — 19 step events
+    // with at most one variable each, but only 3 carrying a Variable
+    // (the three signal assignments).  Older Nim trace writers
+    // counted the empty step records too, so the canonical count
+    // surfaces as 19 here.
     assert_eq!(
         counts["values"].as_u64(),
-        Some(8),
+        Some(19),
         "values; counts={counts}"
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 10, "events.len()");
+    assert_eq!(events.len(), 21, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
     // `ControlFlow` is the outermost user-defined template; the
     // recorder surfaces it as a single call pair around the body's
-    // step events.  RECORDER BUG (separate issue): a spec-compliant
-    // recorder would also emit a step-per-iteration of the `for` loop
-    // and a step on the chosen `if` branch — today both constructs are
-    // invisible because the parser only handles `<==` lines.  See
-    // `test_control_flow_test_for_and_if_steps_emitted` for the
-    // tracking expectation.
+    // step events.
     assert_eq!(observed_call_sequence(&doc), vec!["ControlFlow".to_string()]);
     assert_eq!(observed_exit_sequence(&doc), vec!["ControlFlow".to_string()]);
 
     // ----- Exact step lines (in order) --------------------------------
     // Line 40 is the `component main = ControlFlow()` declaration; it
-    // precedes the template body's signal-decl/assignment steps
-    // because the recorder emits the component-line step immediately
-    // before issuing `register_call`.
+    // precedes the template body's signal-decl / control-flow / assignment
+    // steps because the recorder emits the component-line step
+    // immediately before issuing `register_call`.  Line 25 appears 5
+    // times — one per `for` iteration body — and line 30 is the
+    // taken `if` branch.  The matching else-branch (line 32) is *not*
+    // visited because `start = 7 > 5` selects the then-branch.
     let step_lines: Vec<i64> = events
         .iter()
         .filter(|e| e["kind"] == "step")
         .map(|e| e["line"].as_i64().expect("step.line i64"))
         .collect();
-    assert_eq!(step_lines, vec![1, 40, 17, 18, 19, 35, 36, 37]);
+    assert_eq!(
+        step_lines,
+        vec![1, 40, 17, 18, 19, 21, 23, 24, 25, 25, 25, 25, 25, 28, 29, 30, 35, 36, 37]
+    );
 
     // ----- Decoded variable values ------------------------------------
-    // RECORDER BUG: spec-correct output would surface
-    // total=20, bonus=100, result=120.  Today every signal value comes
-    // through as 0 because the witness calculator returns 0 for every
-    // signal in a circuit with no declared `signal input` — see the
-    // `#[ignore]`d sibling test for the spec-correct expectation.
+    // The structured evaluator surfaces only **signal** assignments
+    // as Variable events — `var` declarations / mutations are
+    // bookkeeping (compile-time scratch) and would otherwise pollute
+    // the "values" pane with the for-loop induction variable, the
+    // accumulator's intermediate values, etc.  This is why the
+    // signal outputs (total/bonus/result) are the only entries
+    // surfaced here.
     assert_eq!(
         observed_int_vars(&doc),
         vec![
-            ("total".to_string(), 0),
-            ("bonus".to_string(), 0),
-            ("result".to_string(), 0),
+            ("total".to_string(), 20),
+            ("bonus".to_string(), 100),
+            ("result".to_string(), 120),
         ],
     );
 }
 
+/// Spec-correct expectation: a Circom circuit with no `signal input`
+/// declarations should still surface its outputs at the values the
+/// source program assigns via `<==`, not as 0.  Pre-2026-05-13 this
+/// failed because the recorder relied entirely on the witness
+/// calculator, which returns 0 for every signal in an inputless
+/// circuit; it now passes because the structured Circom evaluator
+/// (`src/evaluator.rs`) folds RHS expressions at compile time and
+/// emits Variable events with the folded values.
 #[test]
-#[ignore = "RECORDER BUG: in a Circom circuit with no `signal input` \
-            declarations, every output signal surfaces as 0 in the \
-            trace even though the source assigns a constant via \
-            `<==`.  Tracking expectation: control_flow_test.circom \
-            should yield [(\"total\", 20), (\"bonus\", 100), \
-            (\"result\", 120)]."]
 fn test_control_flow_test_constants_decode() {
     let Some((doc, _)) = record_and_dump_full(
         "test_control_flow_test_constants_decode",
@@ -962,13 +987,14 @@ fn test_control_flow_test_constants_decode() {
     );
 }
 
+/// Spec-correct expectation: `for` loop iterations and the taken
+/// `if` branch must each surface a step event so a debugger can
+/// step through the source.  Pre-2026-05-13 the recorder's
+/// brace-tracking parser only matched `<==` lines, so neither
+/// for-loop bodies nor if branches produced any step events; the
+/// structured evaluator now visits both constructs and emits a
+/// step per executed source line.
 #[test]
-#[ignore = "RECORDER BUG: `for` loop iterations and `if`/`else` branch \
-            selection are not surfaced in the trace at all — neither \
-            as iteration steps nor as branch markers.  Tracking \
-            expectation: control_flow_test.circom should emit at least \
-            one step per loop iteration and one step on the taken \
-            `if` branch (lines 28-29 in this fixture)."]
 fn test_control_flow_test_for_and_if_steps_emitted() {
     let Some((doc, _)) = record_and_dump_full(
         "test_control_flow_test_for_and_if_steps_emitted",
@@ -1026,10 +1052,14 @@ fn test_nested_template_test_via_ct_print_full() {
 
     // ----- counts -----------------------------------------------------
     // 10 step events + 3 call_entry + 3 call_exit = 16 events.
-    // The recorder now surfaces the outermost user-defined template
-    // (`NestedTemplate`, instantiated as `component main`) as a real
-    // Call event so the genuinely 3-deep chain
-    // `NestedTemplate -> Middle -> Inner` produces 3 call pairs.
+    // The recorder surfaces the genuinely 3-deep chain
+    // `NestedTemplate -> Middle -> Inner` as 3 nested call pairs.
+    // Each template body emits steps for its signal-output decl,
+    // each component-instantiation, and the final wire — by
+    // induction the per-template step counts are 1+1 (NestedTemplate)
+    // + 1+1 (Middle) + 1+1 (Inner) = 6 body steps, plus 1 toplevel
+    // start + 1 main-component step + 1 final wire per level (3) =
+    // 10 steps.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
@@ -1057,10 +1087,16 @@ fn test_nested_template_test_via_ct_print_full() {
         ],
     );
 
-    // ----- Call exit order: LIFO closure ------------------------------
-    // `register_return` pops the most recent call frame, so closing
-    // three returns at the end of `emit_source_trace` yields the
-    // expected reverse-order exits.
+    // ----- Call exit order: nested LIFO -------------------------------
+    // Each component's call_exit fires immediately after the
+    // recursive evaluation of its body returns, so for a strict
+    // nesting chain (NestedTemplate -> Middle -> Inner) the exits
+    // unwind innermost-first as you'd expect from a normal call
+    // stack:  Inner exit, then Middle exit, then NestedTemplate
+    // exit.  This is the same ordering you'd see in a debugger —
+    // the previous flat-emit recorder produced a different (but
+    // equivalent) LIFO order because it deferred *all* call_exit
+    // events to the end of the trace.
     assert_eq!(
         observed_exit_sequence(&doc),
         vec![
@@ -1071,25 +1107,31 @@ fn test_nested_template_test_via_ct_print_full() {
     );
 
     // ----- Exact decoded variable values ------------------------------
-    // RECORDER BUG: spec-correct output would surface
-    // outer_result=113 (and ideally also middle.out=13 and inner.out=3).
-    // Today the only sub-template output that surfaces is the
-    // top-level signal `outer_result`, and its value comes through
-    // as 0 because the recorder maps sub-template outputs through the
-    // `main.<comp>.<signal>` .sym entries which are absent for
-    // intermediate output signals in this fixture's optimised witness.
+    // The structured evaluator computes each nested template's
+    // outputs and feeds them back into the parent's environment, so
+    // the trace surfaces every intermediate `<==` assignment with
+    // its concrete value: inner.out = 1+2 = 3 (inside Inner, prefixed
+    // with the parent's local component name `inner.`),
+    // middle.out = inner.out + 10 = 13, and finally
+    // outer_result = middle.out + 100 = 113.
     assert_eq!(
         observed_int_vars(&doc),
-        vec![("outer_result".to_string(), 0)],
+        vec![
+            ("inner.out".to_string(), 3),
+            ("middle.out".to_string(), 13),
+            ("outer_result".to_string(), 113),
+        ],
     );
 }
 
+/// Spec-correct expectation: nested-template intermediate output
+/// values must surface as Variable events so debugger users can
+/// inspect what each sub-template computed.  The structured
+/// evaluator recursively evaluates each sub-template and feeds its
+/// outputs back into the parent's env, so `inner.out`, `middle.out`,
+/// and `outer_result` all surface with their evaluator-folded
+/// integer values.
 #[test]
-#[ignore = "RECORDER BUG: nested-template intermediate output values \
-            are not surfaced in the trace.  Tracking expectation: \
-            nested_template_test.circom should yield decoded values \
-            for `inner.out` (=3), `middle.out` (=13), and \
-            `outer_result` (=113)."]
 fn test_nested_template_test_intermediate_outputs_decode() {
     let Some((doc, _)) = record_and_dump_full(
         "test_nested_template_test_intermediate_outputs_decode",
@@ -1177,8 +1219,11 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
     // ----- counts -----------------------------------------------------
     // 14 step events + 3 call_entry + 3 call_exit = 20 events.  The
     // outermost user-defined template (`SignalHierarchy`,
-    // instantiated as `component main`) now surfaces as its own Call
-    // event, bracketing the two sibling sub-component calls.
+    // instantiated as `component main`) surfaces as its own Call
+    // event, bracketing the two sibling sub-component calls.  The
+    // structured evaluator visits each template body in source
+    // order, including the input-signal decl steps inside each
+    // sub-template.
     let counts = &doc["counts"];
     assert_eq!(
         counts["steps"].as_u64(),
@@ -1200,7 +1245,10 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
     // The outermost user-defined template (`SignalHierarchy`,
     // instantiated as `component main`) comes first; siblings inside
     // its body (`add5` then `mul2`) follow in source-instantiation
-    // order.  Exits are LIFO.
+    // order.  Exits are nested LIFO — each component's call_exit
+    // fires immediately after the recursive evaluation of its body
+    // returns, so siblings exit in source order and the parent
+    // exits last.
     assert_eq!(
         observed_call_sequence(&doc),
         vec![
@@ -1212,8 +1260,8 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
     assert_eq!(
         observed_exit_sequence(&doc),
         vec![
-            "Mul2".to_string(),
             "Add5".to_string(),
+            "Mul2".to_string(),
             "SignalHierarchy".to_string(),
         ],
     );
@@ -1222,9 +1270,9 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
     // input` declarations as staged arguments (or none if the template
     // has no inputs).  `SignalHierarchy` has no input signals
     // (`total` is an *output*), so its args list is empty.  Each
-    // sub-component's input signal is staged with its current witness
-    // value (0 today — see RECORDER BUG note on
-    // `test_control_flow_test_via_ct_print_full`).
+    // sub-component's input signal is staged with the value the
+    // structured evaluator wired into it from the parent's
+    // `<comp>.in <== expr;` site (4 for add5.x, 9 for mul2.in).
     let call_entries: Vec<&serde_json::Value> = events
         .iter()
         .filter(|e| e["kind"] == "call_entry")
@@ -1240,36 +1288,55 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
     assert_eq!(add5_args.len(), 1);
     assert_eq!(add5_args[0]["varname"].as_str(), Some("x"));
     assert_eq!(add5_args[0]["value"]["kind"].as_str(), Some("Int"));
-    assert_eq!(add5_args[0]["value"]["i"].as_i64(), Some(0));
+    assert_eq!(add5_args[0]["value"]["i"].as_i64(), Some(4));
 
     let mul2_args = call_entries[2]["args"].as_array().expect("Mul2 args");
     assert_eq!(mul2_args.len(), 1);
     assert_eq!(mul2_args[0]["varname"].as_str(), Some("in"));
     assert_eq!(mul2_args[0]["value"]["kind"].as_str(), Some("Int"));
-    assert_eq!(mul2_args[0]["value"]["i"].as_i64(), Some(0));
+    assert_eq!(mul2_args[0]["value"]["i"].as_i64(), Some(9));
 
     // ----- Decoded variable values ------------------------------------
-    // RECORDER BUG: spec-correct output would surface the wired chain
-    // add5.x=4, add5.y=9, mul2.in=9, mul2.out=18, total=19.  Today
-    // every value is 0 — see the constants-decode #[ignore]d test on
-    // control_flow.
+    // The structured evaluator wires each sub-template's input
+    // signals before its body runs, evaluates the sub-template's
+    // body, and feeds outputs back into the parent's env.  The
+    // surfaced values reflect that:
+    //   * "x" = 4 — staged arg for Add5 (also recorded as a step
+    //     variable on the immediately-preceding component-decl line
+    //     by the trace writer's `arg(...)` shim — see
+    //     codetracer_trace_writer_nim::TraceWriter::arg).
+    //   * "add5.x" = 4 — Add5's input-signal decl with the wired
+    //     value (prefix injected by the recurse-down emit).
+    //   * "add5.y" = 9 — Add5's output (`y <== x + 5`).
+    //   * "in" / "mul2.in" = 9 — same shape for Mul2 (input wired
+    //     from add5.y).
+    //   * "mul2.out" = 18 — `out <== in * 2`.
+    //   * "add5.x" = 4 (again) and "mul2.in" = 9 (again) — the
+    //     parent's own wire steps (lines 36, 37).
+    //   * "total" = 19 — `total <== mul2.out + 1`.
     assert_eq!(
         observed_int_vars(&doc),
         vec![
-            ("x".to_string(), 0),
-            ("in".to_string(), 0),
-            ("add5.x".to_string(), 0),
-            ("mul2.in".to_string(), 0),
-            ("total".to_string(), 0),
+            ("x".to_string(), 4),
+            ("add5.x".to_string(), 4),
+            ("add5.y".to_string(), 9),
+            ("in".to_string(), 9),
+            ("mul2.in".to_string(), 9),
+            ("mul2.out".to_string(), 18),
+            ("add5.x".to_string(), 4),
+            ("mul2.in".to_string(), 9),
+            ("total".to_string(), 19),
         ],
     );
 }
 
+/// Spec-correct expectation: every signal in a wired
+/// sub-component chain must surface with its computed value.  The
+/// structured evaluator wires each sub-template's input signals
+/// before its body runs, evaluates the body, and stores its outputs
+/// in the parent's env so subsequent reads of `comp.signal` resolve
+/// to the right integer.
 #[test]
-#[ignore = "RECORDER BUG: signal-hierarchy chain values do not \
-            round-trip through the witness.  Tracking expectation: \
-            signal_hierarchy_test.circom should yield \
-            add5.x=4, add5.y=9, mul2.in=9, mul2.out=18, total=19."]
 fn test_signal_hierarchy_test_chain_values_decode() {
     let Some((doc, _)) = record_and_dump_full(
         "test_signal_hierarchy_test_chain_values_decode",
@@ -1320,16 +1387,15 @@ fn test_constraint_assert_test_via_ct_print_full() {
     assert_eq!(functions, vec!["ConstraintAssert"]);
 
     // ----- counts -----------------------------------------------------
-    // 10 step events: 1 toplevel + 1 step on the
+    // 12 step events: 1 toplevel + 1 step on the
     // `component main = ConstraintAssert()` line + 4 signal-decl +
-    // 4 assignment.  1 call_entry/exit for the outermost user-defined
-    // frame (`ConstraintAssert`).
-    // RECORDER BUG: the two `===` assertion lines (26 and 27) do
-    // **not** surface as steps or as a dedicated event kind — the
-    // parser only handles `<==`.  See
-    // test_constraint_assert_test_emits_assertion_steps below.
+    // 4 `<==` assignment + 2 `===` constraint-assertion steps.
+    // 1 call_entry/exit for the outermost user-defined frame
+    // (`ConstraintAssert`).  The structured evaluator surfaces the
+    // two `===` lines (26 and 27) as dedicated step events — they
+    // were silently dropped by the previous brace-tracking parser.
     let counts = &doc["counts"];
-    assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
+    assert_eq!(counts["steps"].as_u64(), Some(12), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
@@ -1338,47 +1404,52 @@ fn test_constraint_assert_test_via_ct_print_full() {
     );
     assert_eq!(
         counts["values"].as_u64(),
-        Some(10),
+        Some(12),
         "values; counts={counts}"
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 12, "events.len()");
+    assert_eq!(events.len(), 14, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Exact step lines (in order) --------------------------------
     // Line 30 is the `component main = ConstraintAssert()` declaration;
     // it precedes the body's signal-decl/assignment steps because the
     // recorder emits the component-line step immediately before the
-    // outermost call.
+    // outermost call.  Lines 26 and 27 are the two `===` constraint
+    // assertions, surfaced as steps by the structured evaluator.
     let step_lines: Vec<i64> = events
         .iter()
         .filter(|e| e["kind"] == "step")
         .map(|e| e["line"].as_i64().expect("step.line i64"))
         .collect();
-    assert_eq!(step_lines, vec![1, 30, 14, 15, 17, 18, 20, 21, 23, 24]);
+    assert_eq!(
+        step_lines,
+        vec![1, 30, 14, 15, 17, 18, 20, 21, 23, 24, 26, 27]
+    );
 
     // ----- Decoded variable values ------------------------------------
-    // RECORDER BUG: spec-correct output would surface
-    // a=6, b=7, sum=13, prod=42.  Today every value is 0 — see the
-    // constants-decode #[ignore]d test on control_flow.
+    // The structured evaluator computes each `<==` RHS in source
+    // order, so the trace surfaces the literal-driven values the
+    // source program assigns: a=6, b=7, sum=13, prod=42.  No
+    // Variable events on lines 26/27 — those are `===` constraint
+    // assertions, which assert equality but do not update any signal.
     assert_eq!(
         observed_int_vars(&doc),
         vec![
-            ("a".to_string(), 0),
-            ("b".to_string(), 0),
-            ("sum".to_string(), 0),
-            ("prod".to_string(), 0),
+            ("a".to_string(), 6),
+            ("b".to_string(), 7),
+            ("sum".to_string(), 13),
+            ("prod".to_string(), 42),
         ],
     );
 }
 
+/// Spec-correct expectation: each `===` constraint-assertion line
+/// must surface as a step event so a debugger can step over the
+/// assertion.  The structured evaluator emits a step on every
+/// `Stmt::Constraint` line, satisfying the contract.
 #[test]
-#[ignore = "RECORDER BUG: `===` constraint-assertion lines are not \
-            surfaced as steps or as a dedicated event kind — the \
-            parser only matches `<==`.  Tracking expectation: \
-            constraint_assert_test.circom lines 26 and 27 (the two \
-            `===` assertions) should each emit a step event."]
 fn test_constraint_assert_test_emits_assertion_steps() {
     let Some((doc, _)) = record_and_dump_full(
         "test_constraint_assert_test_emits_assertion_steps",
@@ -1402,11 +1473,13 @@ fn test_constraint_assert_test_emits_assertion_steps() {
     );
 }
 
+/// Spec-correct expectation: integer constants on the RHS of `<==`
+/// must surface as the literal value, even in a circuit with no
+/// `signal input` declarations.  The structured evaluator folds
+/// each RHS at compile time, so the trace surfaces a=6, b=7,
+/// sum=13, prod=42 regardless of what the witness calculator
+/// returns.
 #[test]
-#[ignore = "RECORDER BUG: constants on the RHS of `<==` surface as 0 \
-            in a circuit with no `signal input` declarations.  \
-            Tracking expectation: constraint_assert_test.circom \
-            should yield a=6, b=7, sum=13, prod=42."]
 fn test_constraint_assert_test_constants_decode() {
     let Some((doc, _)) = record_and_dump_full(
         "test_constraint_assert_test_constants_decode",
