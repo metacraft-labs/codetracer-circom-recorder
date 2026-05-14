@@ -25,7 +25,70 @@
 //! Anything outside this set falls back to the legacy brace-tracking
 //! parser in `tracer.rs`.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+
+thread_local! {
+    /// Active function table for the current evaluation.  Set by
+    /// `evaluate_template` for the duration of its body so existing
+    /// `eval_expr(...)` callers (which don't thread `fns` explicitly)
+    /// still resolve `Expr::Call(name, args)` references against the
+    /// surrounding program's `function` definitions.  Stored as a
+    /// raw pointer because the lifetime is bounded by the
+    /// `evaluate_template` call frame and the only consumers run on
+    /// the same thread.
+    static ACTIVE_FUNCTIONS: RefCell<*const HashMap<String, Function>> =
+        const { RefCell::new(std::ptr::null()) };
+}
+
+/// RAII guard that installs a function table for the lifetime of the
+/// guard, restoring the previous binding (typically a null pointer)
+/// when dropped.  Used by `evaluate_template` so nested calls into
+/// `eval_expr(...)` resolve `Expr::Call` references against the
+/// surrounding program's `function` definitions.
+struct FnsGuard {
+    prev: *const HashMap<String, Function>,
+}
+
+impl FnsGuard {
+    fn install(fns: &HashMap<String, Function>) -> Self {
+        let prev = ACTIVE_FUNCTIONS.with(|cell| {
+            let prev = *cell.borrow();
+            *cell.borrow_mut() = fns as *const _;
+            prev
+        });
+        Self { prev }
+    }
+}
+
+impl Drop for FnsGuard {
+    fn drop(&mut self) {
+        ACTIVE_FUNCTIONS.with(|cell| {
+            *cell.borrow_mut() = self.prev;
+        });
+    }
+}
+
+/// Run `f` with the active function table (if any) borrowed for the
+/// duration of the closure.  Safe wrapper around the raw thread-local
+/// pointer — the closure cannot outlive the `FnsGuard` that installed
+/// the binding because it runs synchronously inside the same
+/// `with(...)` callback.
+fn with_active_fns<R>(f: impl FnOnce(Option<&HashMap<String, Function>>) -> R) -> R {
+    ACTIVE_FUNCTIONS.with(|cell| {
+        let p = *cell.borrow();
+        let opt = if p.is_null() {
+            None
+        } else {
+            // Safety: the pointer is valid for the lifetime of the
+            // surrounding `FnsGuard` (installed by
+            // `evaluate_template`), which always outlives this
+            // synchronous closure.
+            Some(unsafe { &*p })
+        };
+        f(opt)
+    })
+}
 
 // ---------------------------------------------------------------------------
 // AST
@@ -64,6 +127,9 @@ pub enum Expr {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// Unary operator on one sub-expression.
     Unary(UnaryOp, Box<Expr>),
+    /// Conditional / ternary expression `cond ? then : else`.  Used by
+    /// circomlib's IsZero pattern (`inv <-- in != 0 ? 1/in : 0;`).
+    Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
     /// Parenthesised expression.
     Paren(Box<Expr>),
     /// Call expression: `Foo(args...)`.  Used for component/template
@@ -124,11 +190,7 @@ pub enum Stmt {
         rhs: Expr,
     },
     /// `lhs === rhs;`.
-    Constraint {
-        line: u32,
-        lhs: Expr,
-        rhs: Expr,
-    },
+    Constraint { line: u32, lhs: Expr, rhs: Expr },
     /// `if (cond) { then } else { else_block }`.
     If {
         line: u32,
@@ -148,6 +210,26 @@ pub enum Stmt {
     ComponentDecl {
         line: u32,
         name: String,
+        template: String,
+        args: Vec<Expr>,
+    },
+    /// `component name[N];` — a component-array declaration, with each
+    /// element instantiated separately (typically inside a for loop)
+    /// via `name[i] = Template(args);`.  Stored separately from
+    /// `ComponentDecl` so the structured evaluator can pre-allocate
+    /// the array slot before the per-element instantiations land.
+    ComponentArrayDecl {
+        line: u32,
+        name: String,
+        dims: Vec<Expr>,
+    },
+    /// `name[i] = Template(args);` — element-wise component-array
+    /// instantiation, typically inside a for loop.  The `index` is
+    /// evaluated against the current env to pick the slot.
+    ComponentArrayAssign {
+        line: u32,
+        name: String,
+        index: Expr,
         template: String,
         args: Vec<Expr>,
     },
@@ -176,6 +258,23 @@ pub struct Template {
     /// source order.  Mirrored from the body so callers don't have to
     /// re-walk it.
     pub input_signals: Vec<String>,
+}
+
+/// A parsed `function` definition (compile-time, no signals or
+/// constraints).  Functions appear in the recorder's function table
+/// distinct from templates — they have no input/output signals, never
+/// touch the witness, and are called from `<==` RHS expressions or
+/// from other functions.
+#[derive(Debug, Clone)]
+pub struct Function {
+    pub name: String,
+    /// 1-based source line of the `function` keyword.
+    pub line: u32,
+    /// Formal parameters bound at call sites.
+    pub params: Vec<String>,
+    /// Body statements in source order; the last `return` carries the
+    /// computed value back to the caller.
+    pub body: Vec<Stmt>,
 }
 
 // ---------------------------------------------------------------------------
@@ -277,8 +376,19 @@ fn tokenize(src: &str) -> Vec<LexedTok> {
         }
         if matches!(
             two,
-            "==" | "!=" | "<=" | ">=" | "&&" | "||" | "<<" | ">>" | "++" | "--" | "+=" | "-="
-                | "*=" | "/="
+            "==" | "!="
+                | "<="
+                | ">="
+                | "&&"
+                | "||"
+                | "<<"
+                | ">>"
+                | "++"
+                | "--"
+                | "+="
+                | "-="
+                | "*="
+                | "/="
         ) {
             out.push(LexedTok {
                 tok: Tok::Punct(two.to_string()),
@@ -378,7 +488,22 @@ impl Parser {
     // ---- Expression parser (Pratt-style) ----
 
     fn parse_expr(&mut self) -> Result<Expr, String> {
-        self.parse_or()
+        self.parse_ternary()
+    }
+
+    fn parse_ternary(&mut self) -> Result<Expr, String> {
+        let cond = self.parse_or()?;
+        if self.eat_punct("?") {
+            let then_branch = self.parse_ternary()?;
+            self.expect_punct(":")?;
+            let else_branch = self.parse_ternary()?;
+            return Ok(Expr::Ternary(
+                Box::new(cond),
+                Box::new(then_branch),
+                Box::new(else_branch),
+            ));
+        }
+        Ok(cond)
     }
 
     fn parse_or(&mut self) -> Result<Expr, String> {
@@ -646,9 +771,26 @@ impl Parser {
                 });
             }
         }
-        // component declaration
+        // component declaration: either a scalar
+        //   `component name = Template(args);`
+        // or an array
+        //   `component name[N];` (with per-element instantiation
+        //   `name[i] = Template(args);` lifted into Stmt::Assign or
+        //   Stmt::ComponentArrayAssign by the assignment parser
+        //   below).
         if self.eat_ident("component") {
             let name = self.expect_ident()?;
+            // Component-array declaration (no `=` follows; instead one
+            // or more `[expr]` index dimensions).
+            if matches!(self.peek(), Tok::Punct(p) if p == "[") {
+                let mut dims = Vec::new();
+                while self.eat_punct("[") {
+                    dims.push(self.parse_expr()?);
+                    self.expect_punct("]")?;
+                }
+                self.eat_punct(";");
+                return Ok(Stmt::ComponentArrayDecl { line, name, dims });
+            }
             self.expect_punct("=")?;
             let template = self.expect_ident()?;
             self.expect_punct("(")?;
@@ -762,6 +904,21 @@ impl Parser {
         } else if self.eat_punct("=") {
             let rhs = self.parse_expr()?;
             self.eat_punct(";");
+            // Recognise the component-array element-instantiation
+            // pattern `name[i] = Template(args);` and lift it to a
+            // dedicated statement so the structured evaluator can wire
+            // it into the per-element call frame for that slot.
+            if let (Expr::Index(box_name, box_idx), Expr::Call(tmpl, args)) = (&lhs, &rhs) {
+                if let Expr::Ident(arr_name) = box_name.as_ref() {
+                    return Ok(Stmt::ComponentArrayAssign {
+                        line,
+                        name: arr_name.clone(),
+                        index: (**box_idx).clone(),
+                        template: tmpl.clone(),
+                        args: args.clone(),
+                    });
+                }
+            }
             Stmt::Assign {
                 line,
                 op: AssignOp::VarAssign,
@@ -873,6 +1030,30 @@ impl Parser {
         Ok(Stmt::ExprStmt { line, expr: lhs })
     }
 
+    fn parse_function(&mut self) -> Result<Function, String> {
+        // assumes `function` keyword already consumed
+        let line = self.peek_line();
+        let name = self.expect_ident()?;
+        self.expect_punct("(")?;
+        let mut params = Vec::new();
+        if !matches!(self.peek(), Tok::Punct(p) if p == ")") {
+            loop {
+                params.push(self.expect_ident()?);
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_punct(")")?;
+        let body = self.parse_block()?;
+        Ok(Function {
+            name,
+            line,
+            params,
+            body,
+        })
+    }
+
     fn parse_template(&mut self) -> Result<Template, String> {
         // assumes `template` keyword already consumed
         let line = self.peek_line();
@@ -914,9 +1095,18 @@ impl Parser {
 /// `pragma`, top-level `include`, top-level `function`, and the
 /// `component main = ...` declaration (those are handled separately).
 pub fn parse_templates(src: &str) -> Vec<Template> {
+    parse_program(src).0
+}
+
+/// Parse a Circom source file into its templates AND functions.
+/// Returns `(templates, functions)` so callers can register both in
+/// the recorder's function table and resolve `Expr::Call(f, args)`
+/// references inside template / function bodies.
+pub fn parse_program(src: &str) -> (Vec<Template>, Vec<Function>) {
     let toks = tokenize(src);
     let mut parser = Parser::new(toks);
     let mut templates = Vec::new();
+    let mut functions = Vec::new();
     loop {
         match parser.peek().clone() {
             Tok::Eof => break,
@@ -956,26 +1146,21 @@ pub fn parse_templates(src: &str) -> Vec<Template> {
                 }
             }
             Tok::Ident(name) if name == "function" => {
-                // Skip function bodies — not used by the shipped fixtures.
                 parser.bump();
-                let _ = parser.expect_ident();
-                // Eat until matching `}`
-                let mut depth = 0i32;
-                let mut started = false;
-                while !matches!(parser.peek(), Tok::Eof) {
-                    if let Tok::Punct(p) = parser.peek() {
-                        if p == "{" {
-                            depth += 1;
-                            started = true;
-                        } else if p == "}" {
-                            depth -= 1;
-                            if started && depth <= 0 {
-                                parser.bump();
-                                break;
+                match parser.parse_function() {
+                    Ok(f) => functions.push(f),
+                    Err(e) => {
+                        eprintln!("circom evaluator: function parse error: {e}");
+                        // skip to next top-level keyword to continue
+                        while !matches!(parser.peek(), Tok::Eof) {
+                            if let Tok::Ident(n) = parser.peek() {
+                                if n == "template" || n == "function" || n == "component" {
+                                    break;
+                                }
                             }
+                            parser.bump();
                         }
                     }
-                    parser.bump();
                 }
             }
             Tok::Ident(name) if name == "component" => {
@@ -992,7 +1177,7 @@ pub fn parse_templates(src: &str) -> Vec<Template> {
             }
         }
     }
-    templates
+    (templates, functions)
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,7 +1225,15 @@ pub enum EvalEventKind {
     Step,
     /// A signal / variable update.  `name` is the printable name
     /// (e.g. `total`, `add5.x`, `inner.out`); `value` is the i64.
-    Variable { name: String, value: i64 },
+    /// `is_bool` is true when the signal is constrained to {0,1} via
+    /// the canonical `signal * (signal - 1) === 0` Boolean
+    /// constraint — the recorder surfaces such variables as
+    /// `ValueRecord::Bool` rather than as generic `ValueRecord::Int`.
+    Variable {
+        name: String,
+        value: i64,
+        is_bool: bool,
+    },
     /// Component instantiation — recurse into the named template.
     /// `args` contains numeric template arguments captured from the
     /// instantiation site (e.g. `Sub(N)` with N=4 -> `vec![4]`).
@@ -1069,6 +1262,10 @@ pub struct EvalContext<'a> {
     pub input_signals: HashMap<String, i64>,
     /// Numeric template arguments (e.g. `Sub(N)` with N bound to 4).
     pub generic_args: Vec<i64>,
+    /// Compile-time `function` definitions, used to resolve
+    /// `Expr::Call(name, args)` references inside template / function
+    /// bodies.  Empty when the program has no functions.
+    pub functions: &'a HashMap<String, Function>,
 }
 
 /// Evaluation result for a template body — both the events produced
@@ -1077,6 +1274,96 @@ pub struct EvalContext<'a> {
 pub struct EvalResult {
     pub events: Vec<EvalEvent>,
     pub outputs: HashMap<String, i64>,
+}
+
+/// Scan a template body for `signal * (signal - 1) === 0` constraint
+/// patterns and return the set of signal names so constrained.  This
+/// is the canonical Boolean constraint used by circomlib's
+/// comparator / IsZero / IsEqual templates — the recorder surfaces
+/// such signals as `ValueRecord::Bool` rather than as generic
+/// `ValueRecord::Int`.  Recognises both `s * (s - 1) === 0` and the
+/// commuted form `(s - 1) * s === 0`.
+pub fn collect_boolean_signals(stmts: &[Stmt]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    walk_for_boolean(stmts, &mut out);
+    out
+}
+
+fn walk_for_boolean(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Constraint { lhs, rhs, .. } => {
+                // Recognise `signal * (signal - 1) === 0` (or the
+                // commuted forms).  rhs must be the literal `0`.
+                let rhs_zero = matches!(rhs, Expr::Int(0))
+                    || matches!(rhs, Expr::Paren(b) if matches!(b.as_ref(), Expr::Int(0)));
+                if !rhs_zero {
+                    continue;
+                }
+                if let Some(name) = bool_signal_from_mul_minus_one(lhs) {
+                    out.insert(name);
+                }
+            }
+            Stmt::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                walk_for_boolean(then_block, out);
+                walk_for_boolean(else_block, out);
+            }
+            Stmt::For { body, .. } => {
+                walk_for_boolean(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walk a `<==` RHS expression and, if it directly reads back a
+/// sub-component's named output (`comp.out`, optionally wrapped in
+/// `Paren`), return the *last segment* of the read so the caller can
+/// look it up in the bool-signals set.  This is what propagates the
+/// Bool-ness from a sub-component's output through a parent's wire
+/// site `parent_out <== sub.boolsig;`.
+fn rhs_bool_signal_name(rhs: &Expr) -> Option<String> {
+    match rhs {
+        Expr::Member(_, name) => Some(name.clone()),
+        Expr::Paren(b) => rhs_bool_signal_name(b),
+        _ => None,
+    }
+}
+
+/// Match `s * (s - 1)` or `(s - 1) * s` (with optional parens around
+/// either operand) and return `Some(s)` for the inner identifier.
+fn bool_signal_from_mul_minus_one(e: &Expr) -> Option<String> {
+    let strip = |x: &Expr| -> Expr {
+        match x {
+            Expr::Paren(b) => (**b).clone(),
+            other => other.clone(),
+        }
+    };
+    if let Expr::Binary(BinOp::Mul, l, r) = e {
+        let l = strip(l);
+        let r = strip(r);
+        // s * (s - 1) ?
+        if let (Expr::Ident(s_l), Expr::Binary(BinOp::Sub, sub_l, sub_r)) = (&l, &r) {
+            if let (Expr::Ident(s_sub), Expr::Int(1)) = (sub_l.as_ref(), sub_r.as_ref()) {
+                if s_l == s_sub {
+                    return Some(s_l.clone());
+                }
+            }
+        }
+        // (s - 1) * s ?
+        if let (Expr::Binary(BinOp::Sub, sub_l, sub_r), Expr::Ident(s_r)) = (&l, &r) {
+            if let (Expr::Ident(s_sub), Expr::Int(1)) = (sub_l.as_ref(), sub_r.as_ref()) {
+                if s_r == s_sub {
+                    return Some(s_r.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Evaluate a template body from start to finish, producing events
@@ -1093,6 +1380,30 @@ pub struct EvalResult {
 /// not outputs), which is the bug that made every recorded
 /// intermediate output value surface as 0.
 pub fn evaluate_template(template: &Template, ctx: &EvalContext) -> EvalResult {
+    // Install the function table for the duration of this evaluation
+    // so `Expr::Call(name, args)` inside `<==` RHS / `var` inits
+    // resolves against the program's `function` definitions.  The
+    // guard pops the binding when the function returns.
+    let _fns_guard = FnsGuard::install(ctx.functions);
+
+    // Discover Boolean-constrained signals across **every** template
+    // in the program so a Variable event whose LHS reads back a
+    // Bool-typed value (e.g. `nz_zero <== nz_a.out;` where IsNonZero
+    // declares `out * (out - 1) === 0`) emits a `Bool` ValueRecord
+    // rather than a generic `Int`.  This is the canonical Circom
+    // pattern used by IsZero / IsEqual / LessThan comparators in
+    // circomlib.  We compute the set across all templates (not just
+    // the current one) because the parent frame's `<==` line surfaces
+    // the value with a name that's distinct from any signal in the
+    // current template body — the bool flavour is carried by the
+    // sub-component's output declaration, not the parent's wire site.
+    let mut bool_signals = collect_boolean_signals(&template.body);
+    for t in ctx.templates.values() {
+        for n in collect_boolean_signals(&t.body) {
+            bool_signals.insert(n);
+        }
+    }
+
     let mut env: HashMap<String, Value> = HashMap::new();
 
     // Bind generic numeric parameters.
@@ -1161,6 +1472,7 @@ pub fn evaluate_template(template: &Template, ctx: &EvalContext) -> EvalResult {
             templates: ctx.templates,
             input_signals: inputs.clone(),
             generic_args: args.clone(),
+            functions: ctx.functions,
         };
         let child_result = evaluate_template(child_template, &child_ctx);
         let mut signals = inputs;
@@ -1182,7 +1494,7 @@ pub fn evaluate_template(template: &Template, ctx: &EvalContext) -> EvalResult {
     // like `mul2.in <== add5.y` resolve correctly.
     // ------------------------------------------------------------------
     let mut events = Vec::new();
-    eval_block(&template.body, &mut env, &mut events, ctx);
+    eval_block(&template.body, &mut env, &mut events, ctx, &bool_signals);
 
     // Collect output-signal values from the env so the caller can
     // expose them via `comp.signal`.
@@ -1240,18 +1552,77 @@ fn collect_components_with_wires(
                     },
                 );
             }
+            Stmt::ComponentArrayDecl { name, dims, .. } => {
+                // Pre-allocate the array slot with empty Component
+                // values; each ComponentArrayAssign below will
+                // populate one slot.  Only the first dimension is
+                // used today.
+                let n = dims
+                    .first()
+                    .and_then(|e| eval_expr(e, env).and_then(|v| v.as_int()))
+                    .unwrap_or(0) as usize;
+                env.insert(
+                    name.clone(),
+                    Value::Array(
+                        (0..n)
+                            .map(|_| Value::Component {
+                                template: String::new(),
+                                signals: HashMap::new(),
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            Stmt::ComponentArrayAssign {
+                name,
+                index,
+                template,
+                args,
+                ..
+            } => {
+                let idx = eval_expr(index, env).and_then(|v| v.as_int()).unwrap_or(0) as i64;
+                let synthetic = format!("{name}[{idx}]");
+                let arg_vals: Vec<i64> = args
+                    .iter()
+                    .map(|e| eval_expr(e, env).and_then(|v| v.as_int()).unwrap_or(0))
+                    .collect();
+                comp_decls.push((synthetic.clone(), template.clone(), arg_vals));
+                env.insert(
+                    synthetic,
+                    Value::Component {
+                        template: template.clone(),
+                        signals: HashMap::new(),
+                    },
+                );
+            }
             Stmt::Assign { lhs, rhs, op, .. } => {
-                if matches!(
-                    op,
-                    AssignOp::SignalAssign | AssignOp::SignalAssignConstrain
-                ) {
+                if matches!(op, AssignOp::SignalAssign | AssignOp::SignalAssignConstrain) {
                     if let Expr::Member(box_lhs, signal) = lhs {
+                        // Wire to a scalar component: `comp.signal <== expr;`
                         if let Expr::Ident(comp_name) = box_lhs.as_ref() {
                             comp_wires
                                 .entry(comp_name.clone())
                                 .or_default()
                                 .push((signal.clone(), rhs.clone()));
                             continue;
+                        }
+                        // Wire to a component-array element:
+                        // `arr[i].signal <== expr;` — resolve the
+                        // index against the current env so we route
+                        // the wire to the right synthetic
+                        // "arr[<idx>]" component slot.
+                        if let Expr::Index(arr_box, idx_expr) = box_lhs.as_ref() {
+                            if let Expr::Ident(arr_name) = arr_box.as_ref() {
+                                let idx = eval_expr(idx_expr, env)
+                                    .and_then(|v| v.as_int())
+                                    .unwrap_or(0);
+                                let synthetic = format!("{arr_name}[{idx}]");
+                                comp_wires
+                                    .entry(synthetic)
+                                    .or_default()
+                                    .push((signal.clone(), rhs.clone()));
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1299,12 +1670,16 @@ fn collect_components_with_wires(
                 ..
             } => {
                 let mut init_evt = Vec::new();
+                let empty_fns = HashMap::new();
+                let empty_bool: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 let empty_ctx = EvalContext {
                     templates: &HashMap::new(),
                     input_signals: HashMap::new(),
                     generic_args: Vec::new(),
+                    functions: &empty_fns,
                 };
-                eval_stmt(init, env, &mut init_evt, &empty_ctx);
+                eval_stmt(init, env, &mut init_evt, &empty_ctx, &empty_bool);
                 let mut iterations = 0usize;
                 while iterations < 10_000 {
                     let c = eval_expr(cond, env).and_then(|v| v.as_int()).unwrap_or(0);
@@ -1313,7 +1688,7 @@ fn collect_components_with_wires(
                     }
                     collect_components_with_wires(body, env, comp_decls, comp_wires);
                     let mut update_evt = Vec::new();
-                    eval_stmt(update, env, &mut update_evt, &empty_ctx);
+                    eval_stmt(update, env, &mut update_evt, &empty_ctx, &empty_bool);
                     iterations += 1;
                 }
             }
@@ -1358,15 +1733,10 @@ fn collect_components(
                 );
             }
             Stmt::Assign { lhs, rhs, op, .. } => {
-                if matches!(
-                    op,
-                    AssignOp::SignalAssign | AssignOp::SignalAssignConstrain
-                ) {
+                if matches!(op, AssignOp::SignalAssign | AssignOp::SignalAssignConstrain) {
                     if let Expr::Member(box_lhs, signal) = lhs {
                         if let Expr::Ident(comp_name) = box_lhs.as_ref() {
-                            let value = eval_expr(rhs, env)
-                                .and_then(|v| v.as_int())
-                                .unwrap_or(0);
+                            let value = eval_expr(rhs, env).and_then(|v| v.as_int()).unwrap_or(0);
                             comp_wires
                                 .entry(comp_name.clone())
                                 .or_default()
@@ -1421,11 +1791,21 @@ fn collect_components(
                 ..
             } => {
                 let mut init_evt = Vec::new();
-                eval_stmt(init, env, &mut init_evt, &EvalContext {
-                    templates: &HashMap::new(),
-                    input_signals: HashMap::new(),
-                    generic_args: Vec::new(),
-                });
+                let empty_fns = HashMap::new();
+                let empty_bool: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                eval_stmt(
+                    init,
+                    env,
+                    &mut init_evt,
+                    &EvalContext {
+                        templates: &HashMap::new(),
+                        input_signals: HashMap::new(),
+                        generic_args: Vec::new(),
+                        functions: &empty_fns,
+                    },
+                    &empty_bool,
+                );
                 let mut iterations = 0usize;
                 while iterations < 10_000 {
                     let c = eval_expr(cond, env).and_then(|v| v.as_int()).unwrap_or(0);
@@ -1434,11 +1814,18 @@ fn collect_components(
                     }
                     collect_components(body, env, events, comp_decls, comp_wires);
                     let mut update_evt = Vec::new();
-                    eval_stmt(update, env, &mut update_evt, &EvalContext {
-                        templates: &HashMap::new(),
-                        input_signals: HashMap::new(),
-                        generic_args: Vec::new(),
-                    });
+                    eval_stmt(
+                        update,
+                        env,
+                        &mut update_evt,
+                        &EvalContext {
+                            templates: &HashMap::new(),
+                            input_signals: HashMap::new(),
+                            generic_args: Vec::new(),
+                            functions: &empty_fns,
+                        },
+                        &empty_bool,
+                    );
                     iterations += 1;
                 }
             }
@@ -1452,9 +1839,10 @@ fn eval_block(
     env: &mut HashMap<String, Value>,
     events: &mut Vec<EvalEvent>,
     ctx: &EvalContext,
+    bool_signals: &std::collections::HashSet<String>,
 ) {
     for s in stmts {
-        eval_stmt(s, env, events, ctx);
+        eval_stmt(s, env, events, ctx, bool_signals);
     }
 }
 
@@ -1463,6 +1851,7 @@ fn eval_stmt(
     env: &mut HashMap<String, Value>,
     events: &mut Vec<EvalEvent>,
     ctx: &EvalContext,
+    bool_signals: &std::collections::HashSet<String>,
 ) {
     match stmt {
         Stmt::VarDecl { line, name, init } => {
@@ -1482,7 +1871,12 @@ fn eval_stmt(
                 kind: EvalEventKind::Step,
             });
         }
-        Stmt::SignalDecl { line, name, kind, dims } => {
+        Stmt::SignalDecl {
+            line,
+            name,
+            kind,
+            dims,
+        } => {
             // Step at the declaration line.  Initialise to UnsetSignal
             // so reads before assignment yield 0.  Inputs already in
             // the env (from ctx.input_signals) are kept.
@@ -1510,6 +1904,7 @@ fn eval_stmt(
                     kind: EvalEventKind::Variable {
                         name: name.clone(),
                         value: display_val,
+                        is_bool: bool_signals.contains(name),
                     },
                 });
             } else {
@@ -1520,10 +1915,7 @@ fn eval_stmt(
                     .first()
                     .and_then(|e| eval_expr(e, env).and_then(|v| v.as_int()))
                     .unwrap_or(0) as usize;
-                env.insert(
-                    name.clone(),
-                    Value::Array(vec![Value::Int(0); n]),
-                );
+                env.insert(name.clone(), Value::Array(vec![Value::Int(0); n]));
                 events.push(EvalEvent {
                     line: *line,
                     kind: EvalEventKind::Step,
@@ -1555,7 +1947,12 @@ fn eval_stmt(
                     // Wire? — `comp.signal <== expr` is also a wire
                     // into the sub-component's input env so we record
                     // a Wire event alongside the user-visible
-                    // Variable event.
+                    // Variable event.  Two shapes are recognised:
+                    //   * `comp.signal <== expr` — scalar component.
+                    //   * `arr[i].signal <== expr` — element of a
+                    //     component array; route to the synthetic
+                    //     `arr[<idx>]` slot populated by the wire
+                    //     pre-pass.
                     if let Expr::Member(comp_box, signal) = lhs {
                         if let Expr::Ident(comp_name) = comp_box.as_ref() {
                             events.push(EvalEvent {
@@ -1566,6 +1963,46 @@ fn eval_stmt(
                                     value,
                                 },
                             });
+                        } else if let Expr::Index(arr_box, idx_expr) = comp_box.as_ref() {
+                            if let Expr::Ident(arr_name) = arr_box.as_ref() {
+                                let idx = eval_expr(idx_expr, env)
+                                    .and_then(|v| v.as_int())
+                                    .unwrap_or(0);
+                                let synthetic = format!("{arr_name}[{idx}]");
+                                events.push(EvalEvent {
+                                    line: *line,
+                                    kind: EvalEventKind::Wire {
+                                        comp_name: synthetic,
+                                        signal_name: signal.clone(),
+                                        value,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    // Detect Boolean-constrained signals.  Three
+                    // shapes are recognised:
+                    //   * `out` declared in a template whose body
+                    //     contains `out * (out - 1) === 0` — picked
+                    //     up by `bool_signals.contains(&lhs_name)`.
+                    //   * `comp.out` parent-frame views — last
+                    //     segment matches a bool-constrained signal.
+                    //   * `parent_out <== sub.boolsig;` — the LHS is
+                    //     a fresh signal in the parent template, but
+                    //     the RHS reads back a boolean from a
+                    //     sub-component, so the surfaced value is
+                    //     {0,1}.
+                    let mut is_bool = bool_signals.contains(&lhs_name)
+                        || lhs_name
+                            .rsplit('.')
+                            .next()
+                            .map(|tail| bool_signals.contains(tail))
+                            .unwrap_or(false);
+                    if !is_bool {
+                        if let Some(name) = rhs_bool_signal_name(rhs) {
+                            if bool_signals.contains(&name) {
+                                is_bool = true;
+                            }
                         }
                     }
                     events.push(EvalEvent {
@@ -1573,6 +2010,7 @@ fn eval_stmt(
                         kind: EvalEventKind::Variable {
                             name: lhs_name,
                             value,
+                            is_bool,
                         },
                     });
                 }
@@ -1597,9 +2035,9 @@ fn eval_stmt(
             });
             let c = eval_expr(cond, env).and_then(|v| v.as_int()).unwrap_or(0);
             if c != 0 {
-                eval_block(then_block, env, events, ctx);
+                eval_block(then_block, env, events, ctx, bool_signals);
             } else {
-                eval_block(else_block, env, events, ctx);
+                eval_block(else_block, env, events, ctx, bool_signals);
             }
         }
         Stmt::For {
@@ -1621,7 +2059,7 @@ fn eval_stmt(
                 kind: EvalEventKind::Step,
             });
             let mut sink = Vec::new();
-            eval_stmt(init, env, &mut sink, ctx);
+            eval_stmt(init, env, &mut sink, ctx, bool_signals);
             let mut iterations = 0usize;
             const MAX_ITERATIONS: usize = 10_000;
             while iterations < MAX_ITERATIONS {
@@ -1629,9 +2067,9 @@ fn eval_stmt(
                 if c == 0 {
                     break;
                 }
-                eval_block(body, env, events, ctx);
+                eval_block(body, env, events, ctx, bool_signals);
                 let mut update_sink = Vec::new();
-                eval_stmt(update, env, &mut update_sink, ctx);
+                eval_stmt(update, env, &mut update_sink, ctx, bool_signals);
                 iterations += 1;
             }
         }
@@ -1668,6 +2106,48 @@ fn eval_stmt(
                 },
             });
         }
+        Stmt::ComponentArrayDecl { line, .. } => {
+            // Array slot is pre-allocated by the wire-collection pre-pass
+            // (the per-element synthetic Component entries are also
+            // populated there).  Surface a step at the decl line.
+            events.push(EvalEvent {
+                line: *line,
+                kind: EvalEventKind::Step,
+            });
+        }
+        Stmt::ComponentArrayAssign {
+            line,
+            name,
+            index,
+            template,
+            args,
+        } => {
+            let idx = eval_expr(index, env).and_then(|v| v.as_int()).unwrap_or(0);
+            let synthetic = format!("{name}[{idx}]");
+            let arg_vals: Vec<i64> = args
+                .iter()
+                .map(|e| eval_expr(e, env).and_then(|v| v.as_int()).unwrap_or(0))
+                .collect();
+            // The wire-collection pre-pass already populated the
+            // synthetic Component entry; don't clobber it.
+            if !env.contains_key(&synthetic) {
+                env.insert(
+                    synthetic.clone(),
+                    Value::Component {
+                        template: template.clone(),
+                        signals: HashMap::new(),
+                    },
+                );
+            }
+            events.push(EvalEvent {
+                line: *line,
+                kind: EvalEventKind::ComponentEnter {
+                    comp_name: synthetic,
+                    template: template.clone(),
+                    args: arg_vals,
+                },
+            });
+        }
         Stmt::ExprStmt { line, .. } => {
             events.push(EvalEvent {
                 line: *line,
@@ -1697,6 +2177,23 @@ fn apply_lvalue(lhs: &Expr, value: i64, env: &mut HashMap<String, Value>) {
                 if let Value::Component { signals, .. } = entry {
                     signals.insert(signal.clone(), value);
                 }
+            } else if let Expr::Index(arr_box, idx_expr) = box_lhs.as_ref() {
+                // `arr[i].signal = value;` — route to the synthetic
+                // `arr[<idx>]` Component slot populated by the
+                // wire-collection pre-pass.
+                if let Expr::Ident(arr_name) = arr_box.as_ref() {
+                    let idx = eval_expr(idx_expr, env)
+                        .and_then(|v| v.as_int())
+                        .unwrap_or(0);
+                    let synthetic = format!("{arr_name}[{idx}]");
+                    let entry = env.entry(synthetic).or_insert(Value::Component {
+                        template: String::new(),
+                        signals: HashMap::new(),
+                    });
+                    if let Value::Component { signals, .. } = entry {
+                        signals.insert(signal.clone(), value);
+                    }
+                }
             }
         }
         Expr::Index(box_lhs, idx_expr) => {
@@ -1704,9 +2201,7 @@ fn apply_lvalue(lhs: &Expr, value: i64, env: &mut HashMap<String, Value>) {
                 .and_then(|v| v.as_int())
                 .unwrap_or(0) as usize;
             if let Expr::Ident(name) = box_lhs.as_ref() {
-                let entry = env
-                    .entry(name.clone())
-                    .or_insert(Value::Array(Vec::new()));
+                let entry = env.entry(name.clone()).or_insert(Value::Array(Vec::new()));
                 if let Value::Array(arr) = entry {
                     if idx >= arr.len() {
                         arr.resize(idx + 1, Value::Int(0));
@@ -1742,36 +2237,76 @@ fn expr_to_name_with_env(e: &Expr, env: Option<&HashMap<String, Value>>) -> Stri
 }
 
 fn eval_expr(e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
+    with_active_fns(|fns| eval_expr_with_fns(e, env, fns))
+}
+
+/// Like `eval_expr`, but with access to a function-table so
+/// `Expr::Call(name, args)` references can resolve to compile-time
+/// `function` definitions.  The caller passes `Some(...)` when
+/// evaluating from inside a template / function body where calls need
+/// to be looked up; `None` is the legacy path used by the pre-pass and
+/// by every evaluation that pre-dates function support.
+fn eval_expr_with_fns(
+    e: &Expr,
+    env: &HashMap<String, Value>,
+    fns: Option<&HashMap<String, Function>>,
+) -> Option<Value> {
     match e {
         Expr::Int(n) => Some(Value::Int(*n)),
         Expr::Ident(name) => env.get(name).cloned(),
         Expr::Member(b, name) => {
-            let base = eval_expr(b, env)?;
+            // First, special-case `arr[i].signal` reads: the wire
+            // pre-pass populates synthetic env entries of the form
+            // `arr[<idx>]` with the per-element Component value, but
+            // the underlying `arr` Array slot stays empty.  Resolve
+            // the synthetic key directly so the read picks up the
+            // sub-component's outputs.
+            if let Expr::Index(arr_box, idx_expr) = b.as_ref() {
+                if let Expr::Ident(arr_name) = arr_box.as_ref() {
+                    if let Some(idx) =
+                        eval_expr_with_fns(idx_expr, env, fns).and_then(|v| v.as_int())
+                    {
+                        let synthetic = format!("{arr_name}[{idx}]");
+                        if let Some(Value::Component { signals, .. }) = env.get(&synthetic) {
+                            return signals.get(name).copied().map(Value::Int);
+                        }
+                    }
+                }
+            }
+            let base = eval_expr_with_fns(b, env, fns)?;
             match base {
                 Value::Component { signals, .. } => signals.get(name).copied().map(Value::Int),
                 _ => None,
             }
         }
         Expr::Index(b, idx) => {
-            let base = eval_expr(b, env)?;
-            let i = eval_expr(idx, env).and_then(|v| v.as_int())? as usize;
+            let base = eval_expr_with_fns(b, env, fns)?;
+            let i = eval_expr_with_fns(idx, env, fns).and_then(|v| v.as_int())? as usize;
             if let Value::Array(arr) = base {
                 arr.get(i).cloned()
             } else {
                 None
             }
         }
-        Expr::Paren(b) => eval_expr(b, env),
+        Expr::Paren(b) => eval_expr_with_fns(b, env, fns),
+        Expr::Ternary(cond, then_b, else_b) => {
+            let c = eval_expr_with_fns(cond, env, fns).and_then(|v| v.as_int())?;
+            if c != 0 {
+                eval_expr_with_fns(then_b, env, fns)
+            } else {
+                eval_expr_with_fns(else_b, env, fns)
+            }
+        }
         Expr::Unary(op, b) => {
-            let v = eval_expr(b, env).and_then(|v| v.as_int())?;
+            let v = eval_expr_with_fns(b, env, fns).and_then(|v| v.as_int())?;
             match op {
                 UnaryOp::Neg => Some(Value::Int(-v)),
                 UnaryOp::Not => Some(Value::Int(if v == 0 { 1 } else { 0 })),
             }
         }
         Expr::Binary(op, l, r) => {
-            let lv = eval_expr(l, env).and_then(|v| v.as_int())?;
-            let rv = eval_expr(r, env).and_then(|v| v.as_int())?;
+            let lv = eval_expr_with_fns(l, env, fns).and_then(|v| v.as_int())?;
+            let rv = eval_expr_with_fns(r, env, fns).and_then(|v| v.as_int())?;
             let result = match op {
                 BinOp::Add => lv + rv,
                 BinOp::Sub => lv - rv,
@@ -1806,7 +2341,126 @@ fn eval_expr(e: &Expr, env: &HashMap<String, Value>) -> Option<Value> {
             };
             Some(Value::Int(result))
         }
-        Expr::Call(_, _) => None,
+        Expr::Call(name, args) => {
+            // Look up the function in the function table; if missing,
+            // fall back to None (the legacy behaviour) so degenerate
+            // inputs still produce *some* trace.
+            let fns = fns?;
+            let func = fns.get(name)?;
+            // Evaluate each argument in the caller's env, then bind the
+            // results to the function's formal parameters in a fresh
+            // env.  Functions don't see signals — only their numeric
+            // parameters and any `var`s declared in their body.
+            let mut fn_env: HashMap<String, Value> = HashMap::new();
+            for (param, arg_expr) in func.params.iter().zip(args.iter()) {
+                let v = eval_expr_with_fns(arg_expr, env, Some(fns))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0);
+                fn_env.insert(param.clone(), Value::Int(v));
+            }
+            // Walk the body looking for the `return` statement; the
+            // body is also allowed to mutate `var`s in its own env via
+            // assignments / for loops, so we need to interpret each
+            // statement.
+            execute_function_body(&func.body, &mut fn_env, fns)
+        }
+    }
+}
+
+/// Execute a function body and return the value of the first `return`
+/// statement encountered (or 0 if none).  Functions are pure
+/// compile-time numeric code: they have no signals, no constraints,
+/// and never touch the witness, so we don't emit any recorder events
+/// here — the recorder integration emits per-line steps separately
+/// when it walks the function body for the function-table call frame.
+fn execute_function_body(
+    body: &[Stmt],
+    env: &mut HashMap<String, Value>,
+    fns: &HashMap<String, Function>,
+) -> Option<Value> {
+    for stmt in body {
+        if let Some(v) = execute_function_stmt(stmt, env, fns) {
+            return Some(v);
+        }
+    }
+    Some(Value::Int(0))
+}
+
+fn execute_function_stmt(
+    stmt: &Stmt,
+    env: &mut HashMap<String, Value>,
+    fns: &HashMap<String, Function>,
+) -> Option<Value> {
+    match stmt {
+        Stmt::VarDecl { name, init, .. } => {
+            let val = init
+                .as_ref()
+                .and_then(|e| eval_expr_with_fns(e, env, Some(fns)).and_then(|v| v.as_int()))
+                .unwrap_or(0);
+            env.insert(name.clone(), Value::Int(val));
+            None
+        }
+        Stmt::Assign { lhs, rhs, .. } => {
+            let value = eval_expr_with_fns(rhs, env, Some(fns))
+                .and_then(|v| v.as_int())
+                .unwrap_or(0);
+            apply_lvalue(lhs, value, env);
+            None
+        }
+        Stmt::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            let c = eval_expr_with_fns(cond, env, Some(fns))
+                .and_then(|v| v.as_int())
+                .unwrap_or(0);
+            if c != 0 {
+                execute_function_body(then_block, env, fns)
+                    .filter(|v| !matches!(v, Value::Int(0)))
+                    .or(None)
+            } else {
+                execute_function_body(else_block, env, fns)
+                    .filter(|v| !matches!(v, Value::Int(0)))
+                    .or(None)
+            }
+        }
+        Stmt::For {
+            init,
+            cond,
+            update,
+            body,
+            ..
+        } => {
+            execute_function_stmt(init, env, fns);
+            let mut iterations = 0usize;
+            const MAX_ITERATIONS: usize = 10_000;
+            while iterations < MAX_ITERATIONS {
+                let c = eval_expr_with_fns(cond, env, Some(fns))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0);
+                if c == 0 {
+                    break;
+                }
+                for s in body {
+                    if let Some(ret) = execute_function_stmt(s, env, fns) {
+                        return Some(ret);
+                    }
+                }
+                execute_function_stmt(update, env, fns);
+                iterations += 1;
+            }
+            None
+        }
+        Stmt::Return { value, .. } => {
+            let v = value
+                .as_ref()
+                .and_then(|e| eval_expr_with_fns(e, env, Some(fns)).and_then(|v| v.as_int()))
+                .unwrap_or(0);
+            Some(Value::Int(v))
+        }
+        _ => None,
     }
 }
 
@@ -1831,10 +2485,12 @@ mod tests {
         for t in &templates {
             tmap.insert(t.name.clone(), t.clone());
         }
+        let empty_fns = HashMap::new();
         let ctx = EvalContext {
             templates: &tmap,
             input_signals: HashMap::new(),
             generic_args: Vec::new(),
+            functions: &empty_fns,
         };
         let result = evaluate_template(&templates[0], &ctx);
         assert_eq!(result.outputs.get("x"), Some(&13));
@@ -1848,10 +2504,12 @@ mod tests {
         for t in &templates {
             tmap.insert(t.name.clone(), t.clone());
         }
+        let empty_fns = HashMap::new();
         let ctx = EvalContext {
             templates: &tmap,
             input_signals: HashMap::new(),
             generic_args: Vec::new(),
+            functions: &empty_fns,
         };
         let result = evaluate_template(&templates[0], &ctx);
         assert_eq!(result.outputs.get("total"), Some(&20));
@@ -1865,10 +2523,12 @@ mod tests {
         for t in &templates {
             tmap.insert(t.name.clone(), t.clone());
         }
+        let empty_fns = HashMap::new();
         let ctx = EvalContext {
             templates: &tmap,
             input_signals: HashMap::new(),
             generic_args: Vec::new(),
+            functions: &empty_fns,
         };
         let result = evaluate_template(&templates[0], &ctx);
         assert_eq!(result.outputs.get("b"), Some(&100));
