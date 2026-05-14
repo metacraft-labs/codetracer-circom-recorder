@@ -463,6 +463,14 @@ struct ComponentInstance {
     /// nesting order — see
     /// `tests/test_tracer.rs::test_nested_template_test_three_deep_call_sequence`.
     parent_template: Option<String>,
+    /// Numeric template arguments captured from the instantiation site
+    /// (`component main = Num2Bits(4)` -> `vec![4]`).  Best-effort
+    /// integer-literal parsing; non-literal arguments (which Circom
+    /// evaluates at compile time) yield `0` so the trace still
+    /// produces *something* sensible.  This is what enables top-level
+    /// `Template(N)` parameterisation through the structured
+    /// evaluator's `generic_args` slot.
+    template_args: Vec<i64>,
 }
 
 /// A parsed template definition.
@@ -655,13 +663,13 @@ impl CircomTracer {
         // Only set inputs for the main component's template (not sub-component templates).
         let signal_decls = parse_signal_declarations(source_code);
         let main_template_name = find_main_template_name(source_code);
-        let main_template_inputs = find_template_inputs(source_code, main_template_name.as_deref());
-        let mut inputs: HashMap<String, Vec<String>> = HashMap::new();
-        for input_name in &main_template_inputs {
-            // Default input value is "0". In a real usage, inputs would come
-            // from a JSON file; for tracing purposes we use 0.
-            inputs.insert(input_name.clone(), vec!["0".to_string()]);
-        }
+        let main_template_args = find_main_template_args(source_code);
+        let main_input_decls =
+            find_template_input_decls(source_code, main_template_name.as_deref());
+        let main_generic_params =
+            find_template_generic_params(source_code, main_template_name.as_deref());
+        let main_generic_env = bind_generic_args(&main_generic_params, &main_template_args);
+        let inputs = build_witness_inputs(&main_input_decls, &main_generic_env);
 
         // -- 4. Run the witness generator -------------------------------------------------
         let witness_result = if use_cpp {
@@ -901,11 +909,13 @@ impl CircomTracer {
         };
         let signal_decls = parse_signal_declarations(source_code);
         let main_template_name = find_main_template_name(source_code);
-        let main_template_inputs = find_template_inputs(source_code, main_template_name.as_deref());
-        let mut inputs: HashMap<String, Vec<String>> = HashMap::new();
-        for input_name in &main_template_inputs {
-            inputs.insert(input_name.clone(), vec!["0".to_string()]);
-        }
+        let main_template_args = find_main_template_args(source_code);
+        let main_input_decls =
+            find_template_input_decls(source_code, main_template_name.as_deref());
+        let main_generic_params =
+            find_template_generic_params(source_code, main_template_name.as_deref());
+        let main_generic_env = bind_generic_args(&main_generic_params, &main_template_args);
+        let inputs = build_witness_inputs(&main_input_decls, &main_generic_env);
 
         let witness_result = if use_cpp {
             let binary = match cpp_witness::compile_cpp_witness(compile_dir.path(), &stem) {
@@ -1122,7 +1132,7 @@ impl CircomTracer {
                 &main_inst.template_name,
                 "", // main has no name prefix for its signals
                 &main_input_values,
-                Vec::new(),
+                main_inst.template_args.clone(),
                 &tmpl_map,
                 &template_fns,
             );
@@ -1608,12 +1618,32 @@ fn parse_component_instances(source: &str) -> Vec<ComponentInstance> {
                 let after_eq = after_component[eq_pos + 1..].trim();
                 if let Some(paren_pos) = after_eq.find('(') {
                     let template_name = after_eq[..paren_pos].trim();
+                    // Extract integer-literal template args from
+                    // `Template(N, M, ...)` between the matching parens.
+                    // Non-literal args fall back to `0`; this matches
+                    // the evaluator's own degraded behaviour for
+                    // unresolved generic arguments and keeps the trace
+                    // producing concrete values for the common
+                    // `template Foo(N) { ... }` instantiation idiom.
+                    let template_args: Vec<i64> =
+                        if let Some(close_paren) = after_eq[paren_pos + 1..].find(')') {
+                            let inner = &after_eq[paren_pos + 1..paren_pos + 1 + close_paren];
+                            inner
+                                .split(',')
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.parse::<i64>().unwrap_or(0))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                     if !name.is_empty() && !template_name.is_empty() {
                         components.push(ComponentInstance {
                             name: name.to_string(),
                             template_name: template_name.to_string(),
                             line: line_num,
                             parent_template: current_template.clone(),
+                            template_args,
                         });
                     }
                 }
@@ -1741,11 +1771,29 @@ fn find_main_template_name(source: &str) -> Option<String> {
     None
 }
 
-/// Find input signal names for a specific template.
+/// A parsed `signal input` declaration with its array dimensions and
+/// the source identifier of each dim (for parameterised templates).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputSignalDecl {
+    /// Bare signal name (without trailing `[N]` brackets).
+    name: String,
+    /// Each `[expr]` dimension token from the declaration, with the
+    /// raw expression source preserved so the caller can substitute
+    /// template-arg values (e.g. `[N]` -> `[3]` when `N=3`).  Scalar
+    /// signals carry an empty `dims` vector.
+    dims: Vec<String>,
+}
+
+/// Find input signal declarations for a specific template, capturing
+/// each declaration's name and its array dimensions (raw expression
+/// strings).  When the template has array-typed inputs, callers need
+/// the dimension expressions so they can compute the witness-size for
+/// each input given the template's actual generic arguments.
 ///
-/// If `template_name` is `None`, falls back to collecting all input signals
-/// from the entire source (backward-compatible behavior for single-template files).
-fn find_template_inputs(source: &str, template_name: Option<&str>) -> Vec<String> {
+/// If `template_name` is `None`, falls back to collecting all input
+/// signals from the entire source (backward-compatible behaviour for
+/// single-template files used in early-2026 fixtures).
+fn find_template_input_decls(source: &str, template_name: Option<&str>) -> Vec<InputSignalDecl> {
     let mut inputs = Vec::new();
     let mut in_target_template = template_name.is_none();
     let mut brace_depth = 0i32;
@@ -1783,15 +1831,165 @@ fn find_template_inputs(source: &str, template_name: Option<&str>) -> Vec<String
 
             // Parse signal input declarations within this template.
             if let Some(rest) = trimmed.strip_prefix("signal input ") {
-                let name = rest.trim().trim_end_matches(';').trim().to_string();
-                if !name.is_empty() {
-                    inputs.push(name);
+                let raw = rest.trim().trim_end_matches(';').trim();
+                if !raw.is_empty() {
+                    let (name, dims) = split_array_dims(raw);
+                    inputs.push(InputSignalDecl { name, dims });
                 }
             }
         }
     }
 
     inputs
+}
+
+/// Extract integer-literal arguments from `component main = Foo(...)`.
+/// Non-literal args (rare for `main`, since circom's compile-time
+/// folding requires them to be constant) yield 0.  Returns an empty
+/// vector when no `component main` line exists.
+fn find_main_template_args(source: &str) -> Vec<i64> {
+    for line_text in source.lines() {
+        let trimmed = line_text.trim();
+        if !trimmed.starts_with("component main") {
+            continue;
+        }
+        let Some(eq_pos) = trimmed.find('=') else {
+            continue;
+        };
+        let after_eq = trimmed[eq_pos + 1..].trim();
+        let Some(open_paren) = after_eq.find('(') else {
+            continue;
+        };
+        let Some(close_paren) = after_eq[open_paren + 1..].find(')') else {
+            continue;
+        };
+        let inner = &after_eq[open_paren + 1..open_paren + 1 + close_paren];
+        return inner
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<i64>().unwrap_or(0))
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Extract the generic-parameter names of `template Foo(N, M, ...)`
+/// for `template_name == Some("Foo")`.  Returns the parameters in
+/// declaration order.  Yields an empty vec if the template has no
+/// generic params or `template_name` is `None`.
+fn find_template_generic_params(source: &str, template_name: Option<&str>) -> Vec<String> {
+    let Some(target) = template_name else {
+        return Vec::new();
+    };
+    for line_text in source.lines() {
+        let trimmed = line_text.trim();
+        if !trimmed.starts_with("template ") {
+            continue;
+        }
+        let Some(open_paren) = trimmed.find('(') else {
+            continue;
+        };
+        let name = trimmed[9..open_paren].trim();
+        if name != target {
+            continue;
+        }
+        let Some(close_paren) = trimmed[open_paren + 1..].find(')') else {
+            return Vec::new();
+        };
+        let inner = &trimmed[open_paren + 1..open_paren + 1 + close_paren];
+        return inner
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Bind generic-parameter names to their corresponding template-arg
+/// values: `Sum(N) ... main = Sum(3)` -> `{"N" -> 3}`.  Extra args (or
+/// extra params without a matching arg) are silently dropped.
+fn bind_generic_args(params: &[String], args: &[i64]) -> HashMap<String, i64> {
+    params
+        .iter()
+        .zip(args.iter())
+        .map(|(p, a)| (p.clone(), *a))
+        .collect()
+}
+
+/// Build the witness-input map (name -> Vec<value-string>) from the
+/// main template's input-signal declarations.  Each scalar input gets
+/// a single `"0"` element; each array input gets `N` `"0"` elements
+/// where `N` is the resolved first dimension.  This shape is what the
+/// circom WASM witness calculator's `setInputSignal` ABI expects.
+fn build_witness_inputs(
+    decls: &[InputSignalDecl],
+    generic_env: &HashMap<String, i64>,
+) -> HashMap<String, Vec<String>> {
+    let mut inputs = HashMap::new();
+    for d in decls {
+        // Total signal size = product of all dimensions (multi-dim
+        // arrays are flattened by circom into a single contiguous
+        // input buffer).  Scalars have `dims == []` so the product
+        // yields 1.
+        let mut size = 1usize;
+        for dim_expr in &d.dims {
+            size *= resolve_dim(dim_expr, generic_env).max(1);
+        }
+        inputs.insert(d.name.clone(), vec!["0".to_string(); size]);
+    }
+    inputs
+}
+
+/// Split `name[d1][d2]...` into `(name, [d1, d2, ...])`.  Each
+/// dimension is captured verbatim as a source-string slice (no parsing
+/// of the inner expression — that's the caller's job, since the
+/// dimension may reference template generic parameters).
+fn split_array_dims(decl: &str) -> (String, Vec<String>) {
+    let bytes = decl.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    let name = std::str::from_utf8(&bytes[..i]).unwrap_or("").to_string();
+    let mut dims = Vec::new();
+    while i < bytes.len() && bytes[i] == b'[' {
+        let start = i + 1;
+        let mut depth = 1i32;
+        i += 1;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        // i now points one past the matching ']'; dim text is bytes[start..i-1]
+        let end = i.saturating_sub(1);
+        let dim = std::str::from_utf8(&bytes[start..end])
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        dims.push(dim);
+    }
+    (name, dims)
+}
+
+/// Resolve a dimension expression to an integer using the
+/// (template_param_name -> value) map.  Returns 1 on parse failure so
+/// the witness calculator at least gets a valid array shape (a real
+/// program will surface the error elsewhere).
+fn resolve_dim(expr: &str, generic_env: &HashMap<String, i64>) -> usize {
+    let expr = expr.trim();
+    if let Ok(n) = expr.parse::<i64>() {
+        return (n.max(0)) as usize;
+    }
+    if let Some(&v) = generic_env.get(expr) {
+        return (v.max(0)) as usize;
+    }
+    1
 }
 
 #[cfg(test)]
@@ -1929,6 +2127,7 @@ template FlowTest() {
                     // `adder` is declared inside the `ComponentTest`
                     // template body, so its parent_template tracks that.
                     parent_template: Some("ComponentTest".to_string()),
+                    template_args: Vec::new(),
                 },
                 ComponentInstance {
                     name: "main".to_string(),
@@ -1937,6 +2136,7 @@ template FlowTest() {
                     // `component main = ...` is at file scope, so it has
                     // no parent template body — it's the root.
                     parent_template: None,
+                    template_args: Vec::new(),
                 },
             ]
         );
@@ -1958,18 +2158,21 @@ template FlowTest() {
             template_name: "Inner".to_string(),
             line: 24,
             parent_template: Some("Middle".to_string()),
+            template_args: Vec::new(),
         };
         let middle = ComponentInstance {
             name: "middle".to_string(),
             template_name: "Middle".to_string(),
             line: 31,
             parent_template: Some("NestedTemplate".to_string()),
+            template_args: Vec::new(),
         };
         let main = ComponentInstance {
             name: "main".to_string(),
             template_name: "NestedTemplate".to_string(),
             line: 35,
             parent_template: None,
+            template_args: Vec::new(),
         };
         let components = vec![inner.clone(), middle.clone(), main.clone()];
 
@@ -1990,18 +2193,21 @@ template FlowTest() {
             template_name: "Add5".to_string(),
             line: 33,
             parent_template: Some("SignalHierarchy".to_string()),
+            template_args: Vec::new(),
         };
         let mul2 = ComponentInstance {
             name: "mul2".to_string(),
             template_name: "Mul2".to_string(),
             line: 34,
             parent_template: Some("SignalHierarchy".to_string()),
+            template_args: Vec::new(),
         };
         let main = ComponentInstance {
             name: "main".to_string(),
             template_name: "SignalHierarchy".to_string(),
             line: 41,
             parent_template: None,
+            template_args: Vec::new(),
         };
         let components = vec![add5.clone(), mul2.clone(), main.clone()];
 

@@ -1498,6 +1498,668 @@ fn test_constraint_assert_test_constants_decode() {
     );
 }
 
+// --- for_loop_unroll_test.circom ------------------------------------------
+
+/// Records `for_loop_unroll_test.circom`, which exercises nested for
+/// loops with compile-time `var` bounds.  The Circom compiler unrolls
+/// every iteration; the structured evaluator (added 2026-05-13) walks
+/// the unrolled steps and emits one step per per-iteration body line.
+/// Closes the M11 `for_and_if_steps_emitted` follow-up by extending
+/// coverage past the single-loop case in `control_flow_test.circom`.
+#[test]
+fn test_for_loop_unroll_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_for_loop_unroll_test_via_ct_print_full",
+        "for_loop_unroll_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["ForLoopUnroll"]);
+
+    // ----- counts -----------------------------------------------------
+    // 15 step events: 1 toplevel + 1 component-main + 1 signal-output
+    // decl + 1 `var acc = 0` + 1 outer-for-header + 9 nested-loop
+    // steps (3 outer iters × (1 inner-for-header + 2 inner-body)) +
+    // 1 final `total <== acc`.  Plus 1 call_entry + 1 call_exit = 17
+    // events.  The outer for-header step fires once even though the
+    // outer loop runs 3 times — see the `Stmt::For` handling in
+    // `eval_stmt` (the header is not re-emitted per-iteration to
+    // avoid pinning a confusing "infinite step train" at the for
+    // line).  The inner for-header step DOES fire 3 times because it
+    // sits inside the outer body, which is replayed once per outer
+    // iteration.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(15), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(15),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 17, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["ForLoopUnroll".to_string()],
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["ForLoopUnroll".to_string()],
+    );
+
+    // ----- Exact step lines (in order) --------------------------------
+    // Lines: toplevel start (1), `component main` (34), `signal output
+    // total;` (22), `var acc = 0;` (24), outer for header (25), then
+    // for each i in 0..3: inner-for header (26) + body line 27 ×2.
+    // Final `total <== acc;` (31).
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(
+        step_lines,
+        vec![1, 34, 22, 24, 25, 26, 27, 27, 26, 27, 27, 26, 27, 27, 31]
+    );
+
+    // ----- Decoded variable values ------------------------------------
+    // Only the final `total <== acc;` surfaces a Variable event.
+    // The for-loop body is `var`-only (acc/i/j are compile-time
+    // scratch and don't pollute the trace; see the rationale in
+    // `eval_stmt::Stmt::VarDecl`).  Total = 0+1+10+11+20+21 = 63.
+    assert_eq!(observed_int_vars(&doc), vec![("total".to_string(), 63)]);
+}
+
+/// Spec-correct expectation: nested for loops with compile-time bounds
+/// must each surface a step event per iteration, regardless of nesting
+/// depth.  Pre-2026-05-13 the brace-tracking parser only matched
+/// `<==` lines and dropped every loop-body step; the structured
+/// evaluator now visits both inner and outer loop bodies and emits a
+/// step on every executed source line.
+#[test]
+fn test_for_loop_unroll_test_nested_iterations_emitted() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_for_loop_unroll_test_nested_iterations_emitted",
+        "for_loop_unroll_test.circom",
+    ) else {
+        return;
+    };
+    let events = doc["events"].as_array().unwrap();
+    let inner_body_count = events
+        .iter()
+        .filter(|e| e["kind"] == "step" && e["line"].as_i64() == Some(27))
+        .count();
+    // 3 outer iters × 2 inner iters = 6 inner-body steps.
+    assert_eq!(
+        inner_body_count, 6,
+        "expected 6 inner-body steps (line 27); events = {events:#?}"
+    );
+    let inner_header_count = events
+        .iter()
+        .filter(|e| e["kind"] == "step" && e["line"].as_i64() == Some(26))
+        .count();
+    // The inner for-header fires once per outer iteration = 3 times.
+    assert_eq!(
+        inner_header_count, 3,
+        "expected 3 inner-for-header steps (line 26); events = {events:#?}"
+    );
+}
+
+// --- constraint_operators_test.circom -------------------------------------
+
+/// Records `constraint_operators_test.circom`, which exercises four
+/// `===` constraint forms (simple, arithmetic-RHS, lhs-with-arithmetic,
+/// scalar-equality).  Closes the M11 `emits_assertion_steps` follow-up
+/// by extending `===` coverage past the two-line case in
+/// `constraint_assert_test.circom`.
+#[test]
+fn test_constraint_operators_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_constraint_operators_test_via_ct_print_full",
+        "constraint_operators_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["ConstraintOperators"]);
+
+    // ----- counts -----------------------------------------------------
+    // 16 step events: 1 toplevel + 1 component-main + 5 signal-decls
+    // (1 output `s` + 4 intermediate a/b/c/d) + 5 `<==` assignments
+    // (a/b/c/d/s) + 4 `===` constraint-assertion lines.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(16), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(16),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 18, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["ConstraintOperators".to_string()],
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["ConstraintOperators".to_string()],
+    );
+
+    // ----- Exact step lines (in order) --------------------------------
+    // Lines: toplevel (1), `component main = ConstraintOperators()`
+    // (44), output decl `s` (24), intermediate decls a/b/c/d
+    // (26/27/28/29), `<==` assignments a/b/c/d (31/32/33/34) and
+    // `s <== a + b` (36), then four `===` constraint lines
+    // (38/39/40/41).
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(
+        step_lines,
+        vec![1, 44, 24, 26, 27, 28, 29, 31, 32, 33, 34, 36, 38, 39, 40, 41]
+    );
+
+    // ----- Decoded variable values ------------------------------------
+    // a=3, b=4, c=7, d=1, s=a+b=7.  `===` lines emit no Variable
+    // events (constraint-only).
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("a".to_string(), 3),
+            ("b".to_string(), 4),
+            ("c".to_string(), 7),
+            ("d".to_string(), 1),
+            ("s".to_string(), 7),
+        ],
+    );
+}
+
+/// Spec-correct expectation: every `===` constraint-assertion line
+/// (regardless of how complex its RHS is) must surface as a step event
+/// so a debugger can step over the assertion.  The structured
+/// evaluator emits a step per `Stmt::Constraint` line; this test pins
+/// all four lines (38, 39, 40, 41) — the simple `s === a + b` form
+/// plus the three extended forms (`a + b === c * d`, `s - a === b`,
+/// `c === s`).
+#[test]
+fn test_constraint_operators_test_all_assertion_lines_emitted() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_constraint_operators_test_all_assertion_lines_emitted",
+        "constraint_operators_test.circom",
+    ) else {
+        return;
+    };
+    let events = doc["events"].as_array().unwrap();
+    let step_lines: std::collections::BTreeSet<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().unwrap())
+        .collect();
+    for want in [38i64, 39, 40, 41] {
+        assert!(
+            step_lines.contains(&want),
+            "expected a step at line {want} (`===` constraint); got {step_lines:?}"
+        );
+    }
+}
+
+// --- wire_to_component_test.circom ----------------------------------------
+
+/// Records `wire_to_component_test.circom`, which exercises a 3-stage
+/// wire chain: `step1.out -> step2.in`, `step2.out -> step3.in`.
+/// Closes the M11 `chain_values_decode` follow-up by extending wire
+/// coverage past the 2-component case in
+/// `signal_hierarchy_test.circom`.  Each sub-component's body
+/// surfaces as its own call frame so the trace contains 4 call pairs
+/// (the parent + 3 sub-components) in source-instantiation order.
+#[test]
+fn test_wire_to_component_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_wire_to_component_test_via_ct_print_full",
+        "wire_to_component_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table — definition order in the source file -------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["AddOne", "MulTwo", "SubThree", "WireToComponent"]
+    );
+
+    // ----- counts -----------------------------------------------------
+    // 19 step events + 4 call_entry + 4 call_exit = 27 events.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(19), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 27, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence in nesting order ----------------------------
+    // Parent `WireToComponent` first, then its three siblings in
+    // source-instantiation order.  Exits unwind LIFO — each
+    // sub-component exits immediately after its body returns, so
+    // siblings exit in source order and the parent exits last.
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "WireToComponent".to_string(),
+            "AddOne".to_string(),
+            "MulTwo".to_string(),
+            "SubThree".to_string(),
+        ],
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "AddOne".to_string(),
+            "MulTwo".to_string(),
+            "SubThree".to_string(),
+            "WireToComponent".to_string(),
+        ],
+    );
+
+    // ----- Call_entry args: each sub-component carries its single
+    // input signal staged from the parent's wire site.  AddOne.x = 5
+    // (literal), MulTwo.in = step1.out = 6, SubThree.in = step2.out
+    // = 12.  WireToComponent has no input signals.
+    let call_entries: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .collect();
+    assert_eq!(call_entries.len(), 4);
+
+    assert_eq!(
+        call_entries[0]["args"].as_array().expect("args").len(),
+        0,
+        "WireToComponent has no input signals"
+    );
+
+    let add1 = call_entries[1]["args"].as_array().expect("AddOne args");
+    assert_eq!(add1.len(), 1);
+    assert_eq!(add1[0]["varname"].as_str(), Some("x"));
+    assert_eq!(add1[0]["value"]["i"].as_i64(), Some(5));
+
+    let mul2 = call_entries[2]["args"].as_array().expect("MulTwo args");
+    assert_eq!(mul2.len(), 1);
+    assert_eq!(mul2[0]["varname"].as_str(), Some("in"));
+    assert_eq!(mul2[0]["value"]["i"].as_i64(), Some(6));
+
+    let sub3 = call_entries[3]["args"].as_array().expect("SubThree args");
+    assert_eq!(sub3.len(), 1);
+    assert_eq!(sub3[0]["varname"].as_str(), Some("in"));
+    assert_eq!(sub3[0]["value"]["i"].as_i64(), Some(12));
+
+    // ----- Decoded variable values ------------------------------------
+    // The structured evaluator wires each sub-template's input
+    // signals before its body runs, evaluates the body, and feeds
+    // outputs back into the parent's env.  The full surface:
+    //   * Each sub-component emits `x`/`in` (input decl) and
+    //     `<comp>.<input>` (prefixed by the recurse-down emit) plus
+    //     the output `<comp>.out`.
+    //   * The parent re-emits each wire site (45/46/47) as a step
+    //     variable carrying the wired value.
+    //   * The final `final <== step3.out + 100;` (line 48) emits
+    //     `final = 109`.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("x".to_string(), 5),
+            ("step1.x".to_string(), 5),
+            ("step1.out".to_string(), 6),
+            ("in".to_string(), 6),
+            ("step2.in".to_string(), 6),
+            ("step2.out".to_string(), 12),
+            ("in".to_string(), 12),
+            ("step3.in".to_string(), 12),
+            ("step3.out".to_string(), 9),
+            ("step1.x".to_string(), 5),
+            ("step2.in".to_string(), 6),
+            ("step3.in".to_string(), 12),
+            ("final".to_string(), 109),
+        ],
+    );
+}
+
+/// Spec-correct expectation: a 3-stage wire chain
+/// (`step1.out -> step2.in -> step3.in`) must propagate values end
+/// to end so the final signal carries the fully-folded result, not
+/// 0.  Pin the final value as the canonical regression check for the
+/// chain-decode follow-up.
+#[test]
+fn test_wire_to_component_test_chain_propagates_end_to_end() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_wire_to_component_test_chain_propagates_end_to_end",
+        "wire_to_component_test.circom",
+    ) else {
+        return;
+    };
+    let observed = observed_int_vars(&doc);
+    assert!(
+        observed.contains(&("final".to_string(), 109i64)),
+        "expected `final = 109` in observed = {observed:?}"
+    );
+    // Each intermediate hop of the wire chain must surface its
+    // computed value, not the witness's "every signal is 0" output
+    // for inputless circuits.
+    for want in [
+        ("step1.out".to_string(), 6i64),
+        ("step2.out".to_string(), 12i64),
+        ("step3.out".to_string(), 9i64),
+    ] {
+        assert!(
+            observed.contains(&want),
+            "expected {want:?} in observed = {observed:?}"
+        );
+    }
+}
+
+// --- circomlib_num2bits_test.circom ---------------------------------------
+
+/// Records `circomlib_num2bits_test.circom`, the canonical circomlib
+/// `Num2Bits(N)` bit-decomposition pattern (from
+/// `circomlib/circuits/bitify.circom`).  Closes the M11
+/// `intermediate_outputs_decode` follow-up by exercising a real-world
+/// template with a numeric template parameter (`N`), an `output[N]`
+/// signal array, a for loop driven by `N`, and a `===` constraint on
+/// the final accumulator.  The recorder defaults `signal input`
+/// values to 0, so the bit-decomposition of 0 yields `[0, 0, 0, 0]`.
+#[test]
+fn test_circomlib_num2bits_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_circomlib_num2bits_test_via_ct_print_full",
+        "circomlib_num2bits_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["Num2Bits"]);
+
+    // ----- counts -----------------------------------------------------
+    // 24 step events: 1 toplevel + 1 component-main + 1 signal-input
+    // decl + 1 signal-output-array decl + 2 var decls + 1 for-header
+    // + (4 iters × 4 body lines = 16) + 1 final `===`.
+    // 1 call_entry + 1 call_exit = 26 events.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(24), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 26, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    assert_eq!(observed_call_sequence(&doc), vec!["Num2Bits".to_string()]);
+    assert_eq!(observed_exit_sequence(&doc), vec!["Num2Bits".to_string()]);
+
+    // ----- Call_entry arg: input `in = 0` (default) -------------------
+    let call_entries: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .collect();
+    assert_eq!(call_entries.len(), 1);
+    let args = call_entries[0]["args"].as_array().expect("Num2Bits args");
+    assert_eq!(args.len(), 1);
+    assert_eq!(args[0]["varname"].as_str(), Some("in"));
+    assert_eq!(args[0]["value"]["i"].as_i64(), Some(0));
+
+    // ----- Exact step lines (in order) --------------------------------
+    // Lines: toplevel (1), `component main = Num2Bits(4)` (32),
+    // `signal input in;` (18), `signal output out[N];` (19), `var
+    // lc1 = 0;` (21), `var e2 = 1;` (22), for header (23), then
+    // 4 iterations of the body: 24, 25, 26, 27 each.  Final
+    // `lc1 === in;` (29).
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(
+        step_lines,
+        vec![
+            1, 32, 18, 19, 21, 22, 23, 24, 25, 26, 27, 24, 25, 26, 27, 24, 25, 26, 27, 24, 25, 26,
+            27, 29
+        ]
+    );
+
+    // ----- Decoded variable values ------------------------------------
+    // The recorder surfaces:
+    //   * `in = 0` (input-signal decl, line 18) twice — once as the
+    //     prefixed parent-frame view (input decls always emit a
+    //     Variable in the recorder's per-frame walk) and once for the
+    //     evaluator's input-signal decl event inside the body.
+    //   * `out[i] = 0` for each i in 0..4 (the `<--` assignment on
+    //     line 24 surfaces with the indexed name resolved against the
+    //     loop-induction var).
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("in".to_string(), 0),
+            ("in".to_string(), 0),
+            ("out[0]".to_string(), 0),
+            ("out[1]".to_string(), 0),
+            ("out[2]".to_string(), 0),
+            ("out[3]".to_string(), 0),
+        ],
+    );
+}
+
+/// Spec-correct expectation: `Num2Bits(N)` output-array assignments
+/// must surface with their indexed name (`out[0]`, `out[1]`, ...) so
+/// debugger users can inspect each bit individually.  Pre-2026-05-13
+/// the evaluator's printable-name path lost the index when the
+/// subscript was a `var` (e.g. the loop induction variable `i`),
+/// emitting `out[?]` instead.  The env-aware
+/// `expr_to_name_with_env` helper added 2026-05-13 resolves the
+/// subscript against the current evaluation env so the right index
+/// surfaces in the trace.
+#[test]
+fn test_circomlib_num2bits_test_intermediate_outputs_decode() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_circomlib_num2bits_test_intermediate_outputs_decode",
+        "circomlib_num2bits_test.circom",
+    ) else {
+        return;
+    };
+    let observed = observed_int_vars(&doc);
+    for want in [
+        ("out[0]".to_string(), 0i64),
+        ("out[1]".to_string(), 0i64),
+        ("out[2]".to_string(), 0i64),
+        ("out[3]".to_string(), 0i64),
+    ] {
+        assert!(
+            observed.contains(&want),
+            "expected {want:?} in observed = {observed:?}"
+        );
+    }
+}
+
+// --- template_signal_args_test.circom -------------------------------------
+
+/// Records `template_signal_args_test.circom`, which exercises the
+/// generic-template + signal-array combination: `template Sum(N)`
+/// with `signal input in[N]` and a for loop driven by `N`.  Closes
+/// the M11 follow-up "bread-and-butter form unexercised today".
+/// The recorder must propagate `Sum(3)`'s template arg into the
+/// evaluator's `generic_args` slot so the for loop runs 3 iterations
+/// (without that, `N` resolves to 0 and the loop runs zero times).
+#[test]
+fn test_template_signal_args_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_template_signal_args_test_via_ct_print_full",
+        "template_signal_args_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["Sum"]);
+
+    // ----- counts -----------------------------------------------------
+    // 10 step events: 1 toplevel + 1 component-main + 1 signal-input
+    // decl + 1 signal-output decl + 1 `var acc = 0;` + 1 for-header
+    // + 3 body iterations + 1 final `sum <== acc;`.
+    // 1 call_entry + 1 call_exit = 12 events.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(10),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 12, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    assert_eq!(observed_call_sequence(&doc), vec!["Sum".to_string()]);
+    assert_eq!(observed_exit_sequence(&doc), vec!["Sum".to_string()]);
+
+    // ----- Call_entry arg: input `in = 0` (default) -------------------
+    let call_entries: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .collect();
+    assert_eq!(call_entries.len(), 1);
+    let args = call_entries[0]["args"].as_array().expect("Sum args");
+    assert_eq!(args.len(), 1);
+    assert_eq!(args[0]["varname"].as_str(), Some("in"));
+    assert_eq!(args[0]["value"]["i"].as_i64(), Some(0));
+
+    // ----- Exact step lines (in order) --------------------------------
+    // Lines: toplevel (1), `component main = Sum(3)` (32),
+    // `signal input in[N];` (22), `signal output sum;` (23), `var
+    // acc = 0;` (25), for header (26), 3 iterations of `acc = acc +
+    // in[i];` (27), final `sum <== acc;` (29).  The 3 body
+    // iterations are the proof that the template arg `Sum(3)` made
+    // it through the recorder's component-args parser into the
+    // evaluator's `generic_args` slot — without that wiring, `N`
+    // resolves to 0 and the for loop runs zero times.
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(step_lines, vec![1, 32, 22, 23, 25, 26, 27, 27, 27, 29]);
+
+    // ----- Decoded variable values ------------------------------------
+    // `in = 0` (input decl) and `sum = 0` (final assign).  The
+    // recorder defaults inputs to 0, so the sum of 3 zeros is 0.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![("in".to_string(), 0), ("sum".to_string(), 0)],
+    );
+}
+
+/// Spec-correct expectation: `template Sum(N)`'s for loop must
+/// iterate exactly `N` times when instantiated as `component main =
+/// Sum(3)`.  Without the template-arg propagation shipped 2026-05-13,
+/// `N` resolved to 0 (the evaluator's default for unknown
+/// generic_args) and the for loop ran zero times.
+#[test]
+fn test_template_signal_args_test_generic_arg_drives_loop() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_template_signal_args_test_generic_arg_drives_loop",
+        "template_signal_args_test.circom",
+    ) else {
+        return;
+    };
+    let events = doc["events"].as_array().unwrap();
+    let body_count = events
+        .iter()
+        .filter(|e| e["kind"] == "step" && e["line"].as_i64() == Some(27))
+        .count();
+    assert_eq!(
+        body_count, 3,
+        "expected 3 for-loop body steps (line 27) for Sum(3); got {body_count}"
+    );
+}
+
 // ===========================================================================
 // CLI env-var contract
 // ===========================================================================
