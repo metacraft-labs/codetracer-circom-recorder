@@ -1532,7 +1532,12 @@ fn eval_stmt(
         }
         Stmt::Assign { line, op, lhs, rhs } => {
             let value = eval_expr(rhs, env).and_then(|v| v.as_int()).unwrap_or(0);
-            let lhs_name = expr_to_name(lhs);
+            // Resolve indices against the current env *before* applying
+            // the assignment so `out[i] <-- ...` renders as `out[3]`
+            // when `i = 3` rather than the placeholder `out[?]`.  This
+            // is the only path that surfaces array element names to the
+            // recorder's variable-event sink.
+            let lhs_name = expr_to_name_with_env(lhs, Some(env));
             // Apply the assignment to the env regardless of the operator.
             apply_lvalue(lhs, value, env);
 
@@ -1714,16 +1719,23 @@ fn apply_lvalue(lhs: &Expr, value: i64, env: &mut HashMap<String, Value>) {
     }
 }
 
-fn expr_to_name(e: &Expr) -> String {
+/// Render an l-value expression as a printable name.  When `env` is
+/// `Some(...)`, indexing expressions like `out[i]` resolve `i` against
+/// the env (so the printed name surfaces as `out[3]` rather than
+/// `out[?]`).  Without an env we still try to render literal indices.
+fn expr_to_name_with_env(e: &Expr, env: Option<&HashMap<String, Value>>) -> String {
     match e {
         Expr::Ident(s) => s.clone(),
-        Expr::Member(b, s) => format!("{}.{}", expr_to_name(b), s),
+        Expr::Member(b, s) => format!("{}.{}", expr_to_name_with_env(b, env), s),
         Expr::Index(b, i) => {
             let idx = match i.as_ref() {
                 Expr::Int(n) => n.to_string(),
-                _ => "?".to_string(),
+                other => env
+                    .and_then(|e| eval_expr(other, e).and_then(|v| v.as_int()))
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
             };
-            format!("{}[{}]", expr_to_name(b), idx)
+            format!("{}[{}]", expr_to_name_with_env(b, env), idx)
         }
         _ => "?".to_string(),
     }
