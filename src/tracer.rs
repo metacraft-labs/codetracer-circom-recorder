@@ -16,7 +16,9 @@ use num_bigint::BigUint;
 use wasmtime::{Caller, Engine, Func, Linker, Module, Store, Val};
 
 use crate::cpp_witness::{self, CompilerSourceMap};
-use crate::evaluator::{self as eval_mod, EvalContext, EvalEventKind, Template as ETemplate};
+use crate::evaluator::{
+    self as eval_mod, EvalContext, EvalEventKind, Function as EFunction, Template as ETemplate,
+};
 use crate::signal_hierarchy::{build_hierarchy, SignalPath};
 use crate::source_map::SourceMap;
 
@@ -500,6 +502,7 @@ pub struct CircomTracer {
     writer: Box<dyn TraceWriter + Send>,
     /// Field element type id (registered once).
     field_type_id: Option<codetracer_trace_types::TypeId>,
+    bool_type_id: Option<codetracer_trace_types::TypeId>,
 }
 
 impl CircomTracer {
@@ -515,20 +518,12 @@ impl CircomTracer {
     /// `Recorder-CLI-Conventions.md` §4 in `codetracer-specs`.  Use
     /// `ct print` (from `codetracer-trace-format-nim`) to convert the
     /// produced bundle to JSON or other text forms.
-    pub fn trace_program(
-        source_path: &Path,
-        source_code: &str,
-        out_dir: &Path,
-    ) -> Result<()> {
+    pub fn trace_program(source_path: &Path, source_code: &str, out_dir: &Path) -> Result<()> {
         Self::trace_program_with_backend(source_path, source_code, out_dir, false)
     }
 
     /// Trace using the C++ witness generator backend (faster for large circuits).
-    pub fn trace_program_cpp(
-        source_path: &Path,
-        source_code: &str,
-        out_dir: &Path,
-    ) -> Result<()> {
+    pub fn trace_program_cpp(source_path: &Path, source_code: &str, out_dir: &Path) -> Result<()> {
         Self::trace_program_with_backend(source_path, source_code, out_dir, true)
     }
 
@@ -781,6 +776,7 @@ impl CircomTracer {
         let mut tracer = CircomTracer {
             writer: create_trace_writer(&program_str, &[], format),
             field_type_id: None,
+            bool_type_id: None,
         };
 
         std::fs::create_dir_all(out_dir)
@@ -802,6 +798,8 @@ impl CircomTracer {
         let field_type_id =
             TraceWriter::ensure_type_id(&mut *tracer.writer, TypeKind::Int, "field");
         tracer.field_type_id = Some(field_type_id);
+        let bool_type_id = TraceWriter::ensure_type_id(&mut *tracer.writer, TypeKind::Bool, "bool");
+        tracer.bool_type_id = Some(bool_type_id);
 
         Ok(tracer)
     }
@@ -1063,41 +1061,59 @@ impl CircomTracer {
             );
         };
 
-        // Parse every template body using the evaluator's structured
-        // parser.  Template definitions that the evaluator can't parse
-        // (e.g. they use language constructs the evaluator doesn't
-        // model) won't appear in the map; we'll degrade to a flat
-        // signal-decl/assignment dump for those.
+        // Parse every template body AND function body using the
+        // evaluator's structured parser.  Definitions that the
+        // evaluator can't parse (e.g. they use language constructs the
+        // evaluator doesn't model) won't appear in the map; we'll
+        // degrade to a flat signal-decl/assignment dump for those.
         let source_code = std::fs::read_to_string(source_path)
             .with_context(|| format!("failed to re-read {}", source_path.display()))?;
-        let parsed: Vec<ETemplate> = eval_mod::parse_templates(&source_code);
+        let (parsed_tmpls, parsed_fns): (Vec<ETemplate>, Vec<EFunction>) =
+            eval_mod::parse_program(&source_code);
         let mut tmpl_map: HashMap<String, ETemplate> = HashMap::new();
-        for t in parsed {
+        for t in parsed_tmpls {
             tmpl_map.insert(t.name.clone(), t);
+        }
+        let mut fns_map: HashMap<String, EFunction> = HashMap::new();
+        for f in parsed_fns {
+            fns_map.insert(f.name.clone(), f);
+        }
+
+        // Register every parsed `function` in the recorder's function
+        // table so it surfaces alongside templates in `ct print`'s
+        // `functions` array — this is the standard convention for
+        // distinguishing compile-time numeric helpers from
+        // signal-bearing templates.
+        let mut function_fns: HashMap<String, FunctionId> = HashMap::new();
+        for f in fns_map.values() {
+            let fn_id = TraceWriter::ensure_function_id(
+                &mut *self.writer,
+                &f.name,
+                source_path,
+                Line(f.line as i64),
+            );
+            function_fns.insert(f.name.clone(), fn_id);
         }
 
         // ------------------------------------------------------------
         // Step 1 — main component step (visible at file scope).
         // ------------------------------------------------------------
-        TraceWriter::register_step(
-            &mut *self.writer,
-            source_path,
-            Line(main_inst.line as i64),
-        );
+        TraceWriter::register_step(&mut *self.writer, source_path, Line(main_inst.line as i64));
 
         // ------------------------------------------------------------
         // Step 2 — main template's input signal values.  Today the
         // recorder defaults all main inputs to 0 (no JSON wiring).
         // The witness map (`values`) is the source of truth here.
         // ------------------------------------------------------------
-        let main_input_values: HashMap<String, i64> = if let Some(t) = tmpl_map.get(&main_inst.template_name) {
-            t.input_signals
-                .iter()
-                .map(|name| (name.clone(), values.get(name).copied().unwrap_or(0)))
-                .collect()
-        } else {
-            HashMap::new()
-        };
+        let main_input_values: HashMap<String, i64> =
+            if let Some(t) = tmpl_map.get(&main_inst.template_name) {
+                t.input_signals
+                    .iter()
+                    .map(|name| (name.clone(), values.get(name).copied().unwrap_or(0)))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
 
         // ------------------------------------------------------------
         // Step 3 — emit call_entry for main, recurse, emit call_exit.
@@ -1135,6 +1151,8 @@ impl CircomTracer {
                 main_inst.template_args.clone(),
                 &tmpl_map,
                 &template_fns,
+                &fns_map,
+                &function_fns,
             );
         }
 
@@ -1163,6 +1181,8 @@ impl CircomTracer {
         generic_args: Vec<i64>,
         tmpl_map: &HashMap<String, ETemplate>,
         template_fns: &HashMap<String, FunctionId>,
+        fns_map: &HashMap<String, EFunction>,
+        function_fns: &HashMap<String, FunctionId>,
     ) -> HashMap<String, i64> {
         let field_type_id = self.field_type_id.unwrap();
         let Some(template) = tmpl_map.get(template_name) else {
@@ -1186,6 +1206,7 @@ impl CircomTracer {
             templates: tmpl_map,
             input_signals: input_signals.clone(),
             generic_args,
+            functions: fns_map,
         };
         let result = eval_mod::evaluate_template(template, &ctx);
 
@@ -1232,7 +1253,11 @@ impl CircomTracer {
                         Line(ev.line as i64),
                     );
                 }
-                EvalEventKind::Variable { name, value } => {
+                EvalEventKind::Variable {
+                    name,
+                    value,
+                    is_bool,
+                } => {
                     TraceWriter::register_step(
                         &mut *self.writer,
                         source_path,
@@ -1252,9 +1277,16 @@ impl CircomTracer {
                         // captures the component path from main.
                         format!("{signal_prefix}{name}")
                     };
-                    let value_record = ValueRecord::Int {
-                        i: *value,
-                        type_id: field_type_id,
+                    let value_record = if *is_bool {
+                        ValueRecord::Bool {
+                            b: *value != 0,
+                            type_id: self.bool_type_id.unwrap(),
+                        }
+                    } else {
+                        ValueRecord::Int {
+                            i: *value,
+                            type_id: field_type_id,
+                        }
                     };
                     TraceWriter::register_variable_with_full_value(
                         &mut *self.writer,
@@ -1311,6 +1343,8 @@ impl CircomTracer {
                         args.clone(),
                         tmpl_map,
                         template_fns,
+                        fns_map,
+                        function_fns,
                     );
                     comp_outputs.insert(comp_name.clone(), outputs);
 
@@ -1365,11 +1399,7 @@ impl CircomTracer {
                 continue;
             };
 
-            TraceWriter::register_step(
-                &mut *self.writer,
-                source_path,
-                Line(component.line as i64),
-            );
+            TraceWriter::register_step(&mut *self.writer, source_path, Line(component.line as i64));
             let is_main = component.name == "main";
             for input_name in &template.input_signals {
                 let lookup_key: String = if is_main {
