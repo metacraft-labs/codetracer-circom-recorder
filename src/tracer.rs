@@ -1158,6 +1158,78 @@ impl CircomTracer {
             );
         }
 
+        // Emit the `template parallel NAME` set (Circom 2.0+ parallel
+        // modifier) as a special event so debugger consumers can flag
+        // parallel-codegen templates alongside the regular ones in
+        // the function-table view.  Content is
+        // `parallel_templates=NAME1,NAME2,...` (comma-joined in
+        // declaration order).
+        let parallel_templates = find_parallel_templates(&source_code);
+        if !parallel_templates.is_empty() {
+            let content = format!("parallel_templates={}", parallel_templates.join(","));
+            TraceWriter::register_special_event(
+                &mut *self.writer,
+                EventLogKind::EvmEvent,
+                "parallel_templates",
+                &content,
+            );
+        }
+
+        // Emit the per-file `pragma circom <version>;` headers as a
+        // special event so debugger consumers can show which Circom
+        // language version was assumed when each source file was
+        // parsed.  Content shape is
+        // `pragma_versions=file1:ver1;file2:ver2;...` — semicolons
+        // separate per-file records, the colon separates the
+        // basename from its declared version.  Files included from
+        // the entrypoint are resolved relative to the entrypoint's
+        // directory.
+        //
+        // The event is only emitted when the entrypoint references at
+        // least one external file via `include` whose pragma also
+        // surfaces — single-file fixtures (the common case) skip the
+        // event entirely so the surface stays minimal.
+        let pragma_versions = find_pragma_versions(source_path, &source_code);
+        if pragma_versions.len() > 1 {
+            let body = pragma_versions
+                .iter()
+                .map(|(name, ver)| format!("{name}:{ver}"))
+                .collect::<Vec<_>>()
+                .join(";");
+            let content = format!("pragma_versions={body}");
+            TraceWriter::register_special_event(
+                &mut *self.writer,
+                EventLogKind::EvmEvent,
+                "pragma_versions",
+                &content,
+            );
+        }
+
+        // Emit the anonymous-component invocation set (Circom 2.1+
+        // `expr <== Template(args)(in1, in2)` syntax) as a special
+        // event so debugger consumers can render every inline-defined
+        // sub-component in the function-table view alongside its
+        // backing template.  Content shape is
+        // `anonymous_components=__anon@LINE:Template;...` —
+        // semicolons separate per-instance records, the colon
+        // separates the recorder-assigned synthetic name from the
+        // underlying template name.
+        let anonymous_components = find_anonymous_components(&source_code);
+        if !anonymous_components.is_empty() {
+            let body = anonymous_components
+                .iter()
+                .map(|(synthetic, tmpl)| format!("{synthetic}:{tmpl}"))
+                .collect::<Vec<_>>()
+                .join(";");
+            let content = format!("anonymous_components={body}");
+            TraceWriter::register_special_event(
+                &mut *self.writer,
+                EventLogKind::EvmEvent,
+                "anonymous_components",
+                &content,
+            );
+        }
+
         // ------------------------------------------------------------
         // Step 2 — main template's input signal values.  Today the
         // recorder defaults all main inputs to 0 (no JSON wiring).
@@ -1821,12 +1893,15 @@ fn parse_template_definitions(source: &str) -> Vec<TemplateDef> {
         if current.is_none() {
             if let Some(after_template) = trimmed.strip_prefix("template ") {
                 // `template custom NAME(...)` (Circom 2.0.6+ pragma
-                // custom_templates) — drop the `custom` modifier from
-                // the name lookup so the recorded template name is
-                // `NAME` rather than `custom NAME`.  The custom flag
-                // is surfaced separately through `find_custom_templates`.
+                // custom_templates) and `template parallel NAME(...)`
+                // (Circom 2.0+ parallel modifier) — drop either
+                // modifier from the name lookup so the recorded
+                // template name is `NAME`.  The flags themselves are
+                // surfaced separately through `find_custom_templates`
+                // and `find_parallel_templates`.
                 let after_template = after_template
                     .strip_prefix("custom ")
+                    .or_else(|| after_template.strip_prefix("parallel "))
                     .map(|s| s.trim_start())
                     .unwrap_or(after_template);
                 if let Some(paren_pos) = after_template.find('(') {
@@ -2007,6 +2082,221 @@ fn find_custom_templates(source: &str) -> Vec<String> {
     out
 }
 
+/// Find every `template parallel NAME(...)` declaration in the source
+/// (Circom 2.0+ parallel modifier).  Returns the names of templates
+/// declared with the `parallel` modifier, in source order.
+///
+/// Circom's `parallel` template modifier opts a template into the
+/// parallel witness-calculator codegen path so the witness for each
+/// instantiation can be computed independently of its siblings.  The
+/// recorder surfaces the set via a `parallel_templates` special event
+/// so debugger consumers can distinguish parallel from regular
+/// templates in the function-table view.
+fn find_parallel_templates(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line_text in source.lines() {
+        let trimmed = line_text.trim();
+        let Some(after_template) = trimmed.strip_prefix("template ") else {
+            continue;
+        };
+        let Some(after_parallel) = after_template.strip_prefix("parallel ") else {
+            continue;
+        };
+        let after_parallel = after_parallel.trim_start();
+        let Some(paren_pos) = after_parallel.find('(') else {
+            continue;
+        };
+        let name = after_parallel[..paren_pos].trim();
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// Find every `pragma circom <version>;` header in `source` plus in
+/// every file referenced by a top-level `include "<path>";` directive
+/// (resolved relative to `source_path`'s directory).  Returns
+/// `(short-path, version)` pairs in declaration order — entrypoint
+/// first, then each include in source order.  `short-path` is the
+/// file's basename so the surface is stable across machines (the
+/// `--strip-paths` ct-print flag normalises absolute prefixes the
+/// same way).  Files with no `pragma circom` line are skipped.
+///
+/// Closes the M12 deferred coverage gap for `pragma` headers: the
+/// recorder surfaces the per-file pragma-version set via a dedicated
+/// `pragma_versions` special event so debugger consumers can show
+/// which Circom language version was assumed when each source file
+/// was parsed.
+fn find_pragma_versions(source_path: &Path, source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let entry_name = source_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if let Some(v) = parse_pragma_circom_version(source) {
+        out.push((entry_name, v));
+    }
+    let parent = source_path.parent();
+    for inc in find_includes(source) {
+        let Some(dir) = parent else {
+            continue;
+        };
+        let inc_path = dir.join(&inc);
+        let Ok(inc_src) = std::fs::read_to_string(&inc_path) else {
+            continue;
+        };
+        if let Some(v) = parse_pragma_circom_version(&inc_src) {
+            let inc_name = std::path::Path::new(&inc)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or(inc);
+            out.push((inc_name, v));
+        }
+    }
+    out
+}
+
+/// Extract `<version>` from the first `pragma circom <version>;`
+/// header in `source`.  Returns `None` when no such header is
+/// present (Circom defaults to its built-in version in that case).
+fn parse_pragma_circom_version(source: &str) -> Option<String> {
+    for line_text in source.lines() {
+        let trimmed = line_text.trim();
+        let Some(after_pragma) = trimmed.strip_prefix("pragma ") else {
+            continue;
+        };
+        let Some(after_circom) = after_pragma.trim_start().strip_prefix("circom ") else {
+            continue;
+        };
+        let v = after_circom
+            .trim_start()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Collect every top-level `include "<path>";` directive's path
+/// argument in source order.  Returns the raw quoted-string contents
+/// (stripped of the surrounding quotes).
+fn find_includes(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line_text in source.lines() {
+        let trimmed = line_text.trim();
+        let Some(after_include) = trimmed.strip_prefix("include ") else {
+            continue;
+        };
+        let after_include = after_include.trim_start();
+        let s = after_include.trim_start_matches('"');
+        let Some(end) = s.find('"') else {
+            continue;
+        };
+        let path = s[..end].to_string();
+        if !path.is_empty() {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Find every anonymous-component invocation in the source — Circom
+/// 2.1+ allows inline-defined sub-components via the
+/// `expr <== Template(args)(in1, in2)` syntax (or `<--` for the
+/// unconstrained variant).  Returns `(synthetic_name, template_name)`
+/// pairs in declaration order, where `synthetic_name` is the
+/// recorder-assigned label `__anon@LINE` so the calltrace surface can
+/// disambiguate multiple anonymous instantiations of the same template
+/// on different source lines.
+///
+/// Closes the M12 deferred coverage gap for the anonymous-component
+/// syntax: the recorder surfaces the per-instance synthetic name and
+/// the underlying template name via a dedicated `anonymous_components`
+/// special event so debugger consumers can render every anonymous
+/// instantiation in the function-table view alongside its arguments.
+fn find_anonymous_components(source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (idx, line_text) in source.lines().enumerate() {
+        let line_no = idx + 1;
+        // Skip whole-line `//` comments — they're the most common
+        // source of false positives (the fixture's own algorithm
+        // explanation uses the `<== Template(args)(in1, in2)`
+        // syntax in prose form).  Block comments are not handled
+        // here; all M12 fixtures use `//` for documentation.
+        let trimmed = line_text.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        // Look for the canonical Circom 2.1+ anonymous-component shape:
+        //   <op> <Identifier> ( ...args... ) ( ...inputs... )
+        // where <op> is `<==` or `<--`.  We scan for either operator
+        // token, then for the immediately-following `IDENT(...)(...)`
+        // sequence.  The argument-list and input-list contents are
+        // ignored for the surface — we only pin the per-line synthetic
+        // label and the template name.
+        //
+        // Strip an inline `// ...` trailing comment so prose inside
+        // a code-bearing line cannot trigger a false positive either.
+        let scan = match line_text.find("//") {
+            Some(comment_at) => &line_text[..comment_at],
+            None => line_text,
+        };
+        for op in ["<==", "<--"] {
+            let mut search_from = 0usize;
+            while let Some(pos) = scan[search_from..].find(op) {
+                let abs = search_from + pos + op.len();
+                let rest = scan[abs..].trim_start();
+                let ident_end = rest
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                if ident_end == 0 {
+                    search_from = abs;
+                    continue;
+                }
+                let ident = &rest[..ident_end];
+                let after_ident = rest[ident_end..].trim_start();
+                let Some(after_open) = after_ident.strip_prefix('(') else {
+                    search_from = abs;
+                    continue;
+                };
+                // Skip past the args list `(...)` honouring nested
+                // parentheses so expressions like `(N+1)` inside the
+                // arg list don't terminate prematurely.
+                let mut depth = 1i32;
+                let mut i = 0usize;
+                let bytes = after_open.as_bytes();
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if depth != 0 || i >= bytes.len() {
+                    search_from = abs;
+                    continue;
+                }
+                let after_args = after_open[i + 1..].trim_start();
+                if after_args.starts_with('(') {
+                    out.push((format!("__anon@{line_no}"), ident.to_string()));
+                }
+                search_from = abs;
+            }
+        }
+    }
+    out
+}
+
 /// Parse the optional `{public [a, b, ...]}` annotation on the
 /// `component main` declaration line.  Returns the list of public
 /// input-signal names in source order.  Returns an empty vector when
@@ -2092,15 +2382,18 @@ fn find_template_input_decls(source: &str, template_name: Option<&str>) -> Vec<I
         if let Some(target) = template_name {
             if trimmed.starts_with("template ") {
                 if let Some(paren_pos) = trimmed.find('(') {
-                    // Strip an optional `custom ` modifier (Circom
-                    // 2.0.6+ pragma custom_templates) so the name
-                    // match doesn't trip on `template custom Foo(`.
-                    let name = trimmed[9..paren_pos]
-                        .trim()
+                    // Strip an optional `custom ` / `parallel `
+                    // modifier (Circom 2.0.6+ pragma custom_templates,
+                    // Circom 2.0+ parallel templates) so the name
+                    // match doesn't trip on `template custom Foo(` or
+                    // `template parallel Foo(`.
+                    let raw = trimmed[9..paren_pos].trim();
+                    let stripped = raw
                         .strip_prefix("custom ")
+                        .or_else(|| raw.strip_prefix("parallel "))
                         .map(|s| s.trim_start())
-                        .unwrap_or_else(|| trimmed[9..paren_pos].trim());
-                    if name == target {
+                        .unwrap_or(raw);
+                    if stripped == target {
                         in_target_template = true;
                         brace_depth = 0;
                     }
@@ -2198,10 +2491,12 @@ fn find_template_generic_params(source: &str, template_name: Option<&str>) -> Ve
             continue;
         };
         let raw = trimmed[9..open_paren].trim();
-        // Strip an optional `custom ` modifier so the name match
-        // works on `template custom Foo(`.
+        // Strip an optional `custom ` / `parallel ` modifier so the
+        // name match works on `template custom Foo(` and
+        // `template parallel Foo(`.
         let name = raw
             .strip_prefix("custom ")
+            .or_else(|| raw.strip_prefix("parallel "))
             .map(|s| s.trim_start())
             .unwrap_or(raw);
         if name != target {

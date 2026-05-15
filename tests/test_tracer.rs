@@ -3819,6 +3819,565 @@ fn test_multi_line_constraint_test_via_ct_print_full() {
     );
 }
 
+// --- parallel_template_test.circom ---------------------------------------
+
+/// Records `parallel_template_test.circom`, which exercises Circom
+/// 2.0+ `template parallel NAME(...)` modifier — the parallel
+/// witness-calculator codegen opt-in.  Closes the M12 deferred
+/// coverage gap for the parallel-template annotation: the recorder
+/// parses the `parallel` modifier on each `template` declaration and
+/// surfaces the set via a dedicated `parallel_templates` special
+/// event so debugger consumers can distinguish parallel from regular
+/// templates in the function-table view.  Per-instance variable
+/// values (every `out[i]` for the `BatchHash(4)` instantiation) are
+/// preserved exactly as for regular templates — the parallel modifier
+/// is purely a back-end codegen flag, not a recording-trace shape
+/// change.
+#[test]
+fn test_parallel_template_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_parallel_template_test_via_ct_print_full",
+        "parallel_template_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    // The `parallel` modifier is dropped from the recorded template
+    // name; the modifier flag itself surfaces through the
+    // `parallel_templates` special event below.
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["BatchHash"]);
+
+    // ----- Parallel-template special event ----------------------------
+    // Exactly ONE io event — the `parallel_templates` annotation.  As
+    // with the public-signal / custom-template / signal-tags
+    // annotations, the CTFS multi-stream IO bucket folds `EvmEvent`
+    // into the `stderr` family (see `toIOEventKind` in
+    // `codetracer_trace_writer_ffi.nim`).  The `text` body carries
+    // the discriminator + payload: `parallel_templates=BatchHash` (the
+    // comma-joined ordered set of template names declared with the
+    // `parallel` modifier).
+    let events = doc["events"].as_array().expect("events array");
+    let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
+    assert_eq!(io_events.len(), 1);
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(
+        io_events[0]["text"].as_str(),
+        Some("parallel_templates=BatchHash"),
+    );
+
+    // ----- counts -----------------------------------------------------
+    // Step breakdown:
+    //   * 1 toplevel start step (line 1)
+    //   * 1 step on `component main = BatchHash(4)` (line 30)
+    //   * 1 signal-input decl step (line 22)
+    //   * 1 signal-output decl step (line 23)
+    //   * 1 for-header step (line 25)
+    //   * 4 body iterations of `out[i] <== in[i] * in[i];` (line 26)
+    // = 9 step events.  + 1 call_entry + 1 call_exit + 1 io_event
+    // = 12 events.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(9),
+        "values; counts={counts}"
+    );
+
+    assert_eq!(events.len(), 12, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    assert_eq!(observed_call_sequence(&doc), vec!["BatchHash".to_string()]);
+    assert_eq!(observed_exit_sequence(&doc), vec!["BatchHash".to_string()]);
+
+    // ----- Call_entry args: input array `in` ------------------------
+    // The recorder stages each declared input signal as a single arg
+    // in the call frame; the per-element values surface through the
+    // body's `out[i] <== in[i] * in[i]` assignments below.
+    let call_entries: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .collect();
+    assert_eq!(call_entries.len(), 1);
+    let args = call_entries[0]["args"].as_array().expect("BatchHash args");
+    assert_eq!(args.len(), 1);
+    assert_eq!(args[0]["varname"].as_str(), Some("in"));
+    assert_eq!(args[0]["value"]["i"].as_i64(), Some(0));
+
+    // ----- Exact step lines (in order) --------------------------------
+    // Lines: toplevel (1), `component main = BatchHash(4)` (30),
+    // `signal input in[N];` (22), `signal output out[N];` (23), for
+    // header (25), then 4 body iterations of `out[i] <== in[i] *
+    // in[i];` on line 26.  The 4 body iterations are the proof that
+    // the template arg `BatchHash(4)` made it through the recorder's
+    // component-args parser into the evaluator's `generic_args` slot
+    // for the parallel-modifier path (the parser must skip the
+    // `parallel` keyword exactly as it skips `custom` for
+    // `template custom NAME`).
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(step_lines, vec![1, 30, 22, 23, 25, 26, 26, 26, 26]);
+
+    // ----- Decoded variable values ------------------------------------
+    // The recorder surfaces:
+    //   * `in = 0` on the BatchHash body's input-decl step (line 22) —
+    //     mirrors the call_entry args.
+    //   * Per iteration of the for body: `out[i] = 0` (the
+    //     square-of-zero result).
+    // Per-instance value preservation is the load-bearing pin for
+    // parallel templates: every `out[i]` slot must surface
+    // independently (rather than collapsing into a single aggregate
+    // event) so debugger consumers can step through each iteration
+    // separately, as for regular templates.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("in".to_string(), 0),
+            ("out[0]".to_string(), 0),
+            ("out[1]".to_string(), 0),
+            ("out[2]".to_string(), 0),
+            ("out[3]".to_string(), 0),
+        ],
+    );
+}
+
+// --- anonymous_component_test.circom -------------------------------------
+
+/// Records `anonymous_component_test.circom`, which exercises Circom
+/// 2.1+ inline-defined sub-components via the
+/// `expr <-- Template(args)(in1, in2)` syntax — the template is
+/// instantiated and wired in a single expression-statement, without
+/// a named `component foo = Template();` declaration.  Closes the
+/// M12 deferred coverage gap for the anonymous-component syntax: the
+/// recorder source-scans for these inline-defined invocations and
+/// surfaces the per-instance synthetic name + underlying template
+/// name via a dedicated `anonymous_components` special event so
+/// debugger consumers can render every anonymous instantiation in
+/// the function-table view alongside its arguments.
+#[test]
+fn test_anonymous_component_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_anonymous_component_test_via_ct_print_full",
+        "anonymous_component_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    // All three templates surface in the function table (definition
+    // order in the source).  Only `Driver` actually opens a call
+    // frame; the anonymous `Doubler()` / `Tripler()` invocations
+    // surface through the dedicated `anonymous_components` special
+    // event below rather than through `call_entry` events because
+    // the recorder's structured evaluator does not recurse into the
+    // anonymous-component body — it treats the expression as an
+    // opaque assignment whose result value the witness calculator
+    // computes.
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["Doubler", "Tripler", "Driver"]);
+
+    // ----- Anonymous-component special event --------------------------
+    // Exactly ONE io event — the `anonymous_components` annotation.
+    // The CTFS multi-stream IO bucket folds `EvmEvent` into the
+    // `stderr` family (see `toIOEventKind` in
+    // `codetracer_trace_writer_ffi.nim`).  The `text` body carries
+    // the discriminator + payload:
+    //   `anonymous_components=__anon@40:Doubler;__anon@41:Tripler`
+    // Semicolons separate per-instance records, the colon separates
+    // the recorder-assigned synthetic name (`__anon@LINE`) from the
+    // underlying template name.  Each per-instance synthetic name
+    // disambiguates multiple anonymous instantiations of the same
+    // template on different source lines so the calltrace surface
+    // can render them distinctly.
+    let events = doc["events"].as_array().expect("events array");
+    let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
+    assert_eq!(io_events.len(), 1);
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(
+        io_events[0]["text"].as_str(),
+        Some("anonymous_components=__anon@40:Doubler;__anon@41:Tripler"),
+    );
+
+    // ----- counts -----------------------------------------------------
+    // Step breakdown:
+    //   * 1 toplevel start step (line 1)
+    //   * 1 step on `component main = Driver()` (line 45)
+    //   * 1 signal-input decl step (line 35)
+    //   * 1 signal-output decl step (line 36)
+    //   * 2 bare intermediate signal-decl steps (lines 38, 39 —
+    //     `signal doubled` / `signal tripled`)
+    //   * 2 steps on line 40 — the `doubled <-- Doubler()(in)`
+    //     assignment surfaces the LHS Variable on the first step,
+    //     then a follow-up bare step where the evaluator's
+    //     anonymous-component recurse hook fires (with no body to
+    //     step into, the recurse is a no-op but still emits a step
+    //     marker so debugger consumers see the inline-instantiation
+    //     boundary)
+    //   * 2 steps on line 41 — same pattern for the
+    //     `tripled <-- Tripler()(doubled)` line
+    //   * 1 step on line 42 — the final
+    //     `out <-- doubled + tripled;`
+    // = 11 step events.  + 1 call_entry + 1 call_exit + 1 io_event
+    // = 14 events.
+    let counts = &doc["counts"];
+    assert_eq!(
+        counts["steps"].as_u64(),
+        Some(11),
+        "steps; counts={counts}"
+    );
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(11),
+        "values; counts={counts}"
+    );
+
+    assert_eq!(events.len(), 14, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    // Only `Driver` opens a call frame — the anonymous `Doubler()` /
+    // `Tripler()` invocations are surfaced through the
+    // `anonymous_components` special event, not as call_entry events.
+    assert_eq!(observed_call_sequence(&doc), vec!["Driver".to_string()]);
+    assert_eq!(observed_exit_sequence(&doc), vec!["Driver".to_string()]);
+
+    // ----- Call_entry args: input `in` --------------------------------
+    let call_entries: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .collect();
+    assert_eq!(call_entries.len(), 1);
+    let args = call_entries[0]["args"].as_array().expect("Driver args");
+    assert_eq!(args.len(), 1);
+    assert_eq!(args[0]["varname"].as_str(), Some("in"));
+    assert_eq!(args[0]["value"]["i"].as_i64(), Some(0));
+
+    // ----- Exact step lines (in order) --------------------------------
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(
+        step_lines,
+        vec![
+            1, 45, // toplevel + main component
+            35, 36, // signal input in / signal output out
+            38, 39, // signal doubled / signal tripled (intermediate decls)
+            40, 40, // doubled <-- Doubler()(in) — Variable + recurse
+            41, 41, // tripled <-- Tripler()(doubled) — Variable + recurse
+            42, // out <-- doubled + tripled
+        ]
+    );
+
+    // ----- Decoded variable values ------------------------------------
+    // The recorder surfaces:
+    //   * `in = 0` on the `component main` step (parent input arg).
+    //   * `in = 0` on the `signal input in;` decl step inside the body.
+    //   * `doubled = 0` on the inline-anonymous `<--` assignment line
+    //     (the recorder's structured evaluator does not recurse into
+    //     the anonymous Doubler body, so the value defaults to 0
+    //     rather than `2 * in = 0` computed inside the sub-template).
+    //   * `tripled = 0` on the second inline-anonymous `<--` line.
+    //   * `out = 0` on the final sum.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("in".to_string(), 0),
+            ("in".to_string(), 0),
+            ("doubled".to_string(), 0),
+            ("tripled".to_string(), 0),
+            ("out".to_string(), 0),
+        ],
+    );
+}
+
+// --- circomlib_poseidon_test.circom --------------------------------------
+
+/// Records `circomlib_poseidon_test.circom`, which exercises a
+/// minimal inline `Poseidon(2)`-style permutation with the canonical
+/// Poseidon shape (S-box exponent 5, MDS-style linear mixing, two
+/// full rounds with per-round constants) over small inputs that
+/// keep every intermediate below `i64::MAX`.  Closes the M12
+/// deferred coverage gap for circomlib's Poseidon hash without
+/// requiring a deep `include` chain — every per-step intermediate
+/// value surfaces as a deterministic `Int` value through the
+/// recorder's structured evaluator, ending in the canonical-by-
+/// construction digest at the `out` signal.
+#[test]
+fn test_circomlib_poseidon_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_circomlib_poseidon_test_via_ct_print_full",
+        "circomlib_poseidon_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["Poseidon2"]);
+
+    // ----- counts -----------------------------------------------------
+    // Step breakdown:
+    //   * 1 toplevel start step (line 1)
+    //   * 1 step on `component main = Poseidon2()` (line 98)
+    //   * 1 signal-output decl step (line 50)
+    //   * 14 signal decls + assignments inside the body (lines 57-95
+    //     — every `signal foo;` is a bare Step and every `foo <--
+    //     expr;` is a Step that also carries a Variable event)
+    //   * 15 Variable events for the 15 `<--` assignments (in_a, in_b
+    //     plus 13 round-state slots)
+    // = 32 step events.  + 1 call_entry + 1 call_exit + 0 io_events
+    // = 34 events.
+    let counts = &doc["counts"];
+    assert_eq!(
+        counts["steps"].as_u64(),
+        Some(32),
+        "steps; counts={counts}"
+    );
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(32),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 34, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    assert_eq!(observed_call_sequence(&doc), vec!["Poseidon2".to_string()]);
+    assert_eq!(observed_exit_sequence(&doc), vec!["Poseidon2".to_string()]);
+
+    // ----- Exact step lines (in order) --------------------------------
+    // Lines: toplevel (1), `component main = Poseidon2()` (98), the
+    // `signal output out;` decl (50), then per-signal decl + assign
+    // pairs threading through both rounds and the final digest (lines
+    // 57..95).  The structured evaluator must visit every `<--` site
+    // so the per-line decoded values pin the per-step digest
+    // computation.
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(
+        step_lines,
+        vec![
+            1, 98, 50, // toplevel + main + signal output out
+            57, 58, 59, 60, // in_a/in_b decls + assigns
+            63, 64, 65, 66, // round 0: m0_0/m0_1 decls + assigns
+            68, 69, 70, 71, // round 0: sb0_0/sb0_1 decls + assigns
+            73, 74, 75, 76, // round 0: r0_0/r0_1 decls + assigns
+            79, 80, 81, 82, // round 1: m1_0/m1_1 decls + assigns
+            84, 85, 86, 87, // round 1: sb1_0/sb1_1 decls + assigns
+            89, 90, 91, 92, // round 1: r1_0/r1_1 decls + assigns
+            95, // out <-- r1_0 + r1_1
+        ]
+    );
+
+    // ----- Decoded variable values ------------------------------------
+    // Hand-traced from the source's `<--` assignments — see the
+    // fixture comment for the per-step computation.  The final digest
+    // value (`out = 493_934_506_353_822`) is the load-bearing pin:
+    // a future Poseidon-spec mismatch (e.g. an evaluator change to
+    // the `**` operator semantics, or a refactor of the per-round
+    // ordering) would surface here as a digest mismatch immediately.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("in_a".to_string(), 1),
+            ("in_b".to_string(), 1),
+            ("m0_0".to_string(), 3),
+            ("m0_1".to_string(), 3),
+            ("sb0_0".to_string(), 243),
+            ("sb0_1".to_string(), 243),
+            ("r0_0".to_string(), 250),
+            ("r0_1".to_string(), 254),
+            ("m1_0".to_string(), 758),
+            ("m1_1".to_string(), 754),
+            ("sb1_0".to_string(), 250_233_832_892_768),
+            ("sb1_1".to_string(), 243_700_673_461_024),
+            ("r1_0".to_string(), 250_233_832_892_781),
+            ("r1_1".to_string(), 243_700_673_461_041),
+            ("out".to_string(), 493_934_506_353_822),
+        ],
+    );
+}
+
+// --- pragma_version_test.circom ------------------------------------------
+
+/// Records `pragma_version_test.circom`, which exercises multiple
+/// `pragma circom <version>;` headers across two source files (the
+/// entrypoint + a directly `include`d helper).  Closes the M12
+/// deferred coverage gap for `pragma circom <version>;` headers: the
+/// recorder scans the entrypoint and every directly included file,
+/// then surfaces the per-file pragma-version set via a dedicated
+/// `pragma_versions` special event so debugger consumers can show
+/// which Circom language version was assumed when each source file
+/// was parsed.
+///
+/// The single-file fixtures (the rest of the M12 suite) keep
+/// `io_events == 0` because the recorder only emits this event when
+/// at least two files (entrypoint + ≥ 1 included file) declare
+/// pragma headers — the surface stays minimal for the common case.
+#[test]
+fn test_pragma_version_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_pragma_version_test_via_ct_print_full",
+        "pragma_version_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    // Only `Driver` (the entrypoint template) — the recorder does not
+    // recurse into included source files for template registration in
+    // its current shape, so `Doubler` (defined in
+    // `pragma_version_helper.circom`) does not surface in the function
+    // table.  This pins the current behaviour explicitly so a future
+    // include-aware refactor surfaces in test diffs.
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["Driver"]);
+
+    // ----- Pragma-version special event -------------------------------
+    // Exactly ONE io event — the `pragma_versions` annotation.  The
+    // CTFS multi-stream IO bucket folds `EvmEvent` into the `stderr`
+    // family (see `toIOEventKind` in
+    // `codetracer_trace_writer_ffi.nim`).  The `text` body carries
+    // the discriminator + payload:
+    //   `pragma_versions=pragma_version_test.circom:2.1.5;
+    //    pragma_version_helper.circom:2.1.0`
+    // Semicolons separate per-file records, the colon separates the
+    // file basename from its declared version.  Entrypoint first,
+    // then includes in source order.  Basenames (rather than absolute
+    // paths) are used so the surface stays stable across machines —
+    // matching the `--strip-paths` ct-print convention.
+    let events = doc["events"].as_array().expect("events array");
+    let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
+    assert_eq!(io_events.len(), 1);
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(
+        io_events[0]["text"].as_str(),
+        Some(
+            "pragma_versions=pragma_version_test.circom:2.1.5;\
+             pragma_version_helper.circom:2.1.0"
+        ),
+    );
+
+    // ----- counts -----------------------------------------------------
+    // Step breakdown:
+    //   * 1 toplevel start step (line 1)
+    //   * 1 step on `component main = Driver()` (line 31)
+    //   * 1 signal-input decl step (line 23)
+    //   * 1 signal-output decl step (line 24)
+    //   * 1 component-decl step (line 26)
+    //   * 1 wire step `inner.x <== x` (line 27)
+    //   * 1 wire-back step `y <== inner.y` (line 28)
+    // = 7 step events.  + 1 call_entry + 1 call_exit + 1 io_event
+    // = 10 events.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(7), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(7),
+        "values; counts={counts}"
+    );
+
+    assert_eq!(events.len(), 10, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    // Only Driver opens a call frame; the included Doubler template
+    // is not parsed, so no Doubler call_entry surfaces despite the
+    // `component inner = Doubler();` declaration in the body.
+    assert_eq!(observed_call_sequence(&doc), vec!["Driver".to_string()]);
+    assert_eq!(observed_exit_sequence(&doc), vec!["Driver".to_string()]);
+
+    // ----- Exact step lines (in order) --------------------------------
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(step_lines, vec![1, 31, 23, 24, 26, 27, 28]);
+
+    // ----- Decoded variable values ------------------------------------
+    // The recorder surfaces:
+    //   * `x = 0` on the `component main` step (parent input arg).
+    //   * `x = 0` on the `signal input x;` decl step inside the body.
+    //   * `inner.x = 0` on the `inner.x <== x;` wire step (the value
+    //     wired into the sub-component's input slot — surfaces even
+    //     though the included Doubler template is not stepped into).
+    //   * `y = 0` on the `y <== inner.y;` wire-back step.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("x".to_string(), 0),
+            ("x".to_string(), 0),
+            ("inner.x".to_string(), 0),
+            ("y".to_string(), 0),
+        ],
+    );
+}
+
 // ===========================================================================
 // CLI env-var contract
 // ===========================================================================
