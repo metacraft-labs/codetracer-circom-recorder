@@ -756,6 +756,19 @@ impl Parser {
                 } else {
                     SignalKind::Intermediate
                 };
+                // Optional Circom 2.1+ signal tag block:
+                // `signal input {tag} a;` or
+                // `signal input {tag=value, other=expr} a;`.  Skip the
+                // entire `{ ... }` block — the tracer surfaces tags via
+                // its own source-level scan in `find_signal_tags`.
+                if self.eat_punct("{") {
+                    while !matches!(self.peek(), Tok::Punct(p) if p == "}")
+                        && !matches!(self.peek(), Tok::Eof)
+                    {
+                        self.bump();
+                    }
+                    self.eat_punct("}");
+                }
                 let name = self.expect_ident()?;
                 let mut dims = Vec::new();
                 while self.eat_punct("[") {
@@ -1057,6 +1070,13 @@ impl Parser {
     fn parse_template(&mut self) -> Result<Template, String> {
         // assumes `template` keyword already consumed
         let line = self.peek_line();
+        // `template custom NAME` (Circom 2.0.6+ pragma custom_templates)
+        // — skip the `custom` modifier so the rest of the parser still
+        // sees `NAME(...)`.  The tracer surfaces the `custom` flag via
+        // its own source-level scan in `find_custom_templates`.
+        if matches!(self.peek(), Tok::Ident(n) if n == "custom") {
+            self.bump();
+        }
         let name = self.expect_ident()?;
         self.expect_punct("(")?;
         let mut generic_params = Vec::new();
@@ -1251,6 +1271,18 @@ pub enum EvalEventKind {
         comp_name: String,
         signal_name: String,
         value: i64,
+    },
+    /// A `===` constraint that the structured evaluator detects does
+    /// NOT hold under the current evaluation env (LHS != RHS).  The
+    /// recorder surfaces this as a tagged constraint-violation
+    /// special event so debugger consumers can flag the offending
+    /// line without waiting for the witness calculator to fail.
+    /// Used by the range-proof fixture to detect out-of-range inputs
+    /// at evaluator time.
+    ConstraintViolation {
+        lhs_value: i64,
+        rhs_value: i64,
+        text: String,
     },
 }
 
@@ -2016,12 +2048,38 @@ fn eval_stmt(
                 }
             }
         }
-        Stmt::Constraint { line, .. } => {
+        Stmt::Constraint { line, lhs, rhs } => {
             // `===` is only a constraint — record a step at the line.
+            // Additionally, if both sides evaluate to concrete i64s
+            // and they don't match, surface a tagged constraint-
+            // violation event so debugger consumers can flag the
+            // offending line.  Constants-on-both-sides is the common
+            // shape for the structured evaluator (defaults are 0,
+            // and many fixtures hardcode RHS values), and it covers
+            // the range-proof fixture's load-bearing case.
             events.push(EvalEvent {
                 line: *line,
                 kind: EvalEventKind::Step,
             });
+            if let (Some(lv), Some(rv)) = (
+                eval_expr(lhs, env).and_then(|v| v.as_int()),
+                eval_expr(rhs, env).and_then(|v| v.as_int()),
+            ) {
+                if lv != rv {
+                    let text = format!(
+                        "constraint violation at line {line}: \
+                         lhs={lv} != rhs={rv}"
+                    );
+                    events.push(EvalEvent {
+                        line: *line,
+                        kind: EvalEventKind::ConstraintViolation {
+                            lhs_value: lv,
+                            rhs_value: rv,
+                            text,
+                        },
+                    });
+                }
+            }
         }
         Stmt::If {
             line,

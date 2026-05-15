@@ -1100,6 +1100,64 @@ impl CircomTracer {
         // ------------------------------------------------------------
         TraceWriter::register_step(&mut *self.writer, source_path, Line(main_inst.line as i64));
 
+        // Emit the `{public [...]}` annotation (if present on the
+        // `component main` line) as a special event so debugger
+        // consumers can render which main inputs are proof-visible.
+        // The content is `public_signals=name1,name2,...` — the prefix
+        // distinguishes this special event from `circom_log()` output
+        // (which both use the EvmEvent kind, the only metadata channel
+        // surfaced by `ct print --full`).
+        let public_inputs = find_main_public_signals(&source_code);
+        if !public_inputs.is_empty() {
+            let content = format!("public_signals={}", public_inputs.join(","));
+            TraceWriter::register_special_event(
+                &mut *self.writer,
+                EventLogKind::EvmEvent,
+                "public_signals",
+                &content,
+            );
+        }
+
+        // Emit the `template custom NAME` set (Circom 2.0.6+
+        // `pragma custom_templates;`) as a special event so debugger
+        // consumers can flag custom-gate templates in the
+        // function-table view.  Content is
+        // `custom_templates=NAME1,NAME2,...` (comma-joined in
+        // declaration order).
+        let custom_templates = find_custom_templates(&source_code);
+        if !custom_templates.is_empty() {
+            let content = format!("custom_templates={}", custom_templates.join(","));
+            TraceWriter::register_special_event(
+                &mut *self.writer,
+                EventLogKind::EvmEvent,
+                "custom_templates",
+                &content,
+            );
+        }
+
+        // Emit the per-signal `{tag}` / `{tag=value}` annotations
+        // (Circom 2.1+) as a special event so debugger consumers can
+        // render the type-tag metadata alongside the signal-kind
+        // badge.  Content shape is
+        // `signal_tags=name1:tag1,tag2;name2:tag3,...` — semicolons
+        // separate per-signal records, the colon separates the
+        // signal name from its comma-joined tag list.
+        let signal_tags = find_signal_tags(&source_code);
+        if !signal_tags.is_empty() {
+            let body = signal_tags
+                .iter()
+                .map(|(name, tags)| format!("{name}:{tags}"))
+                .collect::<Vec<_>>()
+                .join(";");
+            let content = format!("signal_tags={body}");
+            TraceWriter::register_special_event(
+                &mut *self.writer,
+                EventLogKind::EvmEvent,
+                "signal_tags",
+                &content,
+            );
+        }
+
         // ------------------------------------------------------------
         // Step 2 — main template's input signal values.  Today the
         // recorder defaults all main inputs to 0 (no JSON wiring).
@@ -1300,6 +1358,20 @@ impl CircomTracer {
                     // evaluator on the same line) carries the user-
                     // visible step + variable for the parent frame.
                 }
+                EvalEventKind::ConstraintViolation { text, .. } => {
+                    // Surface the violation as a tagged special event
+                    // so debugger consumers can flag the offending
+                    // line.  The content is `constraint_violation=<text>`
+                    // where `<text>` includes the source-line, lhs,
+                    // and rhs values (built by the evaluator).
+                    let content = format!("constraint_violation={text}");
+                    TraceWriter::register_special_event(
+                        &mut *self.writer,
+                        EventLogKind::EvmEvent,
+                        "constraint_violation",
+                        &content,
+                    );
+                }
                 EvalEventKind::ComponentEnter {
                     comp_name,
                     template: child_template,
@@ -1499,6 +1571,20 @@ fn parse_signal_declarations(source: &str) -> Vec<SignalDecl> {
             (SignalKind::Intermediate, after_signal)
         };
 
+        // Strip an optional Circom 2.1+ signal-tag block
+        // `{tag}` / `{tag=value, other=expr}` between the kind keyword
+        // and the signal name.  The tracer surfaces tag metadata
+        // separately through `find_signal_tags`.
+        let rest = if let Some(after_brace) = rest.strip_prefix('{') {
+            if let Some(close) = after_brace.find('}') {
+                after_brace[close + 1..].trim()
+            } else {
+                rest
+            }
+        } else {
+            rest
+        };
+
         let name = rest.trim_end_matches(';').trim().to_string();
         if !name.is_empty() {
             signals.push(SignalDecl {
@@ -1642,9 +1728,22 @@ fn parse_component_instances(source: &str) -> Vec<ComponentInstance> {
 
         // Detect a component instantiation on this line.  The recorded
         // parent is the template body we're currently inside (if any).
+        //
+        // The `component main` declaration may carry a
+        // `{public [a, b, ...]}` annotation between the name and the
+        // `=`; strip it out of the name so the recorder still sees
+        // `main` rather than `main {public [...]}`.  The annotation
+        // itself is parsed by `find_main_public_signals` and emitted
+        // as a `public_signals` special event in `emit_source_trace`.
         if let Some(after_component) = trimmed.strip_prefix("component ") {
             if let Some(eq_pos) = after_component.find('=') {
-                let name = after_component[..eq_pos].trim();
+                let raw_name = after_component[..eq_pos].trim();
+                // Drop a trailing `{...}` annotation on the name.
+                let name = if let Some(brace_pos) = raw_name.find('{') {
+                    raw_name[..brace_pos].trim()
+                } else {
+                    raw_name
+                };
                 let after_eq = after_component[eq_pos + 1..].trim();
                 if let Some(paren_pos) = after_eq.find('(') {
                     let template_name = after_eq[..paren_pos].trim();
@@ -1721,6 +1820,15 @@ fn parse_template_definitions(source: &str) -> Vec<TemplateDef> {
         // templates are not legal in Circom.
         if current.is_none() {
             if let Some(after_template) = trimmed.strip_prefix("template ") {
+                // `template custom NAME(...)` (Circom 2.0.6+ pragma
+                // custom_templates) — drop the `custom` modifier from
+                // the name lookup so the recorded template name is
+                // `NAME` rather than `custom NAME`.  The custom flag
+                // is surfaced separately through `find_custom_templates`.
+                let after_template = after_template
+                    .strip_prefix("custom ")
+                    .map(|s| s.trim_start())
+                    .unwrap_or(after_template);
                 if let Some(paren_pos) = after_template.find('(') {
                     let name = after_template[..paren_pos].trim().to_string();
                     if !name.is_empty() {
@@ -1741,7 +1849,21 @@ fn parse_template_definitions(source: &str) -> Vec<TemplateDef> {
         // and track brace depth so we know when the body ends.
         if let Some((tmpl, depth)) = current.as_mut() {
             if let Some(rest) = trimmed.strip_prefix("signal input ") {
-                let name = rest.trim().trim_end_matches(';').trim().to_string();
+                // Strip an optional Circom 2.1+ tag block
+                // (`{bit}` / `{maxbit=8}` / etc.) between
+                // `signal input` and the signal name.  The tag set
+                // itself is surfaced through `find_signal_tags`.
+                let rest = rest.trim();
+                let rest = if let Some(after_brace) = rest.strip_prefix('{') {
+                    if let Some(close) = after_brace.find('}') {
+                        after_brace[close + 1..].trim()
+                    } else {
+                        rest
+                    }
+                } else {
+                    rest
+                };
+                let name = rest.trim_end_matches(';').trim().to_string();
                 if !name.is_empty() {
                     tmpl.input_signals.push(name);
                 }
@@ -1785,6 +1907,7 @@ fn find_main_template_name(source: &str) -> Option<String> {
         let trimmed = line_text.trim();
         // Match patterns like: component main = TemplateName();
         // or: component main = TemplateName(args);
+        // or: component main {public [a, b]} = TemplateName(args);
         if trimmed.starts_with("component main") {
             if let Some(eq_pos) = trimmed.find('=') {
                 let after_eq = trimmed[eq_pos + 1..].trim();
@@ -1799,6 +1922,140 @@ fn find_main_template_name(source: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Find every `signal {tag}` / `signal {tag=value}` annotation in
+/// the source.  Returns `(signal_name, tags_string)` pairs in source
+/// order, where `tags_string` is the raw inner text of the `{ ... }`
+/// block (with whitespace around commas normalised).
+///
+/// Closes the M12 deferred coverage gap for Circom 2.1+ signal
+/// tags: the recorder surfaces the tag set per declaration so
+/// debugger consumers can render the per-signal type-tag metadata
+/// alongside the signal-kind (input / output / intermediate) badge.
+fn find_signal_tags(source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line_text in source.lines() {
+        let trimmed = line_text.trim();
+        let after_signal = if let Some(rest) = trimmed.strip_prefix("signal ") {
+            rest.trim()
+        } else {
+            continue;
+        };
+        // Strip the kind keyword if present.
+        let rest = if let Some(rest) = after_signal.strip_prefix("input ") {
+            rest.trim()
+        } else if let Some(rest) = after_signal.strip_prefix("output ") {
+            rest.trim()
+        } else {
+            after_signal
+        };
+        // Tag block must immediately follow.
+        let Some(after_brace) = rest.strip_prefix('{') else {
+            continue;
+        };
+        let Some(close) = after_brace.find('}') else {
+            continue;
+        };
+        let tags = after_brace[..close]
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        let after_tag = after_brace[close + 1..].trim();
+        let name = after_tag
+            .split(|c: char| c == '[' || c == ';' || c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !name.is_empty() && !tags.is_empty() {
+            out.push((name, tags));
+        }
+    }
+    out
+}
+
+/// Find every `template custom NAME(...)` declaration in the source
+/// (Circom 2.0.6+ `pragma custom_templates;`).  Returns the names of
+/// templates declared with the `custom` modifier, in source order.
+///
+/// Circom's `custom` template modifier opts a template into the
+/// PLONK-custom-gate codegen path; the recorder surfaces the set
+/// via a `custom_templates` special event so debugger consumers can
+/// flag custom-gate templates in the function-table view.
+fn find_custom_templates(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line_text in source.lines() {
+        let trimmed = line_text.trim();
+        let Some(after_template) = trimmed.strip_prefix("template ") else {
+            continue;
+        };
+        let Some(after_custom) = after_template.strip_prefix("custom ") else {
+            continue;
+        };
+        let after_custom = after_custom.trim_start();
+        let Some(paren_pos) = after_custom.find('(') else {
+            continue;
+        };
+        let name = after_custom[..paren_pos].trim();
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// Parse the optional `{public [a, b, ...]}` annotation on the
+/// `component main` declaration line.  Returns the list of public
+/// input-signal names in source order.  Returns an empty vector when
+/// no annotation is present (default Circom behaviour: every main
+/// input is private to the prover).
+///
+/// Closes the M12 deferred coverage gap for the `public` annotation:
+/// the recorder surfaces this set via a `register_special_event`
+/// (EvmEvent kind, metadata `public_signals`) at the start of the
+/// main call frame so debugger consumers can render which inputs
+/// are proof-visible.
+fn find_main_public_signals(source: &str) -> Vec<String> {
+    for line_text in source.lines() {
+        let trimmed = line_text.trim();
+        if !trimmed.starts_with("component main") {
+            continue;
+        }
+        // Locate the `{public [...]}` block — it sits between
+        // `component main` and the `=`.
+        let Some(eq_pos) = trimmed.find('=') else {
+            continue;
+        };
+        let header = &trimmed[..eq_pos];
+        let Some(open_brace) = header.find('{') else {
+            return Vec::new();
+        };
+        let Some(close_brace) = header[open_brace + 1..].find('}') else {
+            return Vec::new();
+        };
+        let inner = &header[open_brace + 1..open_brace + 1 + close_brace];
+        let inner = inner.trim();
+        let Some(after_public) = inner.strip_prefix("public") else {
+            return Vec::new();
+        };
+        let after_public = after_public.trim();
+        let Some(open_bracket) = after_public.find('[') else {
+            return Vec::new();
+        };
+        let Some(close_bracket) = after_public[open_bracket + 1..].find(']') else {
+            return Vec::new();
+        };
+        let names = &after_public[open_bracket + 1..open_bracket + 1 + close_bracket];
+        return names
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    Vec::new()
 }
 
 /// A parsed `signal input` declaration with its array dimensions and
@@ -1835,7 +2092,14 @@ fn find_template_input_decls(source: &str, template_name: Option<&str>) -> Vec<I
         if let Some(target) = template_name {
             if trimmed.starts_with("template ") {
                 if let Some(paren_pos) = trimmed.find('(') {
-                    let name = trimmed[9..paren_pos].trim();
+                    // Strip an optional `custom ` modifier (Circom
+                    // 2.0.6+ pragma custom_templates) so the name
+                    // match doesn't trip on `template custom Foo(`.
+                    let name = trimmed[9..paren_pos]
+                        .trim()
+                        .strip_prefix("custom ")
+                        .map(|s| s.trim_start())
+                        .unwrap_or_else(|| trimmed[9..paren_pos].trim());
                     if name == target {
                         in_target_template = true;
                         brace_depth = 0;
@@ -1861,7 +2125,20 @@ fn find_template_input_decls(source: &str, template_name: Option<&str>) -> Vec<I
 
             // Parse signal input declarations within this template.
             if let Some(rest) = trimmed.strip_prefix("signal input ") {
-                let raw = rest.trim().trim_end_matches(';').trim();
+                let raw = rest.trim();
+                // Strip an optional Circom 2.1+ tag block.  The tag
+                // names themselves are surfaced separately through
+                // `find_signal_tags`.
+                let raw = if let Some(after_brace) = raw.strip_prefix('{') {
+                    if let Some(close) = after_brace.find('}') {
+                        after_brace[close + 1..].trim()
+                    } else {
+                        raw
+                    }
+                } else {
+                    raw
+                };
+                let raw = raw.trim_end_matches(';').trim();
                 if !raw.is_empty() {
                     let (name, dims) = split_array_dims(raw);
                     inputs.push(InputSignalDecl { name, dims });
@@ -1920,7 +2197,13 @@ fn find_template_generic_params(source: &str, template_name: Option<&str>) -> Ve
         let Some(open_paren) = trimmed.find('(') else {
             continue;
         };
-        let name = trimmed[9..open_paren].trim();
+        let raw = trimmed[9..open_paren].trim();
+        // Strip an optional `custom ` modifier so the name match
+        // works on `template custom Foo(`.
+        let name = raw
+            .strip_prefix("custom ")
+            .map(|s| s.trim_start())
+            .unwrap_or(raw);
         if name != target {
             continue;
         }
