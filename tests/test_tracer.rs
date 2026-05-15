@@ -2786,6 +2786,473 @@ fn test_circomlib_iszero_test_via_ct_print_full() {
     );
 }
 
+// --- var_vs_signal_test.circom -------------------------------------------
+
+/// Records `var_vs_signal_test.circom`, which mixes a compile-time
+/// `var k = 7` constant, a `var sum = 0` accumulator mutated inside a
+/// `for`-unroll, and a single `signal output out;` capturing the
+/// final accumulator value.  Closes the M12 deferred coverage gap for
+/// the `var` / `signal` distinction at the trace surface — `var`
+/// declarations / mutations emit Step events at their lines but never
+/// surface as Variable events (they're compile-time bookkeeping in
+/// the recorder's mental model), while `signal` assignments emit
+/// both a Step and a Variable event carrying the field-element value.
+/// Pinning this strictly prevents a later refactor from silently
+/// surfacing `var` bindings into the values pane (which would pollute
+/// the trace with every for-loop induction variable / scratch slot).
+#[test]
+fn test_var_vs_signal_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_var_vs_signal_test_via_ct_print_full",
+        "var_vs_signal_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["VarVsSignal"]);
+
+    // ----- counts -----------------------------------------------------
+    // Step breakdown for var_vs_signal_test.circom:
+    //   * 1 toplevel start step (line 1)
+    //   * 1 step on `component main = VarVsSignal()` (line 32)
+    //   * 1 step on `signal output out;` (line 21) — non-input decl
+    //     surfaces as a bare Step (no Variable; the value lands on
+    //     the assignment line)
+    //   * 1 step on `var k = 7;` (line 23) — `var` decl, no Variable
+    //   * 1 step on `var sum = 0;` (line 24) — `var` decl, no Variable
+    //   * 1 step on the `for` header (line 25)
+    //   * 5 steps on the loop body (line 26 × 5 iterations) — every
+    //     `var` mutation surfaces as a bare Step (no Variable)
+    //   * 1 step on `out <== sum;` (line 29) carrying the Variable
+    //     event for `out`
+    // = 12 step events.  + 1 call_entry + 1 call_exit = 14 events.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(12), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(12),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 14, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["VarVsSignal".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["VarVsSignal".to_string()]
+    );
+
+    // ----- Call_entry args: VarVsSignal has no input signals --------
+    let call_entries: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .collect();
+    assert_eq!(call_entries.len(), 1);
+    let args = call_entries[0]["args"].as_array().expect("args");
+    assert_eq!(args.len(), 0);
+
+    // ----- Exact step lines (in order) --------------------------------
+    // Lines: toplevel (1), `component main = VarVsSignal()` (32),
+    // `signal output out` (21), `var k = 7` (23), `var sum = 0` (24),
+    // for-header (25), loop body × 5 (26 × 5), `out <== sum;` (29).
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(
+        step_lines,
+        vec![1, 32, 21, 23, 24, 25, 26, 26, 26, 26, 26, 29]
+    );
+
+    // ----- Decoded variable values ------------------------------------
+    // Only the `signal output out` assignment surfaces as a Variable
+    // event — every `var` declaration / mutation is bookkeeping and
+    // emits a bare Step (zero Variable events).  The folded value is
+    // 0 + (0+7) + (1+7) + (2+7) + (3+7) + (4+7) = 0+7+8+9+10+11 = 45.
+    assert_eq!(observed_int_vars(&doc), vec![("out".to_string(), 45)]);
+}
+
+// --- if_else_compile_time_test.circom -------------------------------------
+
+/// Records `if_else_compile_time_test.circom`, which instantiates
+/// `Branch(MODE)` twice as siblings inside a `Pair` parent — once
+/// with `MODE=0` (the `then`-branch fires) and once with `MODE=1`
+/// (the `else`-branch fires).  Closes the M12 deferred coverage gap
+/// for compile-time branch elimination — only the *taken* branch's
+/// body line surfaces as a step inside each per-instance call frame,
+/// and the per-instance step lines differ (line 24 vs line 26)
+/// because `MODE == 0` folds at compile time.  The taken-branch's
+/// `<==` Variable event lands as `b{0,1}.y` in the *parent* (Pair)
+/// frame, immediately after the corresponding Branch call exits — a
+/// recorder-wide quirk where the LAST Variable event of a call frame
+/// always lands after the call_exit (visible in every `_via_ct_print_full`
+/// fixture on this codebase).
+#[test]
+fn test_if_else_compile_time_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_if_else_compile_time_test_via_ct_print_full",
+        "if_else_compile_time_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table — definition order in the source file -------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["Branch", "Pair"]);
+
+    // ----- counts -----------------------------------------------------
+    // 18 step events + 3 call_entry + 3 call_exit = 24 events.  The
+    // three calls are Pair + 2 Branch (one per sub-component).
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(18), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(18),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 24, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence — parent + 2 sibling Branches ---------------
+    // Pair opens first; b0 (MODE=0) opens, exits; b1 (MODE=1) opens,
+    // exits; Pair exits last.
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "Pair".to_string(),
+            "Branch".to_string(),
+            "Branch".to_string(),
+        ],
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "Branch".to_string(),
+            "Branch".to_string(),
+            "Pair".to_string(),
+        ],
+    );
+
+    // ----- Call_entry args: each Branch carries `x = 0` --------------
+    let call_entries: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .collect();
+    assert_eq!(call_entries.len(), 3);
+    // Pair has no input signals.
+    let pair_args = call_entries[0]["args"].as_array().expect("Pair args");
+    assert_eq!(pair_args.len(), 0);
+    for branch in &call_entries[1..] {
+        let args = branch["args"].as_array().expect("Branch args");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0]["varname"].as_str(), Some("x"));
+        assert_eq!(args[0]["value"]["i"].as_i64(), Some(0));
+    }
+
+    // ----- Exact step lines (in order) --------------------------------
+    // Lines: toplevel (1), `component main = Pair()` (44), Pair body
+    // signal-decl steps (31, 32), b0 sub-component frame (component
+    // decl 34, signal-input arg-staging on the same line; signal
+    // input x at 20; signal output y at 21; if-header at 23 — note
+    // the taken `then`-body line 24 does NOT surface inside the
+    // child frame, the corresponding `b0.y` Variable lands in the
+    // parent frame immediately after call_exit at line 24); b1 frame
+    // mirrors b0 with line 35 / else-body line 26 instead; then Pair's
+    // own wire-up: `b0.x <== 0` (37), `b1.x <== 0` (38), `out_zero <==
+    // b0.y` (40), `out_one <== b1.y` (41).
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(
+        step_lines,
+        vec![
+            1, 44, 31, 32, // toplevel + Pair body header
+            34, 20, 21, 23, // b0 frame: component decl + signal in/out + if header
+            24, // b0.y Variable lands in Pair frame after Branch call_exit
+            35, 20, 21, 23, // b1 frame: same shape, different parent decl line
+            26, // b1.y Variable lands in Pair frame after Branch call_exit
+            37, 38, 40, 41, // Pair's wire-up + final two output assignments
+        ]
+    );
+
+    // ----- Decoded variable values ------------------------------------
+    // Per-frame surfaced variables, in event-emission order:
+    //   * b0's input arg `x = 0` is staged on the parent's component
+    //     line (34) inside the Branch frame, then re-surfaced inside
+    //     Branch as `b0.x = 0` on the signal-input decl line (20).
+    //   * The taken `then`-body's `y <== x * 2` surfaces as `b0.y = 0`
+    //     in the Pair frame at line 24 (after Branch's call_exit).
+    //   * b1's `x = 0` and `b1.x = 0` mirror b0; the taken `else`-body
+    //     `y <== x + 100` surfaces as `b1.y = 100` in the Pair frame
+    //     at line 26.
+    //   * Pair's own wire-up sites surface as parent-frame views:
+    //     `b0.x = 0` at line 37, `b1.x = 0` at line 38 (input wires);
+    //     `out_zero = 0` at line 40 (taken-then output) and `out_one =
+    //     100` at line 41 (taken-else output).
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            // b0 = Branch(0): then-branch taken
+            ("x".to_string(), 0),
+            ("b0.x".to_string(), 0),
+            ("b0.y".to_string(), 0),
+            // b1 = Branch(1): else-branch taken
+            ("x".to_string(), 0),
+            ("b1.x".to_string(), 0),
+            ("b1.y".to_string(), 100),
+            // Pair frame: wire-up + output assignments
+            ("b0.x".to_string(), 0),
+            ("b1.x".to_string(), 0),
+            ("out_zero".to_string(), 0),
+            ("out_one".to_string(), 100),
+        ],
+    );
+}
+
+// --- bitwise_var_ops_test.circom -----------------------------------------
+
+/// Records `bitwise_var_ops_test.circom`, which exercises every
+/// bitwise / shift operator (`&`, `|`, `^`, `<<`, `>>`) on a pair of
+/// compile-time `var` operands and surfaces each per-op result through
+/// a dedicated `signal output` so the recorder can pin each
+/// `ValueRecord::Int` value at the corresponding `<==` line.  Closes
+/// the M12 deferred coverage gap for bitwise operators on `var`s —
+/// they've been carried in the AST since commit 730faa4 but no
+/// end-to-end fixture pinned the surfaced values.
+#[test]
+fn test_bitwise_var_ops_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_bitwise_var_ops_test_via_ct_print_full",
+        "bitwise_var_ops_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["BitwiseVarOps"]);
+
+    // ----- counts -----------------------------------------------------
+    // Step breakdown:
+    //   * 1 toplevel start step (line 1)
+    //   * 1 step on `component main = BitwiseVarOps()` (line 42)
+    //   * 5 signal-output decl steps (lines 20-24) — bare Steps, no
+    //     Variable events (values land on the `<==` lines)
+    //   * 2 `var` operand decl steps (lines 26, 27) — bare Steps
+    //   * 5 `var` op decl steps (lines 29-33) — bare Steps
+    //   * 5 signal-assignment steps (lines 35-39) carrying the
+    //     evaluated Variable events
+    // = 19 step events.  + 1 call_entry + 1 call_exit = 21 events.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(19), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(19),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 21, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["BitwiseVarOps".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["BitwiseVarOps".to_string()]
+    );
+
+    // ----- Exact step lines (in order) --------------------------------
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(
+        step_lines,
+        vec![
+            1, 42, // toplevel + main component
+            20, 21, 22, 23, 24, // signal-output decl steps
+            26, 27, // `var a / b` decl steps
+            29, 30, 31, 32, 33, // `var <op>` decl steps
+            35, 36, 37, 38, 39, // signal-assignment steps
+        ]
+    );
+
+    // ----- Decoded variable values ------------------------------------
+    // `a = 0xF0 = 240`, `b = 0x0F = 15`.  Per-op:
+    //   * a & b   = 0xF0 & 0x0F = 0x00  = 0
+    //   * a | b   = 0xF0 | 0x0F = 0xFF  = 255
+    //   * a ^ b   = 0xF0 ^ 0x0F = 0xFF  = 255
+    //   * a << 2  = 0xF0 << 2   = 0x3C0 = 960
+    //   * a >> 4  = 0xF0 >> 4   = 0x0F  = 15
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("and_out".to_string(), 0),
+            ("or_out".to_string(), 255),
+            ("xor_out".to_string(), 255),
+            ("shl_out".to_string(), 960),
+            ("shr_out".to_string(), 15),
+        ],
+    );
+}
+
+// --- field_arithmetic_test.circom ----------------------------------------
+
+/// Records `field_arithmetic_test.circom`, which exercises the
+/// `(a + b) % p` reduction pattern over `var` operands positioned
+/// near a chosen modulus boundary so the sum overflows past `p` and
+/// the `%` reduction lands on a canonical small-magnitude
+/// representative.  The recorder evaluates `var` arithmetic in i64;
+/// the bn128 field prime doesn't fit in i64, so the fixture uses a
+/// synthetic in-i64 modulus (the prime 1_000_003) which still
+/// exercises the same `(a + b) % p` reduction path that the witness
+/// calculator applies under the real field modulus.  Closes the M12
+/// deferred coverage gap for compile-time field-arithmetic-style
+/// reductions on `var`s.
+#[test]
+fn test_field_arithmetic_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_field_arithmetic_test_via_ct_print_full",
+        "field_arithmetic_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["FieldArithmetic"]);
+
+    // ----- counts -----------------------------------------------------
+    // Step breakdown:
+    //   * 1 toplevel start step (line 1)
+    //   * 1 step on `component main = FieldArithmetic()` (line 39)
+    //   * 2 signal-output decl steps (lines 25, 26) — bare Steps
+    //   * 3 `var` operand decl steps (lines 28, 29, 30) — bare Steps
+    //   * 2 `var <expr>` decl steps (lines 32, 33) — bare Steps
+    //   * 2 signal-assignment steps (lines 35, 36) carrying Variable
+    //     events
+    // = 11 step events.  + 1 call_entry + 1 call_exit = 13 events.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(11), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(11),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 13, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["FieldArithmetic".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["FieldArithmetic".to_string()]
+    );
+
+    // ----- Exact step lines (in order) --------------------------------
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(
+        step_lines,
+        vec![
+            1, 39, // toplevel + main component
+            25, 26, // signal-output decl steps
+            28, 29, 30, // `var p / a / b` decl steps
+            32, 33, // `var sum_mod / diff_mod` decl steps
+            35, 36, // signal-assignment steps
+        ]
+    );
+
+    // ----- Decoded variable values ------------------------------------
+    // `p = 1_000_003`, `a = p - 100 = 999_903`, `b = 250`.
+    //   * sum_mod  = (a + b) % p = (1_000_153) % 1_000_003 = 150
+    //   * diff_mod = ((b - a) % p + p) % p
+    //              = ((-999_653) % 1_000_003 + 1_000_003) % 1_000_003
+    //              = (-999_653 + 1_000_003) % 1_000_003 = 350
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![("sum_out".to_string(), 150), ("diff_out".to_string(), 350),],
+    );
+}
+
 // ===========================================================================
 // CLI env-var contract
 // ===========================================================================
