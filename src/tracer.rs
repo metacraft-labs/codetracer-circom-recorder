@@ -17,7 +17,8 @@ use wasmtime::{Caller, Engine, Func, Linker, Module, Store, Val};
 
 use crate::cpp_witness::{self, CompilerSourceMap};
 use crate::evaluator::{
-    self as eval_mod, EvalContext, EvalEventKind, Function as EFunction, Template as ETemplate,
+    self as eval_mod, Bus as EBus, EvalContext, EvalEventKind, Function as EFunction,
+    Template as ETemplate,
 };
 use crate::signal_hierarchy::{build_hierarchy, SignalPath};
 use crate::source_map::SourceMap;
@@ -661,10 +662,12 @@ impl CircomTracer {
         let main_template_args = find_main_template_args(source_code);
         let main_input_decls =
             find_template_input_decls(source_code, main_template_name.as_deref());
+        let main_bus_inputs =
+            find_template_input_bus_decls(source_code, main_template_name.as_deref());
         let main_generic_params =
             find_template_generic_params(source_code, main_template_name.as_deref());
         let main_generic_env = bind_generic_args(&main_generic_params, &main_template_args);
-        let inputs = build_witness_inputs(&main_input_decls, &main_generic_env);
+        let inputs = build_witness_inputs(&main_input_decls, &main_generic_env, &main_bus_inputs);
 
         // -- 4. Run the witness generator -------------------------------------------------
         let witness_result = if use_cpp {
@@ -910,10 +913,12 @@ impl CircomTracer {
         let main_template_args = find_main_template_args(source_code);
         let main_input_decls =
             find_template_input_decls(source_code, main_template_name.as_deref());
+        let main_bus_inputs =
+            find_template_input_bus_decls(source_code, main_template_name.as_deref());
         let main_generic_params =
             find_template_generic_params(source_code, main_template_name.as_deref());
         let main_generic_env = bind_generic_args(&main_generic_params, &main_template_args);
-        let inputs = build_witness_inputs(&main_input_decls, &main_generic_env);
+        let inputs = build_witness_inputs(&main_input_decls, &main_generic_env, &main_bus_inputs);
 
         let witness_result = if use_cpp {
             let binary = match cpp_witness::compile_cpp_witness(compile_dir.path(), &stem) {
@@ -1068,8 +1073,8 @@ impl CircomTracer {
         // degrade to a flat signal-decl/assignment dump for those.
         let source_code = std::fs::read_to_string(source_path)
             .with_context(|| format!("failed to re-read {}", source_path.display()))?;
-        let (parsed_tmpls, parsed_fns): (Vec<ETemplate>, Vec<EFunction>) =
-            eval_mod::parse_program(&source_code);
+        let (parsed_tmpls, parsed_fns, parsed_buses): (Vec<ETemplate>, Vec<EFunction>, Vec<EBus>) =
+            eval_mod::parse_program_with_buses(&source_code);
         let mut tmpl_map: HashMap<String, ETemplate> = HashMap::new();
         for t in parsed_tmpls {
             tmpl_map.insert(t.name.clone(), t);
@@ -1077,6 +1082,28 @@ impl CircomTracer {
         let mut fns_map: HashMap<String, EFunction> = HashMap::new();
         for f in parsed_fns {
             fns_map.insert(f.name.clone(), f);
+        }
+        let mut bus_map: HashMap<String, EBus> = HashMap::new();
+        for b in parsed_buses {
+            bus_map.insert(b.name.clone(), b);
+        }
+
+        // Register a `TypeKind::Struct` for every declared bus type so
+        // its `type_id` is stable and reusable across the trace.  Each
+        // bus is the recorder's first-ever Struct emission for Circom —
+        // pre-2.2 fixtures don't declare any composite types, so the
+        // map is empty for the entire test corpus apart from
+        // `bus_type_test.circom`.  The Nim FFI's `ensure_type_id` only
+        // takes (kind, lang_type) and doesn't propagate
+        // `TypeSpecificInfo::Struct { fields }` — the field-name list is
+        // implicit in the per-value CBOR encoding the `arg(...)` and
+        // `register_variable_with_full_value(...)` paths emit, so the
+        // reader reconstructs the typed shape directly from the
+        // `ValueRecord::Struct { field_values, type_id }` payload.
+        let mut bus_type_ids: HashMap<String, codetracer_trace_types::TypeId> = HashMap::new();
+        for bus_name in bus_map.keys() {
+            let id = TraceWriter::ensure_type_id(&mut *self.writer, TypeKind::Struct, bus_name);
+            bus_type_ids.insert(bus_name.clone(), id);
         }
 
         // Register every parsed `function` in the recorder's function
@@ -1260,6 +1287,13 @@ impl CircomTracer {
         };
 
         // Stage main's input signal arguments before register_call.
+        // Scalar `signal input` arguments come first (in source order),
+        // followed by bus-typed inputs (`input BusName() var;`) — each
+        // bus arg is emitted as a `ValueRecord::Struct` whose
+        // `field_values` mirror the bus's declared field order with
+        // each field defaulted to 0 (matching the witness calculator's
+        // default for unset inputs).  The recorder's first Struct
+        // emission for Circom — see the bus_type_test fixture.
         if let Some(t) = tmpl_map.get(&main_inst.template_name) {
             for input_name in &t.input_signals {
                 let v = main_input_values.get(input_name).copied().unwrap_or(0);
@@ -1268,6 +1302,25 @@ impl CircomTracer {
                     type_id: field_type_id,
                 };
                 let _ = TraceWriter::arg(&mut *self.writer, input_name, value);
+            }
+            for (var_name, bus_type) in &t.input_buses {
+                let type_id = bus_type_ids.get(bus_type).copied().unwrap_or(field_type_id);
+                let field_values = if let Some(bus) = bus_map.get(bus_type) {
+                    bus.fields
+                        .iter()
+                        .map(|_| ValueRecord::Int {
+                            i: 0,
+                            type_id: field_type_id,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let value = ValueRecord::Struct {
+                    field_values,
+                    type_id,
+                };
+                let _ = TraceWriter::arg(&mut *self.writer, var_name, value);
             }
         }
         TraceWriter::register_call(&mut *self.writer, main_fn_id, vec![]);
@@ -1283,6 +1336,7 @@ impl CircomTracer {
                 &template_fns,
                 &fns_map,
                 &function_fns,
+                &bus_map,
             );
         }
 
@@ -1313,6 +1367,7 @@ impl CircomTracer {
         template_fns: &HashMap<String, FunctionId>,
         fns_map: &HashMap<String, EFunction>,
         function_fns: &HashMap<String, FunctionId>,
+        bus_map: &HashMap<String, EBus>,
     ) -> HashMap<String, i64> {
         let field_type_id = self.field_type_id.unwrap();
         let Some(template) = tmpl_map.get(template_name) else {
@@ -1337,6 +1392,7 @@ impl CircomTracer {
             input_signals: input_signals.clone(),
             generic_args,
             functions: fns_map,
+            buses: bus_map,
         };
         let result = eval_mod::evaluate_template(template, &ctx);
 
@@ -1489,6 +1545,7 @@ impl CircomTracer {
                         template_fns,
                         fns_map,
                         function_fns,
+                        bus_map,
                     );
                     comp_outputs.insert(comp_name.clone(), outputs);
 
@@ -2529,11 +2586,16 @@ fn bind_generic_args(params: &[String], args: &[i64]) -> HashMap<String, i64> {
 /// Build the witness-input map (name -> Vec<value-string>) from the
 /// main template's input-signal declarations.  Each scalar input gets
 /// a single `"0"` element; each array input gets `N` `"0"` elements
-/// where `N` is the resolved first dimension.  This shape is what the
-/// circom WASM witness calculator's `setInputSignal` ABI expects.
+/// where `N` is the resolved first dimension.  Bus-typed inputs
+/// (`input BusName() var;`, Circom 2.2+) are flattened to a single
+/// witness key (`var`) whose array length matches the bus's total
+/// scalar-field count — this is what `getInputSignalSize(hash("var"))`
+/// returns for a bus input, mirroring how circom's own
+/// `qualify_input` flattens nested object inputs.
 fn build_witness_inputs(
     decls: &[InputSignalDecl],
     generic_env: &HashMap<String, i64>,
+    bus_inputs: &[BusInputDecl],
 ) -> HashMap<String, Vec<String>> {
     let mut inputs = HashMap::new();
     for d in decls {
@@ -2547,7 +2609,168 @@ fn build_witness_inputs(
         }
         inputs.insert(d.name.clone(), vec!["0".to_string(); size]);
     }
+    for b in bus_inputs {
+        inputs.insert(b.name.clone(), vec!["0".to_string(); b.field_count.max(1)]);
+    }
     inputs
+}
+
+/// A parsed `input BusName() var;` declaration captured from the main
+/// template body so the witness-input builder can request the right
+/// number of zero-defaulted slots from `setInputSignal`.  The
+/// `field_count` is resolved by looking up the matching bus
+/// declaration's `signal NAME;` count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BusInputDecl {
+    /// Bus variable name (the user-visible identifier in the template
+    /// body).
+    name: String,
+    /// Bus type name (matches the `bus NAME() { ... }` declaration).
+    #[allow(dead_code)]
+    bus_type: String,
+    /// Total number of scalar `signal` fields declared in the bus body
+    /// — this is what circom's `getInputSignalSize` returns for the
+    /// bus-input hash key.
+    field_count: usize,
+}
+
+/// Find bus-typed input declarations for a specific template, paired
+/// with the field-count of each matching bus.  When the bus type
+/// can't be resolved (e.g. the bus is declared in a file the recorder
+/// didn't scan), the entry is skipped — the witness calculator will
+/// surface a clear "Not enough values for input signal" error in that
+/// case which is more useful than a silent zero default.
+fn find_template_input_bus_decls(source: &str, template_name: Option<&str>) -> Vec<BusInputDecl> {
+    let buses = find_bus_decls(source);
+    let bus_field_counts: HashMap<String, usize> =
+        buses.into_iter().map(|(n, fs)| (n, fs.len())).collect();
+
+    let mut results = Vec::new();
+    let mut in_target = template_name.is_none();
+    let mut brace_depth = 0i32;
+
+    for line_text in source.lines() {
+        let trimmed = line_text.trim();
+
+        if let Some(target) = template_name {
+            if trimmed.starts_with("template ") {
+                if let Some(paren_pos) = trimmed.find('(') {
+                    let raw = trimmed[9..paren_pos].trim();
+                    let stripped = raw
+                        .strip_prefix("custom ")
+                        .or_else(|| raw.strip_prefix("parallel "))
+                        .map(|s| s.trim_start())
+                        .unwrap_or(raw);
+                    if stripped == target {
+                        in_target = true;
+                        brace_depth = 0;
+                    }
+                }
+            }
+        }
+
+        if in_target {
+            for ch in trimmed.chars() {
+                match ch {
+                    '{' => brace_depth += 1,
+                    '}' => {
+                        brace_depth -= 1;
+                        if brace_depth <= 0 && template_name.is_some() {
+                            in_target = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // `input BusName() var;` — capture (var, BusName).  Strict
+            // shape match: `input` + ident + `()` + ident + `;`.
+            if let Some(rest) = trimmed.strip_prefix("input ") {
+                let rest = rest.trim();
+                if let Some(open_paren) = rest.find('(') {
+                    let bus_type = rest[..open_paren].trim().to_string();
+                    let after_paren = rest[open_paren + 1..].trim_start();
+                    if let Some(close_paren) = after_paren.find(')') {
+                        let between = after_paren[..close_paren].trim();
+                        if between.is_empty() {
+                            let after = after_paren[close_paren + 1..].trim();
+                            let var_name = after.trim_end_matches(';').trim();
+                            if !var_name.is_empty() && !bus_type.is_empty() {
+                                if let Some(&fc) = bus_field_counts.get(&bus_type) {
+                                    results.push(BusInputDecl {
+                                        name: var_name.to_string(),
+                                        bus_type,
+                                        field_count: fc,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Source-level scan for top-level `bus NAME() { signal A; signal B; }`
+/// declarations.  Returns `[(bus_name, [field_names])]` in source
+/// order.  Mirrors the lightweight string scans elsewhere in this
+/// module (e.g. `find_template_input_decls`) — the structured parser
+/// in `evaluator::parse_program_with_buses` is the canonical source of
+/// the same data, but the input-builder runs before the structured
+/// parse so we re-derive it here from raw source.
+fn find_bus_decls(source: &str) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut current: Option<(String, Vec<String>)> = None;
+    let mut brace_depth = 0i32;
+
+    for line_text in source.lines() {
+        let trimmed = line_text.trim();
+        if current.is_none() && trimmed.starts_with("bus ") {
+            // Parse `bus NAME(...)`; tolerate optional generic-params block.
+            let after_bus = trimmed[4..].trim();
+            // The name ends at `(` or whitespace.
+            let name_end = after_bus
+                .find(|c: char| c == '(' || c.is_whitespace())
+                .unwrap_or(after_bus.len());
+            let name = after_bus[..name_end].to_string();
+            if !name.is_empty() {
+                current = Some((name, Vec::new()));
+                // Count `{` on this line to set brace_depth.
+                brace_depth = trimmed.chars().filter(|&c| c == '{').count() as i32
+                    - trimmed.chars().filter(|&c| c == '}').count() as i32;
+            }
+            continue;
+        }
+        if let Some((_, ref mut fields)) = current {
+            // Track brace depth.
+            for ch in trimmed.chars() {
+                match ch {
+                    '{' => brace_depth += 1,
+                    '}' => brace_depth -= 1,
+                    _ => {}
+                }
+            }
+            // `signal NAME;` field.  Only top-level inside the bus
+            // body (depth == 1 right before `}`).
+            if let Some(rest) = trimmed.strip_prefix("signal ") {
+                let raw = rest.trim().trim_end_matches(';').trim();
+                if !raw.is_empty() {
+                    let (fname, _dims) = split_array_dims(raw);
+                    fields.push(fname);
+                }
+            }
+            if brace_depth <= 0 {
+                if let Some(bus) = current.take() {
+                    out.push(bus);
+                }
+            }
+        }
+    }
+
+    out
 }
 
 /// Split `name[d1][d2]...` into `(name, [d1, d2, ...])`.  Each
