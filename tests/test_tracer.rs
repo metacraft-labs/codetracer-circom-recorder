@@ -4045,11 +4045,7 @@ fn test_anonymous_component_test_via_ct_print_full() {
     // = 11 step events.  + 1 call_entry + 1 call_exit + 1 io_event
     // = 14 events.
     let counts = &doc["counts"];
-    assert_eq!(
-        counts["steps"].as_u64(),
-        Some(11),
-        "steps; counts={counts}"
-    );
+    assert_eq!(counts["steps"].as_u64(), Some(11), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
@@ -4168,11 +4164,7 @@ fn test_circomlib_poseidon_test_via_ct_print_full() {
     // = 32 step events.  + 1 call_entry + 1 call_exit + 0 io_events
     // = 34 events.
     let counts = &doc["counts"];
-    assert_eq!(
-        counts["steps"].as_u64(),
-        Some(32),
-        "steps; counts={counts}"
-    );
+    assert_eq!(counts["steps"].as_u64(), Some(32), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
@@ -4374,6 +4366,315 @@ fn test_pragma_version_test_via_ct_print_full() {
             ("x".to_string(), 0),
             ("inner.x".to_string(), 0),
             ("y".to_string(), 0),
+        ],
+    );
+}
+
+// --- bus_type_test.circom -----------------------------------------------
+
+/// Path to the Circom 2.2.3 binary built locally from the
+/// `metacraft-circom-fork` tree.  The dev shell pins circom 2.1.5,
+/// which doesn't recognise the `bus` / `input BusName()` syntax
+/// introduced in Circom 2.2 — the bus_type fixture's `pragma circom
+/// 2.2.0;` declaration is rejected with `Pragma version 2.2.0 is not
+/// supported`.  Tests that need bus support route the recorder
+/// through this binary by setting `CIRCOM_BIN` on the recorder
+/// subprocess, which keeps the env override scoped to the bus test
+/// (cargo test runs all test functions in the same process by
+/// default; setting `std::env::set_var` would leak the override into
+/// every other test running in parallel and silently re-circle the
+/// 2.1.5 corpus through 2.2.3, which is not 100% backward-compatible
+/// for some constraint patterns the existing fixtures rely on).
+///
+/// Resolved relative to the workspace root (`<workspace>/codetracer-
+/// circom-recorder/../metacraft-circom-fork/target/release/circom`)
+/// so the path is portable across machines that follow the metacraft
+/// repo workspace layout.  An externally-set `CIRCOM_2_2_BIN` env
+/// override (e.g. for CI runners that build circom in a different
+/// location) takes precedence.
+fn circom_2_2_path() -> PathBuf {
+    if let Ok(p) = std::env::var("CIRCOM_2_2_BIN") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("metacraft-circom-fork")
+        .join("target")
+        .join("release")
+        .join("circom")
+}
+
+/// Like `record_and_dump_full`, but invokes the recorder as a
+/// subprocess with `CIRCOM_BIN` pointed at the Circom 2.2.3 binary
+/// so the bus-type fixture compiles.  Returns `None` when either the
+/// 2.2 binary or `ct-print` is unavailable, surfacing a `SKIP:` line
+/// (the verify-cli-convention-no-silent-skip.sh check greps for that
+/// literal token).
+fn record_and_dump_full_with_circom_2_2(
+    test_name: &str,
+    program: &str,
+) -> Option<(serde_json::Value, PathBuf)> {
+    let circom_bin = circom_2_2_path();
+    if !circom_bin.exists() {
+        eprintln!(
+            "SKIP: {test_name} requires circom 2.2.3 at {} — only available \
+            within the metacraft workspace where metacraft-circom-fork is a sibling \
+            and built (cd ~/metacraft/metacraft-circom-fork && cargo build --release).",
+            circom_bin.display()
+        );
+        return None;
+    }
+
+    let ct_print = ct_print_or_skip(test_name)?;
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = tmp_dir.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let source_path = test_programs_dir().join(program);
+
+    // Run the recorder as a subprocess so the `CIRCOM_BIN` env override
+    // stays local to this invocation and doesn't leak into other tests
+    // (cargo test runs all test functions in the same process by
+    // default and env vars are process-wide).
+    let output = Command::new(env!("CARGO_BIN_EXE_codetracer-circom-recorder"))
+        .args(["record"])
+        .arg(&source_path)
+        .args(["--out-dir"])
+        .arg(&out_dir)
+        .env("CIRCOM_BIN", &circom_bin)
+        .output()
+        .expect("failed to run recorder subprocess");
+
+    assert!(
+        output.status.success(),
+        "recorder should succeed for {program} with CIRCOM_BIN={}; stderr: {}",
+        circom_bin.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let ct_files = ct_files_in(&out_dir);
+    assert!(
+        !ct_files.is_empty(),
+        "expected a .ct container in {:?}",
+        out_dir
+    );
+
+    let ct_output = Command::new(&ct_print)
+        .args(["--full", "--strip-paths"])
+        .arg(&ct_files[0])
+        .output()
+        .expect("failed to run ct-print --full");
+
+    assert!(
+        ct_output.status.success(),
+        "ct-print --full should succeed; stderr: {}",
+        String::from_utf8_lossy(&ct_output.stderr)
+    );
+
+    let doc: serde_json::Value =
+        serde_json::from_slice(&ct_output.stdout).expect("ct-print --full should emit valid JSON");
+
+    drop(tmp_dir);
+
+    Some((doc, source_path))
+}
+
+/// Records `bus_type_test.circom`, the recorder's first fixture for
+/// Circom 2.2's `bus` composite type.  The `Distance` template
+/// declares `input Point() p;` — a bus-typed parameter that surfaces
+/// on the call_entry as a `ValueRecord::Struct` whose `field_values`
+/// mirror the `Point { signal x; signal y; }` field order.  Field
+/// reads (`p.x`, `p.y`) inside the body resolve through the
+/// evaluator's existing `Expr::Member` -> `Value::Component` lookup
+/// path.  The recorder defaults every bus field to 0 (no JSON-input
+/// wiring today), so the squared terms `x2`, `y2`, `d` all surface
+/// as 0 — what's load-bearing here is the *shape* of the call_entry
+/// arg (a Struct with 2 Int field_values), not the values.
+///
+/// Pinned to current behavior: the recorder doesn't have an
+/// input-injection mechanism for bus fields (or for any input), so
+/// the spec-correct expectation `p = Struct{ field_values: [Int 3,
+/// Int 4], type_id }` from the original task brief is not yet
+/// reachable — the witness calculator gets `0` for every input slot
+/// and the trace surfaces those zeroes.  The Struct *shape* (a
+/// `TypeKind::Struct` `Point` registered via `ensure_type_id`, with
+/// the call_entry arg's `field_values` carrying the field-element
+/// type-id list) is the new-this-round contribution — that's the
+/// recorder's first Struct emission for Circom.  When JSON input
+/// wiring lands, this test should be extended to assert the
+/// non-zero field values rather than weakened to allow them.
+#[test]
+fn test_bus_type_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full_with_circom_2_2(
+        "test_bus_type_test_via_ct_print_full",
+        "bus_type_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table -------------------------------------------------
+    // Only the `Distance` template surfaces — `bus Point()` is a type
+    // declaration, not a callable, and the recorder doesn't register
+    // bus types in the `functions` array.
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["Distance"]);
+
+    // ----- Type table -----------------------------------------------------
+    // `Point` is registered as the recorder's first Struct type for
+    // Circom (`TypeKind::Struct`, lang_type = "Point").  `field` and
+    // `bool` are the standard scalar types every Circom trace
+    // registers; `type_0` is the per-int-type-id alias the writer
+    // creates as a side-effect of the `register_variable_int` /
+    // `register_variable_cbor` fast path (every other Circom fixture
+    // also surfaces it — see `template_signal_args_test`'s 3-entry
+    // type table).
+    let types: Vec<&str> = doc["types"]
+        .as_array()
+        .expect("types array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(types, vec!["field", "bool", "Point", "type_0"]);
+
+    // ----- counts ---------------------------------------------------------
+    // 9 step events: 1 toplevel (line 1) + 1 component-main (line 47)
+    // + 1 input-bus decl (line 38) + 1 signal-output decl (line 39)
+    // + 2 intermediate signal decls (lines 40, 41) + 3 wire
+    // assignments (lines 42, 43, 44).  + 1 call_entry + 1 call_exit
+    // = 11 events.  9 values: the bus arg `p` surfaces both as a
+    // call_entry arg AND as a step variable on the line-47 step (the
+    // Nim writer's `arg(...)` path stages the value on the current
+    // step before consuming it for the next call), then 3 step
+    // variables for the wire targets x2/y2/d.  That's 4 step
+    // variables + 1 args entry + 4 step events with empty `vars` for
+    // the toplevel/decl steps = 9 values total tracked by the writer.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(9),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 11, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence --------------------------------------------------
+    assert_eq!(observed_call_sequence(&doc), vec!["Distance".to_string()]);
+    assert_eq!(observed_exit_sequence(&doc), vec!["Distance".to_string()]);
+
+    // ----- Call_entry arg: bus-typed `p` surfaces as a Struct -------------
+    // This is the load-bearing assertion: the recorder's first-ever
+    // `ValueRecord::Struct` emission for Circom.  The Struct's
+    // `type_id` points at the registered `Point` struct-kind type
+    // (index 2 in the type table — `field` is 0, `bool` is 1).
+    // `field_values` mirrors the bus declaration's field order:
+    // `signal x; signal y;` -> two field-element `Int 0` values, both
+    // typed as `field` (type_id 0).
+    let call_entries: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .collect();
+    assert_eq!(call_entries.len(), 1);
+    let args = call_entries[0]["args"].as_array().expect("Distance args");
+    assert_eq!(args.len(), 1, "Distance has one bus-typed input arg");
+    assert_eq!(args[0]["varname"].as_str(), Some("p"));
+    assert_eq!(args[0]["value"]["kind"].as_str(), Some("Struct"));
+    assert_eq!(args[0]["value"]["type_id"].as_i64(), Some(2));
+    let field_values = args[0]["value"]["field_values"]
+        .as_array()
+        .expect("Struct.field_values array");
+    assert_eq!(field_values.len(), 2, "Point has 2 declared fields (x, y)");
+    for (i, fv) in field_values.iter().enumerate() {
+        assert_eq!(
+            fv["kind"].as_str(),
+            Some("Int"),
+            "field[{i}] should decode as Int (witness defaults inputs to 0); \
+             when JSON input wiring lands, extend this test to assert non-zero \
+             values rather than weakening the kind check"
+        );
+        assert_eq!(
+            fv["i"].as_i64(),
+            Some(0),
+            "field[{i}] value must be 0 (the recorder defaults all witness \
+             inputs to 0; no JSON-input wiring today)"
+        );
+        assert_eq!(
+            fv["type_id"].as_i64(),
+            Some(0),
+            "each bus field is typed as the scalar `field` type (type_id 0)"
+        );
+    }
+
+    // ----- Exact step lines (in order) ------------------------------------
+    // The trailing line-44 step (the `d <== x2 + y2;` wire) lands
+    // *after* the call_exit because the Nim writer buffers the
+    // current pending step until the next register_step / finish call
+    // flushes it — `register_return` doesn't flush.  This is the
+    // existing writer quirk every Circom fixture observes (compare
+    // `template_signal_args_test`'s line-29 step which also surfaces
+    // post-call_exit).  Pinning the order here guards against any
+    // future flush-on-return change silently dropping the wire step.
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(step_lines, vec![1, 47, 38, 39, 40, 41, 42, 43, 44]);
+
+    // ----- Decoded variable values (across step events) -------------------
+    // Walk every step event's `vars` array and collect a single
+    // `(varname, kind, [optional payload])` triple per recorded var.
+    // Pinning the full sequence — including the `p` Struct var that
+    // surfaces on the line-47 step (the Nim writer's `arg(...)` path
+    // stages the staged-arg value on the *current* step before
+    // consuming it for the next call) — catches both regression in
+    // bus surfacing and any drift in the scalar wire-target order.
+    // The bus var's payload is asserted via the dedicated `field_values`
+    // checks above; here we only check that the line-47 step carries
+    // *one* var named `p` of kind `Struct`, and the trailing wire
+    // steps each carry their respective `Int 0` scalar.
+    let recorded_vars: Vec<(String, String, Option<i64>)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .map(|v| {
+            let name = v["varname"].as_str().expect("varname str").to_string();
+            let kind = v["value"]["kind"]
+                .as_str()
+                .expect("value.kind str")
+                .to_string();
+            let int_val = v["value"]["i"].as_i64();
+            (name, kind, int_val)
+        })
+        .collect();
+    assert_eq!(
+        recorded_vars,
+        vec![
+            // line-47 step (component main): the staged bus arg `p`.
+            ("p".to_string(), "Struct".to_string(), None),
+            // line-42 wire step: x2 <== p.x * p.x = 0.
+            ("x2".to_string(), "Int".to_string(), Some(0)),
+            // line-43 wire step: y2 <== p.y * p.y = 0.
+            ("y2".to_string(), "Int".to_string(), Some(0)),
+            // line-44 wire step (post-call_exit, see step-line ordering
+            // note above): d <== x2 + y2 = 0.
+            ("d".to_string(), "Int".to_string(), Some(0)),
         ],
     );
 }

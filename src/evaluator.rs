@@ -182,6 +182,16 @@ pub enum Stmt {
         kind: SignalKind,
         dims: Vec<Expr>,
     },
+    /// `input BusName() var;` (Circom 2.2+ bus input declaration).
+    /// The variable is bound to a `Value::Component`-shaped slot whose
+    /// fields default to 0 (matching the witness calculator's default
+    /// for unset inputs).  Field reads through `var.field` resolve via
+    /// the existing `Expr::Member` path.
+    InputBusDecl {
+        line: u32,
+        name: String,
+        bus_type: String,
+    },
     /// `lhs = expr;` or `lhs <== expr;` or `lhs <-- expr;`.
     Assign {
         line: u32,
@@ -258,6 +268,10 @@ pub struct Template {
     /// source order.  Mirrored from the body so callers don't have to
     /// re-walk it.
     pub input_signals: Vec<String>,
+    /// Bus-typed input declarations (Circom 2.2+):
+    ///   `input BusName() var;` -> `("var", "BusName")` pairs in source
+    /// order.  Mirrored from the body's `Stmt::InputBusDecl` entries.
+    pub input_buses: Vec<(String, String)>,
 }
 
 /// A parsed `function` definition (compile-time, no signals or
@@ -275,6 +289,23 @@ pub struct Function {
     /// Body statements in source order; the last `return` carries the
     /// computed value back to the caller.
     pub body: Vec<Stmt>,
+}
+
+/// A parsed `bus NAME() { signal a; signal b; ... }` declaration
+/// (Circom 2.2+ composite type).  Buses act as named records of
+/// field-element signals that can be passed as a single `input`
+/// parameter to a template.  The recorder surfaces a bus-typed input
+/// arg as a `ValueRecord::Struct` whose `type_id` points at the
+/// registered struct-kind type for `name`.
+#[derive(Debug, Clone)]
+pub struct Bus {
+    pub name: String,
+    /// 1-based source line of the `bus` keyword.
+    pub line: u32,
+    /// Field names declared inside the bus body, in source order.
+    /// Only scalar `signal NAME;` fields are recognised — array fields
+    /// and nested bus fields are not modelled by the recorder today.
+    pub fields: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -745,6 +776,49 @@ impl Parser {
             self.eat_punct(";");
             return Ok(Stmt::VarDecl { line, name, init });
         }
+        // bus-typed input declaration (Circom 2.2+):
+        //   `input BusName() var;`
+        // Recognised as a separate statement so the structured evaluator
+        // can seed the variable as a Component-shaped value (matching
+        // how `comp.signal` reads resolve via `Expr::Member`) and so the
+        // tracer can surface the parameter as a `ValueRecord::Struct`
+        // arg on the template's call_entry.
+        //
+        // We only consume the tokens when the *exact* `Ident "input"`,
+        // `Ident TYPE`, `Punct "("`, `Punct ")"`, `Ident NAME`, `Punct ";"`
+        // sequence is present; on any deviation we fall through and let
+        // the existing parser paths handle it (so we don't accidentally
+        // swallow `input` used as a regular identifier in pre-2.2 code).
+        if let Tok::Ident(s) = self.peek() {
+            if s == "input" {
+                let saved_pos = self.pos;
+                self.bump(); // input
+                if let Tok::Ident(bus_type) = self.peek().clone() {
+                    self.bump(); // BusName
+                    if matches!(self.peek(), Tok::Punct(p) if p == "(") && {
+                        // Peek one ahead manually to confirm `()` (no args).
+                        let next = self.toks.get(self.pos + 1).map(|t| t.tok.clone());
+                        matches!(next, Some(Tok::Punct(ref q)) if q == ")")
+                    } {
+                        self.bump(); // (
+                        self.bump(); // )
+                        if let Tok::Ident(var_name) = self.peek().clone() {
+                            self.bump(); // var name
+                            self.eat_punct(";");
+                            return Ok(Stmt::InputBusDecl {
+                                line,
+                                name: var_name,
+                                bus_type,
+                            });
+                        }
+                    }
+                }
+                // Roll back — the token sequence didn't match the
+                // bus-input shape, so let the generic expr-stmt fallback
+                // handle whatever this is.
+                self.pos = saved_pos;
+            }
+        }
         // signal declaration
         if let Tok::Ident(s) = self.peek() {
             if s == "signal" {
@@ -1108,12 +1182,20 @@ impl Parser {
                 _ => None,
             })
             .collect();
+        let input_buses: Vec<(String, String)> = body
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::InputBusDecl { name, bus_type, .. } => Some((name.clone(), bus_type.clone())),
+                _ => None,
+            })
+            .collect();
         Ok(Template {
             name,
             line,
             generic_params,
             body,
             input_signals,
+            input_buses,
         })
     }
 }
@@ -1130,13 +1212,104 @@ pub fn parse_templates(src: &str) -> Vec<Template> {
 /// the recorder's function table and resolve `Expr::Call(f, args)`
 /// references inside template / function bodies.
 pub fn parse_program(src: &str) -> (Vec<Template>, Vec<Function>) {
+    let (templates, functions, _) = parse_program_with_buses(src);
+    (templates, functions)
+}
+
+/// Like `parse_program`, but also returns the `bus` definitions
+/// (Circom 2.2+ composite types).  Kept as a separate entry point so
+/// the existing `parse_program` callers don't have to thread the
+/// (currently empty for ~99% of fixtures) bus list through.
+pub fn parse_program_with_buses(src: &str) -> (Vec<Template>, Vec<Function>, Vec<Bus>) {
     let toks = tokenize(src);
     let mut parser = Parser::new(toks);
     let mut templates = Vec::new();
     let mut functions = Vec::new();
+    let mut buses = Vec::new();
     loop {
         match parser.peek().clone() {
             Tok::Eof => break,
+            Tok::Ident(name) if name == "bus" => {
+                let line = parser.peek_line();
+                parser.bump(); // bus
+                               // Bus name.
+                let bus_name = match parser.peek().clone() {
+                    Tok::Ident(n) => {
+                        parser.bump();
+                        n
+                    }
+                    _ => continue,
+                };
+                // Optional `()` — buses can declare generic params but
+                // the recorder only models the no-arg form today.
+                if matches!(parser.peek(), Tok::Punct(p) if p == "(") {
+                    let mut depth = 0i32;
+                    loop {
+                        match parser.peek().clone() {
+                            Tok::Punct(p) if p == "(" => {
+                                depth += 1;
+                                parser.bump();
+                            }
+                            Tok::Punct(p) if p == ")" => {
+                                depth -= 1;
+                                parser.bump();
+                                if depth <= 0 {
+                                    break;
+                                }
+                            }
+                            Tok::Eof => break,
+                            _ => {
+                                parser.bump();
+                            }
+                        }
+                    }
+                }
+                // `{ signal X; signal Y; ... }` — collect each scalar
+                // `signal NAME;` declaration as a field.  Anything more
+                // complex (nested buses, array fields) is silently
+                // skipped — the recorder doesn't model those today.
+                let mut fields = Vec::new();
+                if matches!(parser.peek(), Tok::Punct(p) if p == "{") {
+                    parser.bump(); // {
+                    let mut depth = 1i32;
+                    while depth > 0 {
+                        match parser.peek().clone() {
+                            Tok::Eof => break,
+                            Tok::Punct(p) if p == "{" => {
+                                depth += 1;
+                                parser.bump();
+                            }
+                            Tok::Punct(p) if p == "}" => {
+                                depth -= 1;
+                                parser.bump();
+                            }
+                            Tok::Ident(n) if n == "signal" && depth == 1 => {
+                                parser.bump(); // signal
+                                if let Tok::Ident(field_name) = parser.peek().clone() {
+                                    parser.bump();
+                                    fields.push(field_name);
+                                    // Skip any trailing `[dim]` or other
+                                    // tokens until `;`.
+                                    while !matches!(parser.peek(), Tok::Punct(p) if p == ";")
+                                        && !matches!(parser.peek(), Tok::Eof)
+                                    {
+                                        parser.bump();
+                                    }
+                                    parser.eat_punct(";");
+                                }
+                            }
+                            _ => {
+                                parser.bump();
+                            }
+                        }
+                    }
+                }
+                buses.push(Bus {
+                    name: bus_name,
+                    line,
+                    fields,
+                });
+            }
             Tok::Ident(name) if name == "pragma" => {
                 // Eat until ';'
                 while !matches!(parser.peek(), Tok::Punct(p) if p == ";")
@@ -1204,7 +1377,7 @@ pub fn parse_program(src: &str) -> (Vec<Template>, Vec<Function>) {
             }
         }
     }
-    (templates, functions)
+    (templates, functions, buses)
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,6 +1478,14 @@ pub struct EvalContext<'a> {
     /// `Expr::Call(name, args)` references inside template / function
     /// bodies.  Empty when the program has no functions.
     pub functions: &'a HashMap<String, Function>,
+    /// Bus type definitions keyed by bus name.  Looked up when the
+    /// evaluator hits a `Stmt::InputBusDecl` so it can seed the bus
+    /// variable as a `Value::Component { template: <bus_name>, signals }`
+    /// with each declared field defaulted to 0.  Field reads (`p.x`)
+    /// then resolve through the existing `Expr::Member` ->
+    /// `Value::Component` lookup path.  Empty when the program has no
+    /// bus definitions (the common case for pre-2.2 fixtures).
+    pub buses: &'a HashMap<String, Bus>,
 }
 
 /// Evaluation result for a template body — both the events produced
@@ -1456,6 +1637,35 @@ pub fn evaluate_template(template: &Template, ctx: &EvalContext) -> EvalResult {
         env.insert(name.clone(), Value::Int(*value));
     }
 
+    // Pre-seed bus-typed inputs as `Value::Component`-shaped slots so
+    // member reads (`p.x`, `p.y`) resolve through the existing
+    // `Expr::Member` -> `Value::Component` lookup path.  Each declared
+    // field defaults to 0 (matching the witness calculator's default
+    // for unset inputs — the recorder doesn't have a JSON-input wiring
+    // mechanism today, so every bus field starts at 0 just like every
+    // scalar `signal input` does).  Bus fields whose type isn't in
+    // `ctx.buses` (e.g. forward-declared, in an included file the
+    // recorder didn't scan, or the program forgot the `bus` keyword)
+    // are seeded as empty Components so reads still return None
+    // gracefully rather than panicking.
+    for stmt in &template.body {
+        if let Stmt::InputBusDecl { name, bus_type, .. } = stmt {
+            let mut signals: HashMap<String, i64> = HashMap::new();
+            if let Some(bus) = ctx.buses.get(bus_type) {
+                for field in &bus.fields {
+                    signals.insert(field.clone(), 0);
+                }
+            }
+            env.insert(
+                name.clone(),
+                Value::Component {
+                    template: bus_type.clone(),
+                    signals,
+                },
+            );
+        }
+    }
+
     // ------------------------------------------------------------------
     // Pre-pass: walk the body in source order.  When a sub-component
     // declaration appears, record it.  When a wire to a sub-component
@@ -1512,6 +1722,7 @@ pub fn evaluate_template(template: &Template, ctx: &EvalContext) -> EvalResult {
             input_signals: inputs.clone(),
             generic_args: args.clone(),
             functions: ctx.functions,
+            buses: ctx.buses,
         };
         let child_result = evaluate_template(child_template, &child_ctx);
         let mut signals = inputs;
@@ -1710,6 +1921,7 @@ fn collect_components_with_wires(
             } => {
                 let mut init_evt = Vec::new();
                 let empty_fns = HashMap::new();
+                let empty_buses = HashMap::new();
                 let empty_bool: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 let empty_ctx = EvalContext {
@@ -1717,6 +1929,7 @@ fn collect_components_with_wires(
                     input_signals: HashMap::new(),
                     generic_args: Vec::new(),
                     functions: &empty_fns,
+                    buses: &empty_buses,
                 };
                 eval_stmt(init, env, &mut init_evt, &empty_ctx, &empty_bool);
                 let mut iterations = 0usize;
@@ -1831,6 +2044,7 @@ fn collect_components(
             } => {
                 let mut init_evt = Vec::new();
                 let empty_fns = HashMap::new();
+                let empty_buses = HashMap::new();
                 let empty_bool: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 eval_stmt(
@@ -1842,6 +2056,7 @@ fn collect_components(
                         input_signals: HashMap::new(),
                         generic_args: Vec::new(),
                         functions: &empty_fns,
+                        buses: &empty_buses,
                     },
                     &empty_bool,
                 );
@@ -1862,6 +2077,7 @@ fn collect_components(
                             input_signals: HashMap::new(),
                             generic_args: Vec::new(),
                             functions: &empty_fns,
+                            buses: &empty_buses,
                         },
                         &empty_bool,
                     );
@@ -1905,6 +2121,45 @@ fn eval_stmt(
             // variable would show up as a recorded "value", contrary
             // to the Circom mental model where only `signal`s carry
             // values into the witness).  Emit a step-only event.
+            events.push(EvalEvent {
+                line: *line,
+                kind: EvalEventKind::Step,
+            });
+        }
+        Stmt::InputBusDecl {
+            line,
+            name,
+            bus_type,
+        } => {
+            // Bus-typed input declaration (Circom 2.2+):
+            //   `input BusName() var;`
+            // The value was pre-seeded into `env` by `evaluate_template`
+            // before the body walk started (so wire RHS evaluations in
+            // the prepass could read fields like `p.x`).  Re-seed
+            // defensively here in case the eval_stmt path was reached
+            // through a code path that bypassed the pre-seed (e.g. an
+            // included template body) — the recorder treats the
+            // duplicate insert as idempotent.
+            if !env.contains_key(name) {
+                let mut signals: HashMap<String, i64> = HashMap::new();
+                if let Some(bus) = ctx.buses.get(bus_type) {
+                    for field in &bus.fields {
+                        signals.insert(field.clone(), 0);
+                    }
+                }
+                env.insert(
+                    name.clone(),
+                    Value::Component {
+                        template: bus_type.clone(),
+                        signals,
+                    },
+                );
+            }
+            // Step-only event at the input-decl line: the user-visible
+            // bus value surfaces as the call_entry arg (a
+            // `ValueRecord::Struct`), not as a step Variable record —
+            // mirroring how scalar input signal decls surface their
+            // value at the declaration line via a separate path.
             events.push(EvalEvent {
                 line: *line,
                 kind: EvalEventKind::Step,
@@ -2551,11 +2806,13 @@ mod tests {
             tmap.insert(t.name.clone(), t.clone());
         }
         let empty_fns = HashMap::new();
+        let empty_buses = HashMap::new();
         let ctx = EvalContext {
             templates: &tmap,
             input_signals: HashMap::new(),
             generic_args: Vec::new(),
             functions: &empty_fns,
+            buses: &empty_buses,
         };
         let result = evaluate_template(&templates[0], &ctx);
         assert_eq!(result.outputs.get("x"), Some(&13));
@@ -2570,11 +2827,13 @@ mod tests {
             tmap.insert(t.name.clone(), t.clone());
         }
         let empty_fns = HashMap::new();
+        let empty_buses = HashMap::new();
         let ctx = EvalContext {
             templates: &tmap,
             input_signals: HashMap::new(),
             generic_args: Vec::new(),
             functions: &empty_fns,
+            buses: &empty_buses,
         };
         let result = evaluate_template(&templates[0], &ctx);
         assert_eq!(result.outputs.get("total"), Some(&20));
@@ -2589,11 +2848,13 @@ mod tests {
             tmap.insert(t.name.clone(), t.clone());
         }
         let empty_fns = HashMap::new();
+        let empty_buses = HashMap::new();
         let ctx = EvalContext {
             templates: &tmap,
             input_signals: HashMap::new(),
             generic_args: Vec::new(),
             functions: &empty_fns,
+            buses: &empty_buses,
         };
         let result = evaluate_template(&templates[0], &ctx);
         assert_eq!(result.outputs.get("b"), Some(&100));
