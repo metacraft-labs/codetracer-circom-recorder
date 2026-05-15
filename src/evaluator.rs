@@ -1071,11 +1071,18 @@ impl Parser {
         // assumes `template` keyword already consumed
         let line = self.peek_line();
         // `template custom NAME` (Circom 2.0.6+ pragma custom_templates)
-        // — skip the `custom` modifier so the rest of the parser still
-        // sees `NAME(...)`.  The tracer surfaces the `custom` flag via
-        // its own source-level scan in `find_custom_templates`.
-        if matches!(self.peek(), Tok::Ident(n) if n == "custom") {
-            self.bump();
+        // and `template parallel NAME` (Circom 2.0+ parallel modifier)
+        // — skip either modifier (or both) so the rest of the parser
+        // still sees `NAME(...)`.  The tracer surfaces the `custom`
+        // flag via `find_custom_templates` and the `parallel` flag via
+        // `find_parallel_templates` (independent source-level scans).
+        loop {
+            match self.peek() {
+                Tok::Ident(n) if n == "custom" || n == "parallel" => {
+                    self.bump();
+                }
+                _ => break,
+            }
         }
         let name = self.expect_ident()?;
         self.expect_punct("(")?;
