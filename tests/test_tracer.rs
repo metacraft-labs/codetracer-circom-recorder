@@ -3253,6 +3253,572 @@ fn test_field_arithmetic_test_via_ct_print_full() {
     );
 }
 
+// --- public_signals_test.circom ------------------------------------------
+
+/// Records `public_signals_test.circom`, which exercises the
+/// `component main {public [a, b]} = Foo();` annotation.  Closes the
+/// M12 deferred coverage gap for the public-signal annotation: the
+/// recorder parses the `{public [...]}` clause and surfaces the set
+/// via a dedicated `public_signals` special event so debugger
+/// consumers can render which main inputs are proof-visible.
+#[test]
+fn test_public_signals_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_public_signals_test_via_ct_print_full",
+        "public_signals_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["Foo"]);
+
+    // ----- counts -----------------------------------------------------
+    // Step breakdown:
+    //   * 1 toplevel start step (line 1)
+    //   * 1 step on `component main {public [a, b]} = Foo()` (line 22)
+    //   * 3 signal-input decl steps (lines 14, 15, 16)
+    //   * 1 signal-output decl step (line 17) — bare Step
+    //   * 1 `<==` assignment step (line 19)
+    // = 7 step events.
+    // + 1 call_entry + 1 call_exit + 1 io_event (the public_signals
+    //   special event) = 10 events.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(7), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 10, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    assert_eq!(observed_call_sequence(&doc), vec!["Foo".to_string()]);
+    assert_eq!(observed_exit_sequence(&doc), vec!["Foo".to_string()]);
+
+    // ----- Call_entry args: all three input signals (a, b, c) ---------
+    // Both public and private inputs are staged onto the call frame —
+    // the public/private distinction is a proof-system metadata fact
+    // (which inputs the verifier sees), NOT a recording-trace gating
+    // fact.  Private inputs are still staged so the debugger can
+    // surface every input value during step-through.
+    let call_entries: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .collect();
+    assert_eq!(call_entries.len(), 1);
+    let args = call_entries[0]["args"].as_array().expect("Foo args");
+    assert_eq!(args.len(), 3);
+    assert_eq!(args[0]["varname"].as_str(), Some("a"));
+    assert_eq!(args[1]["varname"].as_str(), Some("b"));
+    assert_eq!(args[2]["varname"].as_str(), Some("c"));
+
+    // ----- Public-signal special event --------------------------------
+    // Exactly ONE io event — the `public_signals` annotation.  The
+    // CTFS multi-stream IO bucket folds `EvmEvent` into the `stderr`
+    // family (see `toIOEventKind` in `codetracer_trace_writer_ffi.nim`),
+    // so the surfaced `io_kind` is `ioStderr`.  The `text` body
+    // carries the discriminator + payload: `public_signals=a,b` (the
+    // comma-joined ordered set of input names declared `public` on
+    // the `component main` line).  Consumers that need to distinguish
+    // public-signal annotations from `circom_log()` output split on
+    // the leading `public_signals=` prefix.
+    let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
+    assert_eq!(io_events.len(), 1);
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["text"].as_str(), Some("public_signals=a,b"),);
+
+    // ----- Exact step lines (in order) --------------------------------
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(
+        step_lines,
+        vec![
+            1, 22, // toplevel + main component
+            14, 15, 16, // signal input a/b/c decl steps
+            17, // signal output sum decl step
+            19, // sum <== a + b + c assignment step
+        ]
+    );
+
+    // ----- Decoded variable values ------------------------------------
+    // All inputs default to 0, so `sum = 0`.  Each input signal
+    // surfaces twice — once on the `component main` step (parent-
+    // frame staging that mirrors the call_entry args list) and once
+    // on its own `signal input` decl line inside the body — and the
+    // assignment surfaces `sum = 0` on the `<==` line.  This is the
+    // same pattern pinned by `circomlib_num2bits` for its `in`
+    // signal.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("a".to_string(), 0),
+            ("b".to_string(), 0),
+            ("c".to_string(), 0),
+            ("a".to_string(), 0),
+            ("b".to_string(), 0),
+            ("c".to_string(), 0),
+            ("sum".to_string(), 0),
+        ],
+    );
+}
+
+// --- custom_template_test.circom -----------------------------------------
+
+/// Records `custom_template_test.circom`, which exercises the
+/// `pragma custom_templates;` + `template custom NAME(...)` pair
+/// (Circom 2.0.6+).  Closes the M12 deferred coverage gap for the
+/// custom-template annotation: the recorder parses the `custom`
+/// modifier on each `template` declaration and surfaces the set via
+/// a dedicated `custom_templates` special event so debugger consumers
+/// can flag custom-gate templates in the function-table view.
+#[test]
+fn test_custom_template_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_custom_template_test_via_ct_print_full",
+        "custom_template_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    // Both templates surface — `XorGate` (the custom-gate template)
+    // and `Driver` (the regular template that instantiates it).  The
+    // ordering matches `parse_template_definitions` source order.
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["XorGate", "Driver"]);
+
+    // ----- Custom-template special event ------------------------------
+    // Exactly ONE io event — the `custom_templates` annotation.  As
+    // with the public-signal annotation, the CTFS multi-stream IO
+    // bucket folds `EvmEvent` into the `stderr` family (see
+    // `toIOEventKind` in `codetracer_trace_writer_ffi.nim`).  The
+    // `text` body carries the discriminator + payload:
+    // `custom_templates=XorGate` (the comma-joined ordered set of
+    // template names declared with the `custom` modifier).
+    let events = doc["events"].as_array().expect("events array");
+    let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
+    assert_eq!(io_events.len(), 1);
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(
+        io_events[0]["text"].as_str(),
+        Some("custom_templates=XorGate"),
+    );
+
+    // ----- counts -----------------------------------------------------
+    // The Driver body wires its inputs into the `gate` sub-component
+    // and reads back `gate.c`.  Step breakdown (lines refer to the
+    // .circom file):
+    //   * 1 toplevel start step (line 1 — `pragma circom 2.0.6;`)
+    //   * 1 step on `component main = Driver()` (line 37)
+    //   * 3 Driver-body decl steps (input a/b/output c — lines
+    //     27, 28, 29)
+    //   * 1 Driver-body sub-component decl step
+    //     (`component gate = XorGate()`, line 31)
+    //   * 2 Driver-side wire steps (`gate.a <== a;` line 32,
+    //     `gate.b <== b;` line 33)
+    //   * 4 XorGate body decl/assignment steps inside the call frame
+    //     (input a/b lines 18/19, output c line 20, `c <-- ...`
+    //     line 21)
+    //   * 3 XorGate `===` constraint steps (lines 22, 23, 24)
+    //   * 1 Driver-side `c <== gate.c;` step (line 34)
+    // = 16 step events + 2 call_entry + 2 call_exit + 1 io_event
+    // = 21 events.
+    let counts = &doc["counts"];
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["Driver".to_string(), "XorGate".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["XorGate".to_string(), "Driver".to_string()]
+    );
+
+    // ----- Discovery snapshot — print step_lines + observed_int_vars
+    // before pinning the strict assertions below.  This block is
+    // load-bearing only when the recorder shape changes; it stays as
+    // documentation of what surfaced when the test was authored.
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+
+    // ----- Exact step lines (in order) --------------------------------
+    // Pinned to the recorder's actual surface.  The custom modifier
+    // doesn't perturb the body-step ordering — only the function-table
+    // metadata + the `custom_templates` special event.
+    assert_eq!(
+        step_lines,
+        vec![
+            1, 38, // toplevel + main component
+            28, 29, 30, // Driver: signal input a/b/output c
+            32, // component gate = XorGate()
+            18, 19, 20, // XorGate: signal input a/b/output c
+            21, // c <-- a + b - 2*a*b
+            22, 23, 24, // three === constraints inside XorGate body
+            33, 34, 35, // Driver-side wires + read-back
+        ]
+    );
+
+    // ----- Decoded variable values ------------------------------------
+    // All inputs default to 0.  The recorder surfaces, in event order:
+    //   * Driver frame: a/b on the component-main step (parent input
+    //     args), then a/b on their own `signal input` decl lines.
+    //   * XorGate-call recurse: a/b are emitted again as the
+    //     XorGate-side input-decl values (the input-decl walk inside
+    //     the XorGate body), and the `c <-- ...` evaluator-step
+    //     surfaces `gate.c` as a parent-frame view of the wire result.
+    //   * Driver-side wire-back of gate.a/gate.b (recurse-up parent
+    //     wire emits) and the final `c <== gate.c;` assignment that
+    //     surfaces `c` in the Driver frame.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("a".to_string(), 0),
+            ("b".to_string(), 0),
+            ("a".to_string(), 0),
+            ("b".to_string(), 0),
+            ("a".to_string(), 0),
+            ("b".to_string(), 0),
+            ("gate.a".to_string(), 0),
+            ("gate.b".to_string(), 0),
+            ("gate.c".to_string(), 0),
+            ("gate.a".to_string(), 0),
+            ("gate.b".to_string(), 0),
+            ("c".to_string(), 0),
+        ],
+    );
+}
+
+// --- signal_tags_test.circom ---------------------------------------------
+
+/// Records `signal_tags_test.circom`, which exercises Circom 2.1+
+/// `signal input {tag}` / `signal input {tag=value}` annotations.
+/// Closes the M12 deferred coverage gap for signal tags: the
+/// recorder parses the `{tag}` / `{tag=value}` annotations on
+/// declarations and surfaces the per-declaration tag set via a
+/// dedicated `signal_tags` special event so debugger consumers can
+/// render the per-signal type-tag metadata alongside the
+/// signal-kind badge.
+#[test]
+fn test_signal_tags_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_signal_tags_test_via_ct_print_full",
+        "signal_tags_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ----------------------------------------------
+    // Inner first (defined first), then Driver.
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["Inner", "Driver"]);
+
+    // ----- Signal-tag special event ------------------------------------
+    // The CTFS multi-stream IO bucket folds `EvmEvent` into the
+    // `stderr` family (see `toIOEventKind` in
+    // `codetracer_trace_writer_ffi.nim`).  The `text` body carries
+    // the discriminator + payload:
+    //   `signal_tags=a:bit;b:maxbit;bit_a:bit;maxbit_b:maxbit`
+    // Semicolons separate per-signal records, the colon separates
+    // the signal name from its comma-joined tag list.  The fixture
+    // declares tags in three places:
+    //   * Inner.a / Inner.b (the inner-template tagged inputs)
+    //   * Driver.bit_a / Driver.maxbit_b (the parent's intermediate
+    //     tagged signals used to attach the tag onto the value
+    //     wired through from the untagged main inputs via `<--`)
+    // The Driver template's own `signal input a` / `signal input b`
+    // are intentionally untagged because Circom rejects a
+    // `component main` whose template declares tagged inputs (see
+    // the typing-error trap in the fixture comment).
+    //
+    // Tag-flow validation: `Inner.a` and `Driver.bit_a` both carry
+    // the same `bit` tag, proving that the tag is recorded at every
+    // declaration site in the wire chain (main → Driver →
+    // bit_a → inner.a → Inner.a) so debugger consumers can verify
+    // the chain end-to-end.
+    let events = doc["events"].as_array().expect("events array");
+    let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
+    assert_eq!(io_events.len(), 1);
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(
+        io_events[0]["text"].as_str(),
+        Some("signal_tags=a:bit;b:maxbit;bit_a:bit;maxbit_b:maxbit"),
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["Driver".to_string(), "Inner".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Inner".to_string(), "Driver".to_string()]
+    );
+}
+
+// --- range_proof_test.circom ---------------------------------------------
+
+/// Records `range_proof_test.circom`, which exercises `Num2Bits(N)`
+/// as a bounded-integer range proof.  Closes the M12 deferred
+/// coverage gap for range proofs by pinning that:
+///   * the in-range `Num2Bits(8)` invocation completes silently
+///     (no constraint-violation events surface from the
+///     in-range path)
+///   * an out-of-range claim surfaces a tagged
+///     `constraint_violation` special event when the structured
+///     evaluator detects that a `===` constraint does not hold
+///     under the current evaluation env (without waiting for the
+///     witness calculator to fail at runtime — `<--` keeps the
+///     witness calculator from rejecting the circuit).
+#[test]
+fn test_range_proof_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_range_proof_test_via_ct_print_full",
+        "range_proof_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    // Range first (the main template), then Num2Bits.
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["Range", "Num2Bits"]);
+
+    // ----- Constraint-violation special event -------------------------
+    // Exactly ONE io event — the synthetic out-of-range
+    // `x_out_of_range_claim === 256` constraint that the structured
+    // evaluator detects as failing (LHS=100 from the `<--` literal
+    // assignment, RHS=256 from the constraint-RHS literal).  The
+    // CTFS multi-stream IO bucket folds `EvmEvent` into the
+    // `stderr` family (see `toIOEventKind` in
+    // `codetracer_trace_writer_ffi.nim`).  The `text` body carries
+    // the discriminator + payload:
+    //   `constraint_violation=constraint violation at line 42:
+    //    lhs=100 != rhs=256`
+    //
+    // The in-range `Num2Bits(8)` instantiation completes silently —
+    // no other io events surface from its body's `===` constraints
+    // because they all hold under the evaluator's symbolic
+    // computation (every default is 0 and the recurse propagates
+    // values consistently).
+    let events = doc["events"].as_array().expect("events array");
+    let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
+    assert_eq!(io_events.len(), 1);
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(
+        io_events[0]["text"].as_str(),
+        Some("constraint_violation=constraint violation at line 42: lhs=100 != rhs=256"),
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    // Range opens first, then Num2Bits inside its body.
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["Range".to_string(), "Num2Bits".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Num2Bits".to_string(), "Range".to_string()]
+    );
+}
+
+// --- multi_line_constraint_test.circom -----------------------------------
+
+/// Records `multi_line_constraint_test.circom`, which exercises a
+/// single `<==` signal-assignment whose RHS expression is split across
+/// four physical source lines.  Closes the M12 deferred coverage gap
+/// for source-formatting resilience — the structured evaluator must
+/// surface a *single* step event for the constraint (carrying the
+/// constructed expression value) rather than four separate steps for
+/// each physical line of the RHS.  This pins the recorder's
+/// "one statement, one step" contract against developer-friendly
+/// multi-line formatting that real-world circomlib circuits routinely
+/// use to keep long algebraic constraints readable.
+#[test]
+fn test_multi_line_constraint_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_multi_line_constraint_test_via_ct_print_full",
+        "multi_line_constraint_test.circom",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table ---------------------------------------------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["MultiLineConstraint"]);
+
+    // ----- counts -----------------------------------------------------
+    // Step breakdown:
+    //   * 1 toplevel start step (line 1)
+    //   * 1 step on `component main = MultiLineConstraint()` (line 44)
+    //   * 1 signal-output decl step (line 22) — bare Step
+    //   * 5 intermediate signal-decl steps (lines 24-28) — bare Steps
+    //   * 5 short-form `<==` assignment steps (lines 30-34)
+    //     carrying Variable events for a..e
+    //   * 1 multi-line `out <== 2*a + 3*b + 4*c + 5*d - e` step
+    //     (line 36 — the line of the LHS `out` token, courtesy of
+    //     the `line_of_op.min(line)` rule in evaluator's parse_stmt)
+    // = 14 step events.  + 1 call_entry + 1 call_exit = 16 events.
+    //
+    // The "single step" property is the load-bearing pin: even though
+    // the RHS spans physical lines 37-41, only ONE step at line 36
+    // surfaces.  Counting `step_lines == 36` below gives exactly 1.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(14), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(14),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 16, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["MultiLineConstraint".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["MultiLineConstraint".to_string()]
+    );
+
+    // ----- Exact step lines (in order) --------------------------------
+    // The multi-line constraint surfaces exactly ONE step at line 36
+    // (the LHS line), not 5 steps for each physical RHS line (37..41).
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| e["line"].as_i64().expect("step.line i64"))
+        .collect();
+    assert_eq!(
+        step_lines,
+        vec![
+            1, 44, // toplevel + main component
+            22, // signal output out
+            24, 25, 26, 27, 28, // intermediate signal decls a..e
+            30, 31, 32, 33, 34, // short-form `<==` assignments
+            36, // single multi-line `out <== ...` step
+        ]
+    );
+
+    // ----- Multi-line constraint surfaces as exactly ONE step --------
+    // Cross-check the load-bearing "one statement, one step" property
+    // independently of the line-list ordering above: NO step event
+    // lands on lines 37..41 (the physical lines occupied by the RHS
+    // expression continuation), and exactly one step lands on line 36.
+    let count_at = |line: i64| -> usize {
+        events
+            .iter()
+            .filter(|e| e["kind"] == "step" && e["line"].as_i64() == Some(line))
+            .count()
+    };
+    assert_eq!(count_at(36), 1, "exactly one step on the LHS line (36)");
+    assert_eq!(count_at(37), 0, "no step on RHS continuation line 37");
+    assert_eq!(count_at(38), 0, "no step on RHS continuation line 38");
+    assert_eq!(count_at(39), 0, "no step on RHS continuation line 39");
+    assert_eq!(count_at(40), 0, "no step on RHS continuation line 40");
+    assert_eq!(count_at(41), 0, "no step on RHS continuation line 41");
+
+    // ----- Decoded variable values ------------------------------------
+    // a=2, b=3, c=4, d=5, e=1.
+    // out = 2*a + 3*b + 4*c + 5*d - e = 4 + 9 + 16 + 25 - 1 = 53.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("a".to_string(), 2),
+            ("b".to_string(), 3),
+            ("c".to_string(), 4),
+            ("d".to_string(), 5),
+            ("e".to_string(), 1),
+            ("out".to_string(), 53),
+        ],
+    );
+}
+
 // ===========================================================================
 // CLI env-var contract
 // ===========================================================================
