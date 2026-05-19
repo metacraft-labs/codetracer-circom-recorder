@@ -786,14 +786,8 @@ impl CircomTracer {
             .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
         let events_path = out_dir.join("trace.bin");
-        let metadata_path = out_dir.join("trace_metadata.json");
-        let paths_path = out_dir.join("trace_paths.json");
 
         TraceWriter::begin_writing_trace_events(&mut *tracer.writer, &events_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_metadata(&mut *tracer.writer, &metadata_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_paths(&mut *tracer.writer, &paths_path)
             .map_err(|e| eyre!("{e}"))?;
 
         TraceWriter::start(&mut *tracer.writer, source_path, Line(1));
@@ -809,8 +803,9 @@ impl CircomTracer {
 
     fn finish_trace(&mut self) -> Result<()> {
         TraceWriter::finish_writing_trace_events(&mut *self.writer).map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_metadata(&mut *self.writer).map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_paths(&mut *self.writer).map_err(|e| eyre!("{e}"))?;
+        self.writer
+            .write_meta_dat("codetracer-circom-recorder")
+            .map_err(|e| eyre!("{e}"))?;
         self.writer.close().map_err(|e| eyre!("{e}"))?;
         Ok(())
     }
