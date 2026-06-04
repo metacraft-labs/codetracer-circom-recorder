@@ -1,0 +1,17 @@
+pkgbase = codetracer-circom-recorder
+	pkgdesc = CodeTracer recorder for Circom zero-knowledge circuit programs
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/metacraft-labs/codetracer-circom-recorder
+	arch = x86_64
+	arch = aarch64
+	license = Apache-2.0
+	makedepends = rust
+	makedepends = cargo
+	depends = glibc
+	depends = zstd
+	provides = codetracer-circom-recorder
+	source = codetracer-circom-recorder-0.1.0.tar.gz::https://github.com/metacraft-labs/codetracer-circom-recorder/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = REPLACE_AT_PUBLISH_TIME_source
+
+pkgname = codetracer-circom-recorder
