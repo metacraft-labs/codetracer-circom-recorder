@@ -715,7 +715,7 @@ impl Parser {
             Tok::Int(s) => {
                 self.bump();
                 let n = s.parse::<i128>().unwrap_or(0);
-                Ok(Expr::Int((n as i64).max(i64::MIN).min(i64::MAX)))
+                Ok(Expr::Int(n.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64))
             }
             Tok::Ident(name) => {
                 self.bump();
@@ -1830,7 +1830,7 @@ fn collect_components_with_wires(
                 args,
                 ..
             } => {
-                let idx = eval_expr(index, env).and_then(|v| v.as_int()).unwrap_or(0) as i64;
+                let idx = eval_expr(index, env).and_then(|v| v.as_int()).unwrap_or(0);
                 let synthetic = format!("{name}[{idx}]");
                 let arg_vals: Vec<i64> = args
                     .iter()
@@ -1955,7 +1955,7 @@ fn collect_components_with_wires(
 /// callers / tests that need a simple "collect everything I see"
 /// view; the structured evaluator now drives sub-component
 /// instantiation through `collect_components_with_wires`.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::only_used_in_recursion)]
 fn collect_components(
     stmts: &[Stmt],
     env: &mut HashMap<String, Value>,
