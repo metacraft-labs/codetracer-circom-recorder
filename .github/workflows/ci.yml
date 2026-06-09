@@ -51,6 +51,18 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y capnproto
 
+      - name: Install circom 2.1 (compiler under test)
+        # The recorder shells out to `circom` to compile witnesses;
+        # the tests in test_ctfs_audit pin against the 2.1 corpus
+        # (see CIRCOM_BIN / CIRCOM_2_2_BIN overrides for the 2.2
+        # bus-type test).  Fetch the official Linux release binary.
+        run: |
+          curl -fSL -o /tmp/circom \
+            https://github.com/iden3/circom/releases/download/v2.1.9/circom-linux-amd64
+          chmod +x /tmp/circom
+          sudo mv /tmp/circom /usr/local/bin/circom
+          circom --version
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
