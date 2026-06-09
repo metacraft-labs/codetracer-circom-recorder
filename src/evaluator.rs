@@ -715,7 +715,9 @@ impl Parser {
             Tok::Int(s) => {
                 self.bump();
                 let n = s.parse::<i128>().unwrap_or(0);
-                Ok(Expr::Int(n.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64))
+                Ok(Expr::Int(
+                    n.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+                ))
             }
             Tok::Ident(name) => {
                 self.bump();
