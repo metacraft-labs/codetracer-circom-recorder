@@ -1653,19 +1653,17 @@ fn bigint_to_i64(val: &BigUint) -> i64 {
         } else {
             0
         }
-    } else {
-        if bytes[8..].iter().all(|&b| b == 0) {
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(&bytes[..8]);
-            let raw = u64::from_le_bytes(buf);
-            if raw <= i64::MAX as u64 {
-                raw as i64
-            } else {
-                0
-            }
+    } else if bytes[8..].iter().all(|&b| b == 0) {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[..8]);
+        let raw = u64::from_le_bytes(buf);
+        if raw <= i64::MAX as u64 {
+            raw as i64
         } else {
             0
         }
+    } else {
+        0
     }
 }
 
