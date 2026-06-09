@@ -45,7 +45,7 @@ fn find_ct_file(out_dir: &std::path::Path) -> PathBuf {
         .expect("failed to read output directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
         .collect();
     assert_eq!(
         entries.len(),
