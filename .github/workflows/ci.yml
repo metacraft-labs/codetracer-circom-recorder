@@ -1,5 +1,9 @@
 name: CI
 
+# Re-plays the project's deterministic dev env on the runner.
+# See:
+#   https://github.com/metacraft-labs/metacraft-dev-guidelines/blob/latest/policies/ci-shared-dev-env.md
+
 on:
   push:
     branches: [main, dev, stable]
@@ -13,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone codetracer-trace-format (Cargo path dependency)
+      - name: Clone codetracer-trace-format sibling
         run: |
           PINS=".github/sibling-pins"
           TF_REF="main"
@@ -31,65 +35,38 @@ jobs:
             git -C "${GITHUB_WORKSPACE}/../codetracer-trace-format" checkout "${TF_REF}"
           fi
 
-      - name: Install Nim
-        uses: jiro4989/setup-nim-action@v2
-        with:
-          nim-version: "2.2.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build Nim trace writer library
+      - name: Clone codetracer-trace-format-nim sibling
         run: |
+          rm -rf "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
           git clone --depth 1 \
             "https://github.com/metacraft-labs/codetracer-trace-format-nim.git" \
             "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
-          cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
-          nimble install -y stew results
-          nim c --app:staticlib --mm:arc --noMain -d:release -p:src \
-            -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
+
+      - name: Setup dev env
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        with:
+          env-flavor: nix
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Nim trace writer library (sibling artifact)
+        # TODO: replace with `direnv exec ../codetracer-trace-format-nim
+        # just build-trace-writer-lib` once the sibling repo ships
+        # that target -- per cross-repo-builds.md.
+        run: |
+          dev-exec bash -c '
+            set -euo pipefail
+            cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
+            nimble install -y stew results
+            nim c --app:staticlib --mm:arc --noMain -d:release -p:src \
+              -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
+          '
           echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "$GITHUB_ENV"
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Lint
+        run: dev-exec just lint
 
-      - name: Install circom 2.1 (compiler under test)
-        # The recorder shells out to `circom` to compile witnesses;
-        # the tests in test_ctfs_audit pin against the 2.1 corpus
-        # (see CIRCOM_BIN / CIRCOM_2_2_BIN overrides for the 2.2
-        # bus-type test).  Fetch the official Linux release binary.
-        run: |
-          curl -fSL -o /tmp/circom \
-            https://github.com/iden3/circom/releases/download/v2.1.9/circom-linux-amd64
-          chmod +x /tmp/circom
-          sudo mv /tmp/circom /usr/local/bin/circom
-          circom --version
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Build
-        run: cargo build --all-targets
-
-      - name: Run tests with zero-test guard
-        run: |
-          set -euo pipefail
-          OUTPUT=$(cargo test --all-targets 2>&1) || { echo "$OUTPUT"; exit 1; }
-          echo "$OUTPUT"
-          # Guard against silently empty test suites
-          if ! echo "$OUTPUT" | grep -qP "test result: ok\. [1-9]"; then
-            echo "::error::Zero tests passed — check that test binaries are compiling correctly"
-            exit 1
-          fi
+      - name: Test
+        run: dev-exec just test
 
       - name: Upload test logs on failure
         if: failure()
