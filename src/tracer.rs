@@ -1350,7 +1350,7 @@ impl CircomTracer {
     /// `signal_prefix` is the component path under which this template
     /// is being called (e.g. `add5.`, `middle.inner.`).  Empty for the
     /// outermost (main) frame.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
     fn evaluate_and_emit(
         &mut self,
         source_path: &Path,
