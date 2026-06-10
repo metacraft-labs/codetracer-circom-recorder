@@ -792,6 +792,30 @@ impl CircomTracer {
 
         TraceWriter::start(&mut *tracer.writer, source_path, Line(1));
 
+        // Open the synthetic ``<toplevel>`` Call frame.  The comments
+        // throughout this recorder and the EVM recorder assume
+        // ``TraceWriter::start()`` opens this depth-0 call, but the
+        // CTFS-era Nim writer's ``trace_writer_start`` only emits a
+        // Step -- it doesn't actually register the ``<toplevel>``
+        // function or emit a Call event for it.  Emit them
+        // explicitly here so the calltrace UI surfaces a real
+        // ``<toplevel>`` frame (which is what the vscode-extension
+        // WDIO smoke tests look for) without changing the
+        // depth-tracking semantics already documented in commit
+        // 9f4bb20: the main template's steps remain at depth 0
+        // inside this synthesised frame (the main template's Call
+        // is intentionally skipped, see ``emit_template_fns``),
+        // sub-components nest at depth 1+, and the closing
+        // ``register_return`` in write_trace closes this frame
+        // back out.
+        let toplevel_fn = TraceWriter::ensure_function_id(
+            &mut *tracer.writer,
+            "<toplevel>",
+            source_path,
+            Line(1),
+        );
+        TraceWriter::register_call(&mut *tracer.writer, toplevel_fn, vec![]);
+
         let field_type_id =
             TraceWriter::ensure_type_id(&mut *tracer.writer, TypeKind::Int, "field");
         tracer.field_type_id = Some(field_type_id);
