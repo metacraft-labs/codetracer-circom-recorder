@@ -30,6 +30,34 @@ fn wasm_err(e: wasmtime::Error) -> eyre::Report {
     eyre!("{}", e)
 }
 
+/// Compute the per-line UTF-8 byte-length table required by the
+/// `paths.dat` Layout A record (column-aware mode).
+///
+/// `line_lengths[i]` is the byte count of source line `i + 1` (1-based,
+/// matching the CTFS spec), excluding the trailing `\n`.  An `\r\n`
+/// terminator contributes its `\r` to the line's byte count, which keeps
+/// the table consistent with byte offsets into the file.  A file that
+/// doesn't end with `\n` still has its final line counted.
+///
+/// Cross-recorder convention (Cairo / EVM / Solana) — see
+/// `codetracer-trace-format-spec/trace-events.md` §"paths.dat per-line
+/// offset table — Layout A".
+fn compute_line_lengths(source: &str) -> Vec<u32> {
+    let bytes = source.as_bytes();
+    let mut lengths: Vec<u32> = Vec::new();
+    let mut line_start: usize = 0;
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            lengths.push((i - line_start) as u32);
+            line_start = i + 1;
+        }
+    }
+    if line_start < bytes.len() {
+        lengths.push((bytes.len() - line_start) as u32);
+    }
+    lengths
+}
+
 // ---------------------------------------------------------------------------
 // Circom witness calculator (real implementation via Wasmtime)
 // ---------------------------------------------------------------------------
@@ -538,7 +566,7 @@ impl CircomTracer {
         // parameter (`TraceEventsFileFormat::{Json,Binary,Ctfs}`) and the
         // CLI exposed a `--format` flag.  The convention now mandates
         // CTFS exclusively.
-        let mut tracer = Self::start_trace(source_path, out_dir)?;
+        let mut tracer = Self::start_trace(source_path, source_code, out_dir)?;
 
         // -- 1. Compile the Circom source --------------------------------------------------
         let compile_dir = tempfile::tempdir()
@@ -769,7 +797,7 @@ impl CircomTracer {
         Ok(())
     }
 
-    fn start_trace(source_path: &Path, out_dir: &Path) -> Result<Self> {
+    fn start_trace(source_path: &Path, source_code: &str, out_dir: &Path) -> Result<Self> {
         // CTFS-only.  Pre-2026-05-08 this method accepted a
         // `TraceEventsFileFormat` parameter and switched the events
         // filename on it; now it pins to the canonical CTFS multi-stream
@@ -789,6 +817,46 @@ impl CircomTracer {
 
         TraceWriter::begin_writing_trace_events(&mut *tracer.writer, &events_path)
             .map_err(|e| eyre!("{e}"))?;
+
+        // FU-Column-Aware-Nav-Circom: opt the canonical CTFS writer into
+        // column-aware step encoding *before* the first `register_step`
+        // / `start` call.  `enable_column_aware_steps` is sticky for the
+        // lifetime of the trace and gates the writer's `DeltaColumn`
+        // (tag 0x07) emission path plus the `meta.dat` bit 4 flag
+        // (`FLAG_HAS_COLUMN_AWARE_STEPS`).  The Circom AST currently
+        // tracks only 1-based line numbers (see `evaluator::EvalEvent`,
+        // `tracer::ComponentInstance`, `SignalDecl`, `SignalAssignment`,
+        // `TemplateDef`); per-step columns therefore resolve to `None`
+        // for now and `register_step_with_column(..., None)` lands the
+        // line transition without an accompanying `DeltaColumn`.
+        // Downstream readers (Cairo / Solana / EVM convention) rely on
+        // the flag being set unconditionally so they know to surface a
+        // `column` field on step events when one ever becomes
+        // available.
+        TraceWriter::enable_column_aware_steps(&mut *tracer.writer);
+
+        // FU-Column-Aware-Nav-Circom: register the source file's per-line
+        // byte-length table BEFORE `TraceWriter::start`.  `start`
+        // internally interns the path (without line-length data), and a
+        // later `register_path_with_line_lengths` for an already-interned
+        // path is silently dropped by the Nim writer.  Registering up
+        // front populates `pathLineLengths` on the writer side so the
+        // reader's `decodeGlobalPositionIndex` has the data it needs
+        // when (and if) per-step columns start landing for Circom.
+        // Mirrors the Cairo / EVM / Solana pattern.
+        let line_lengths = compute_line_lengths(source_code);
+        if let Err(err) = TraceWriter::register_path_with_line_lengths(
+            &mut *tracer.writer,
+            source_path,
+            &line_lengths,
+        ) {
+            eprintln!(
+                "[codetracer-circom-recorder] register_path_with_line_lengths failed for {}: {} \
+                 (column resolution will fall back to None for this file)",
+                source_path.display(),
+                err,
+            );
+        }
 
         TraceWriter::start(&mut *tracer.writer, source_path, Line(1));
 
@@ -1144,7 +1212,19 @@ impl CircomTracer {
         // ------------------------------------------------------------
         // Step 1 — main component step (visible at file scope).
         // ------------------------------------------------------------
-        TraceWriter::register_step(&mut *self.writer, source_path, Line(main_inst.line as i64));
+        // FU-Column-Aware-Nav-Circom: emit through the column-aware
+        // entry point.  Column resolves to `None` because the Circom
+        // parser (and `evaluator::EvalEvent`) carries only line
+        // numbers; downstream tooling still sees the
+        // `has_column_aware_steps` flag so step records remain
+        // column-extensible if/when the parser starts tracking column
+        // info.
+        TraceWriter::register_step_with_column(
+            &mut *self.writer,
+            source_path,
+            Line(main_inst.line as i64),
+            None,
+        );
 
         // Emit the `{public [...]}` annotation (if present on the
         // `component main` line) as a special event so debugger
@@ -1452,10 +1532,15 @@ impl CircomTracer {
         for ev in events {
             match &ev.kind {
                 EvalEventKind::Step => {
-                    TraceWriter::register_step(
+                    // FU-Column-Aware-Nav-Circom: column = None — the
+                    // structured evaluator emits one `Step` per
+                    // executed statement but only tracks the 1-based
+                    // line number.
+                    TraceWriter::register_step_with_column(
                         &mut *self.writer,
                         source_path,
                         Line(ev.line as i64),
+                        None,
                     );
                 }
                 EvalEventKind::Variable {
@@ -1463,10 +1548,11 @@ impl CircomTracer {
                     value,
                     is_bool,
                 } => {
-                    TraceWriter::register_step(
+                    TraceWriter::register_step_with_column(
                         &mut *self.writer,
                         source_path,
                         Line(ev.line as i64),
+                        None,
                     );
                     let printable = if signal_prefix.is_empty() {
                         name.clone()
@@ -1525,10 +1611,11 @@ impl CircomTracer {
                     args,
                 } => {
                     // Step at the component-decl line.
-                    TraceWriter::register_step(
+                    TraceWriter::register_step_with_column(
                         &mut *self.writer,
                         source_path,
                         Line(ev.line as i64),
+                        None,
                     );
                     let Some(&child_fn_id) = template_fns.get(child_template) else {
                         continue;
@@ -1619,7 +1706,14 @@ impl CircomTracer {
                 continue;
             };
 
-            TraceWriter::register_step(&mut *self.writer, source_path, Line(component.line as i64));
+            // FU-Column-Aware-Nav-Circom: legacy-flat path mirrors the
+            // structured path — column = None (parser stores lines only).
+            TraceWriter::register_step_with_column(
+                &mut *self.writer,
+                source_path,
+                Line(component.line as i64),
+                None,
+            );
             let is_main = component.name == "main";
             for input_name in &template.input_signals {
                 let lookup_key: String = if is_main {
@@ -1641,10 +1735,20 @@ impl CircomTracer {
         }
 
         for sig in signals {
-            TraceWriter::register_step(&mut *self.writer, source_path, Line(sig.line as i64));
+            TraceWriter::register_step_with_column(
+                &mut *self.writer,
+                source_path,
+                Line(sig.line as i64),
+                None,
+            );
         }
         for assign in assignments {
-            TraceWriter::register_step(&mut *self.writer, source_path, Line(assign.line as i64));
+            TraceWriter::register_step_with_column(
+                &mut *self.writer,
+                source_path,
+                Line(assign.line as i64),
+                None,
+            );
             if let Some(&val) = values.get(&assign.target) {
                 let value = ValueRecord::Int {
                     i: val,
