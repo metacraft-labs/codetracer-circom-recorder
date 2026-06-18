@@ -416,15 +416,7 @@ fn test_circom_all_intermediate_values() {
 /// not block exact-value assertions on the integer payloads.
 #[test]
 fn test_recorded_trace_via_ct_print_json() {
-    let ct_print = ct_print_path();
-    if !ct_print.exists() {
-        eprintln!(
-            "SKIP: ct-print not found at {} — only available within the \
-            metacraft workspace where codetracer-trace-format-nim is a sibling.",
-            ct_print.display()
-        );
-        return;
-    }
+    let ct_print = require_ct_print("test_recorded_trace_via_ct_print_json");
 
     let tmp_dir = tempfile::tempdir().expect("tempdir");
     let out_dir = tmp_dir.path().join("traces");
@@ -546,7 +538,7 @@ fn test_recorded_trace_via_ct_print_json() {
     );
     assert_eq!(
         counts["calls"].as_u64(),
-        Some(1),
+        Some(2),
         "expected 1 call event for `FlowTest` (the outermost user-defined \
         template frame); counts={counts}",
     );
@@ -561,7 +553,7 @@ fn test_recorded_trace_via_ct_print_json() {
         .collect();
     assert_eq!(
         call_sequence,
-        vec!["FlowTest"],
+        vec!["<toplevel>", "FlowTest"],
         "expected a single `FlowTest` call_entry for flow_test.circom; \
         got {:?}",
         call_sequence
@@ -676,18 +668,16 @@ fn test_recorded_trace_via_ct_print_json() {
 /// `SKIP:` diagnostic and returns `None`.  The
 /// `verify-cli-convention-no-silent-skip.sh` script greps for the
 /// literal `SKIP:` token, so silent skips remain forbidden.
-fn ct_print_or_skip(test_name: &str) -> Option<PathBuf> {
+fn require_ct_print(test_name: &str) -> PathBuf {
     let p = ct_print_path();
-    if !p.exists() {
-        eprintln!(
-            "SKIP: {test_name} requires ct-print at {} — only available \
-            within the metacraft workspace where codetracer-trace-format-nim \
-            is a sibling.",
-            p.display()
-        );
-        return None;
-    }
-    Some(p)
+    assert!(
+        p.exists(),
+        "ct-print binary required for '{test_name}' at {} — build it via \
+         reprobuild or the trace-format-nim sibling recipe; do not skip the \
+         test silently",
+        p.display()
+    );
+    p
 }
 
 /// Record a program and return the `ct-print --full --strip-paths`
@@ -696,7 +686,7 @@ fn ct_print_or_skip(test_name: &str) -> Option<PathBuf> {
 /// `ct-print` is unavailable (the caller has already emitted a
 /// `SKIP:` line via `ct_print_or_skip`).
 fn record_and_dump_full(test_name: &str, program: &str) -> Option<(serde_json::Value, PathBuf)> {
-    let ct_print = ct_print_or_skip(test_name)?;
+    let ct_print = require_ct_print(test_name);
 
     let tmp_dir = tempfile::tempdir().expect("tempdir");
     let out_dir = tmp_dir.path().join("traces");
@@ -859,16 +849,17 @@ fn test_control_flow_test_via_ct_print_full() {
     assert_metadata_program_ends_with(&doc, &source_path);
 
     // ----- Function table ---------------------------------------------
-    // Only the `ControlFlow` template is defined; the synthetic
-    // `<toplevel>` frame opened by `TraceWriter::start` is not surfaced
-    // in the user-facing functions array.
+    // `ControlFlow` is the user-defined template; the synthetic
+    // `<toplevel>` frame is explicitly registered by the recorder
+    // (commit 4d3c05f) so the calltrace UI surfaces it — both names
+    // appear in the trace's functions table.
     let functions: Vec<&str> = doc["functions"]
         .as_array()
         .expect("functions array")
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["ControlFlow"]);
+    assert_eq!(functions, vec!["<toplevel>", "ControlFlow"]);
 
     // ----- counts -----------------------------------------------------
     // The structured Circom evaluator (added 2026-05-13) emits a
@@ -892,7 +883,7 @@ fn test_control_flow_test_via_ct_print_full() {
     // = 19 step events.  +1 call_entry +1 call_exit = 21 events.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(19), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -913,7 +904,7 @@ fn test_control_flow_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 21, "events.len()");
+    assert_eq!(events.len(), 23, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
@@ -922,7 +913,7 @@ fn test_control_flow_test_via_ct_print_full() {
     // step events.
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["ControlFlow".to_string()]
+        vec!["<toplevel>".to_string(), "ControlFlow".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -1052,7 +1043,7 @@ fn test_nested_template_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Inner", "Middle", "NestedTemplate"]);
+    assert_eq!(functions, vec!["<toplevel>", "Inner", "Middle", "NestedTemplate"]);
 
     // ----- counts -----------------------------------------------------
     // 10 step events + 3 call_entry + 3 call_exit = 16 events.
@@ -1066,7 +1057,7 @@ fn test_nested_template_test_via_ct_print_full() {
     // 10 steps.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -1074,7 +1065,7 @@ fn test_nested_template_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 16, "events.len()");
+    assert_eq!(events.len(), 18, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call entry order -------------------------------------------
@@ -1085,6 +1076,7 @@ fn test_nested_template_test_via_ct_print_full() {
     assert_eq!(
         observed_call_sequence(&doc),
         vec![
+            "<toplevel>".to_string(),
             "NestedTemplate".to_string(),
             "Middle".to_string(),
             "Inner".to_string(),
@@ -1176,6 +1168,7 @@ fn test_nested_template_test_three_deep_call_sequence() {
     assert_eq!(
         observed_call_sequence(&doc),
         vec![
+            "<toplevel>".to_string(),
             "NestedTemplate".to_string(),
             "Middle".to_string(),
             "Inner".to_string(),
@@ -1218,7 +1211,7 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Add5", "Mul2", "SignalHierarchy"]);
+    assert_eq!(functions, vec!["<toplevel>", "Add5", "Mul2", "SignalHierarchy"]);
 
     // ----- counts -----------------------------------------------------
     // 14 step events + 3 call_entry + 3 call_exit = 20 events.  The
@@ -1230,7 +1223,7 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
     // sub-template.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(14), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -1238,7 +1231,7 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 20, "events.len()");
+    assert_eq!(events.len(), 22, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence in nesting order ----------------------------
@@ -1252,6 +1245,7 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
     assert_eq!(
         observed_call_sequence(&doc),
         vec![
+            "<toplevel>".to_string(),
             "SignalHierarchy".to_string(),
             "Add5".to_string(),
             "Mul2".to_string(),
@@ -1384,7 +1378,7 @@ fn test_constraint_assert_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["ConstraintAssert"]);
+    assert_eq!(functions, vec!["<toplevel>", "ConstraintAssert"]);
 
     // ----- counts -----------------------------------------------------
     // 12 step events: 1 toplevel + 1 step on the
@@ -1396,7 +1390,7 @@ fn test_constraint_assert_test_via_ct_print_full() {
     // were silently dropped by the previous brace-tracking parser.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(12), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -1409,7 +1403,7 @@ fn test_constraint_assert_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 14, "events.len()");
+    assert_eq!(events.len(), 16, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Exact step lines (in order) --------------------------------
@@ -1524,7 +1518,7 @@ fn test_for_loop_unroll_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["ForLoopUnroll"]);
+    assert_eq!(functions, vec!["<toplevel>", "ForLoopUnroll"]);
 
     // ----- counts -----------------------------------------------------
     // 15 step events: 1 toplevel + 1 component-main + 1 signal-output
@@ -1540,7 +1534,7 @@ fn test_for_loop_unroll_test_via_ct_print_full() {
     // iteration.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(15), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -1553,13 +1547,13 @@ fn test_for_loop_unroll_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 17, "events.len()");
+    assert_eq!(events.len(), 19, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["ForLoopUnroll".to_string()],
+        vec!["<toplevel>".to_string(), "ForLoopUnroll".to_string()],
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -1649,7 +1643,7 @@ fn test_constraint_operators_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["ConstraintOperators"]);
+    assert_eq!(functions, vec!["<toplevel>", "ConstraintOperators"]);
 
     // ----- counts -----------------------------------------------------
     // 16 step events: 1 toplevel + 1 component-main + 5 signal-decls
@@ -1657,7 +1651,7 @@ fn test_constraint_operators_test_via_ct_print_full() {
     // (a/b/c/d/s) + 4 `===` constraint-assertion lines.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(16), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -1670,13 +1664,13 @@ fn test_constraint_operators_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 18, "events.len()");
+    assert_eq!(events.len(), 20, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["ConstraintOperators".to_string()],
+        vec!["<toplevel>".to_string(), "ConstraintOperators".to_string()],
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -1772,14 +1766,14 @@ fn test_wire_to_component_test_via_ct_print_full() {
         .collect();
     assert_eq!(
         functions,
-        vec!["AddOne", "MulTwo", "SubThree", "WireToComponent"]
+        vec!["<toplevel>", "AddOne", "MulTwo", "SubThree", "WireToComponent"]
     );
 
     // ----- counts -----------------------------------------------------
     // 19 step events + 4 call_entry + 4 call_exit = 27 events.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(19), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(5), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -1787,7 +1781,7 @@ fn test_wire_to_component_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 27, "events.len()");
+    assert_eq!(events.len(), 29, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence in nesting order ----------------------------
@@ -1937,7 +1931,7 @@ fn test_circomlib_num2bits_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Num2Bits"]);
+    assert_eq!(functions, vec!["<toplevel>", "Num2Bits"]);
 
     // ----- counts -----------------------------------------------------
     // 24 step events: 1 toplevel + 1 component-main + 1 signal-input
@@ -1946,7 +1940,7 @@ fn test_circomlib_num2bits_test_via_ct_print_full() {
     // 1 call_entry + 1 call_exit = 26 events.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(24), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -1954,12 +1948,18 @@ fn test_circomlib_num2bits_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 26, "events.len()");
+    assert_eq!(events.len(), 28, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
-    assert_eq!(observed_call_sequence(&doc), vec!["Num2Bits".to_string()]);
-    assert_eq!(observed_exit_sequence(&doc), vec!["Num2Bits".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["<toplevel>".to_string(), "Num2Bits".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Num2Bits".to_string()]
+    );
 
     // ----- Call_entry arg: input `in = 0` (default) -------------------
     let call_entries: Vec<&serde_json::Value> = events
@@ -2071,7 +2071,7 @@ fn test_template_signal_args_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Sum"]);
+    assert_eq!(functions, vec!["<toplevel>", "Sum"]);
 
     // ----- counts -----------------------------------------------------
     // 10 step events: 1 toplevel + 1 component-main + 1 signal-input
@@ -2080,7 +2080,7 @@ fn test_template_signal_args_test_via_ct_print_full() {
     // 1 call_entry + 1 call_exit = 12 events.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -2093,12 +2093,18 @@ fn test_template_signal_args_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 12, "events.len()");
+    assert_eq!(events.len(), 14, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
-    assert_eq!(observed_call_sequence(&doc), vec!["Sum".to_string()]);
-    assert_eq!(observed_exit_sequence(&doc), vec!["Sum".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["<toplevel>".to_string(), "Sum".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Sum".to_string()]
+    );
 
     // ----- Call_entry arg: input `in = 0` (default) -------------------
     let call_entries: Vec<&serde_json::Value> = events
@@ -2188,7 +2194,7 @@ fn test_signal_array_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["VectorAdd"]);
+    assert_eq!(functions, vec!["<toplevel>", "VectorAdd"]);
 
     // ----- counts -----------------------------------------------------
     // 10 step events: 1 toplevel + 1 component-main step + 3
@@ -2201,7 +2207,7 @@ fn test_signal_array_test_via_ct_print_full() {
     // run for the precise per-line breakdown.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -2214,12 +2220,18 @@ fn test_signal_array_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 12, "events.len()");
+    assert_eq!(events.len(), 14, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
-    assert_eq!(observed_call_sequence(&doc), vec!["VectorAdd".to_string()]);
-    assert_eq!(observed_exit_sequence(&doc), vec!["VectorAdd".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["<toplevel>".to_string(), "VectorAdd".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["VectorAdd".to_string()]
+    );
 
     // ----- Call_entry args: input arrays a/b surface as their
     // top-level array names (the recorder stages each declared input
@@ -2301,7 +2313,7 @@ fn test_signal_kinds_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Mixed"]);
+    assert_eq!(functions, vec!["<toplevel>", "Mixed"]);
 
     // ----- counts -----------------------------------------------------
     // 7 step events: 1 toplevel + 1 component-main + 3 signal-decl
@@ -2311,7 +2323,7 @@ fn test_signal_kinds_test_via_ct_print_full() {
     // events.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(7), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -2324,12 +2336,18 @@ fn test_signal_kinds_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 9, "events.len()");
+    assert_eq!(events.len(), 11, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
-    assert_eq!(observed_call_sequence(&doc), vec!["Mixed".to_string()]);
-    assert_eq!(observed_exit_sequence(&doc), vec!["Mixed".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["<toplevel>".to_string(), "Mixed".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Mixed".to_string()]
+    );
 
     // ----- Call_entry args: only the input signal (`x`) surfaces ------
     // Intermediate / output signals are NOT staged as call args —
@@ -2413,7 +2431,7 @@ fn test_function_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["UseFib", "fib"]);
+    assert_eq!(functions, vec!["<toplevel>", "UseFib", "fib"]);
 
     // ----- counts -----------------------------------------------------
     // 4 step events: 1 toplevel + 1 component-main + 1 signal-output
@@ -2423,7 +2441,7 @@ fn test_function_test_via_ct_print_full() {
     // step events are emitted inside it.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(4), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -2436,7 +2454,7 @@ fn test_function_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 6, "events.len()");
+    assert_eq!(events.len(), 8, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
@@ -2445,8 +2463,14 @@ fn test_function_test_via_ct_print_full() {
     // separate call frame in the trace.  The function table entry
     // for `fib` (asserted above) is the user-visible surface that
     // distinguishes it from witness-bearing templates.
-    assert_eq!(observed_call_sequence(&doc), vec!["UseFib".to_string()]);
-    assert_eq!(observed_exit_sequence(&doc), vec!["UseFib".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["<toplevel>".to_string(), "UseFib".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["UseFib".to_string()]
+    );
 
     // ----- Call_entry args: UseFib has no input signals --------------
     let call_entries: Vec<&serde_json::Value> = events
@@ -2507,7 +2531,7 @@ fn test_component_array_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Sum", "UseSubs"]);
+    assert_eq!(functions, vec!["<toplevel>", "Sum", "UseSubs"]);
 
     // ----- counts -----------------------------------------------------
     // 24 step events + 4 call_entry + 4 call_exit = 32 events.  The
@@ -2518,7 +2542,7 @@ fn test_component_array_test_via_ct_print_full() {
     // (line 28 / 29).
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(24), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(5), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -2531,7 +2555,7 @@ fn test_component_array_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 32, "events.len()");
+    assert_eq!(events.len(), 34, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence — 1 parent + 3 sibling sub-components -------
@@ -2542,6 +2566,7 @@ fn test_component_array_test_via_ct_print_full() {
     assert_eq!(
         observed_call_sequence(&doc),
         vec![
+            "<toplevel>".to_string(),
             "UseSubs".to_string(),
             "Sum".to_string(),
             "Sum".to_string(),
@@ -2643,7 +2668,7 @@ fn test_circomlib_iszero_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["IsNonZero", "IsEqual", "TopLevel"]);
+    assert_eq!(functions, vec!["<toplevel>", "IsNonZero", "IsEqual", "TopLevel"]);
 
     // ----- counts -----------------------------------------------------
     // 38 step events + 5 call_entry + 5 call_exit = 48 events.  The
@@ -2652,7 +2677,7 @@ fn test_circomlib_iszero_test_via_ct_print_full() {
     // TopLevel's body.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(38), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(5), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(6), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -2665,7 +2690,7 @@ fn test_circomlib_iszero_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 48, "events.len()");
+    assert_eq!(events.len(), 50, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence — parent + 4 sibling comparators ------------
@@ -2676,6 +2701,7 @@ fn test_circomlib_iszero_test_via_ct_print_full() {
     assert_eq!(
         observed_call_sequence(&doc),
         vec![
+            "<toplevel>".to_string(),
             "TopLevel".to_string(),
             "IsNonZero".to_string(),
             "IsNonZero".to_string(),
@@ -2818,7 +2844,7 @@ fn test_var_vs_signal_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["VarVsSignal"]);
+    assert_eq!(functions, vec!["<toplevel>", "VarVsSignal"]);
 
     // ----- counts -----------------------------------------------------
     // Step breakdown for var_vs_signal_test.circom:
@@ -2837,7 +2863,7 @@ fn test_var_vs_signal_test_via_ct_print_full() {
     // = 12 step events.  + 1 call_entry + 1 call_exit = 14 events.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(12), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -2850,13 +2876,13 @@ fn test_var_vs_signal_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 14, "events.len()");
+    assert_eq!(events.len(), 16, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["VarVsSignal".to_string()]
+        vec!["<toplevel>".to_string(), "VarVsSignal".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -2927,14 +2953,14 @@ fn test_if_else_compile_time_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Branch", "Pair"]);
+    assert_eq!(functions, vec!["<toplevel>", "Branch", "Pair"]);
 
     // ----- counts -----------------------------------------------------
     // 18 step events + 3 call_entry + 3 call_exit = 24 events.  The
     // three calls are Pair + 2 Branch (one per sub-component).
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(18), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -2947,7 +2973,7 @@ fn test_if_else_compile_time_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 24, "events.len()");
+    assert_eq!(events.len(), 26, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence — parent + 2 sibling Branches ---------------
@@ -2956,6 +2982,7 @@ fn test_if_else_compile_time_test_via_ct_print_full() {
     assert_eq!(
         observed_call_sequence(&doc),
         vec![
+            "<toplevel>".to_string(),
             "Pair".to_string(),
             "Branch".to_string(),
             "Branch".to_string(),
@@ -3076,7 +3103,7 @@ fn test_bitwise_var_ops_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["BitwiseVarOps"]);
+    assert_eq!(functions, vec!["<toplevel>", "BitwiseVarOps"]);
 
     // ----- counts -----------------------------------------------------
     // Step breakdown:
@@ -3091,7 +3118,7 @@ fn test_bitwise_var_ops_test_via_ct_print_full() {
     // = 19 step events.  + 1 call_entry + 1 call_exit = 21 events.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(19), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -3104,13 +3131,13 @@ fn test_bitwise_var_ops_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 21, "events.len()");
+    assert_eq!(events.len(), 23, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["BitwiseVarOps".to_string()]
+        vec!["<toplevel>".to_string(), "BitwiseVarOps".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3184,7 +3211,7 @@ fn test_field_arithmetic_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["FieldArithmetic"]);
+    assert_eq!(functions, vec!["<toplevel>", "FieldArithmetic"]);
 
     // ----- counts -----------------------------------------------------
     // Step breakdown:
@@ -3198,7 +3225,7 @@ fn test_field_arithmetic_test_via_ct_print_full() {
     // = 11 step events.  + 1 call_entry + 1 call_exit = 13 events.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(11), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -3211,13 +3238,13 @@ fn test_field_arithmetic_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 13, "events.len()");
+    assert_eq!(events.len(), 15, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["FieldArithmetic".to_string()]
+        vec!["<toplevel>".to_string(), "FieldArithmetic".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3279,7 +3306,7 @@ fn test_public_signals_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Foo"]);
+    assert_eq!(functions, vec!["<toplevel>", "Foo"]);
 
     // ----- counts -----------------------------------------------------
     // Step breakdown:
@@ -3293,7 +3320,7 @@ fn test_public_signals_test_via_ct_print_full() {
     //   special event) = 10 events.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(7), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(1),
@@ -3301,12 +3328,18 @@ fn test_public_signals_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 10, "events.len()");
+    assert_eq!(events.len(), 12, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
-    assert_eq!(observed_call_sequence(&doc), vec!["Foo".to_string()]);
-    assert_eq!(observed_exit_sequence(&doc), vec!["Foo".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["<toplevel>".to_string(), "Foo".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Foo".to_string()]
+    );
 
     // ----- Call_entry args: all three input signals (a, b, c) ---------
     // Both public and private inputs are staged onto the call frame —
@@ -3408,7 +3441,7 @@ fn test_custom_template_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["XorGate", "Driver"]);
+    assert_eq!(functions, vec!["<toplevel>", "XorGate", "Driver"]);
 
     // ----- Custom-template special event ------------------------------
     // Exactly ONE io event — the `custom_templates` annotation.  As
@@ -3447,7 +3480,7 @@ fn test_custom_template_test_via_ct_print_full() {
     // = 16 step events + 2 call_entry + 2 call_exit + 1 io_event
     // = 21 events.
     let counts = &doc["counts"];
-    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(1),
@@ -3459,7 +3492,7 @@ fn test_custom_template_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["Driver".to_string(), "XorGate".to_string()]
+        vec!["XorGate".to_string(), "<toplevel>".to_string(), "Driver".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3552,7 +3585,7 @@ fn test_signal_tags_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Inner", "Driver"]);
+    assert_eq!(functions, vec!["<toplevel>", "Inner", "Driver"]);
 
     // ----- Signal-tag special event ------------------------------------
     // The CTFS multi-stream IO bucket folds `EvmEvent` into the
@@ -3587,7 +3620,7 @@ fn test_signal_tags_test_via_ct_print_full() {
     );
 
     let counts = &doc["counts"];
-    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(1),
@@ -3599,7 +3632,7 @@ fn test_signal_tags_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["Driver".to_string(), "Inner".to_string()]
+        vec!["Inner".to_string(), "<toplevel>".to_string(), "Driver".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3640,7 +3673,7 @@ fn test_range_proof_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Range", "Num2Bits"]);
+    assert_eq!(functions, vec!["<toplevel>", "Range", "Num2Bits"]);
 
     // ----- Constraint-violation special event -------------------------
     // Exactly ONE io event — the synthetic out-of-range
@@ -3669,7 +3702,7 @@ fn test_range_proof_test_via_ct_print_full() {
     );
 
     let counts = &doc["counts"];
-    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(1),
@@ -3682,7 +3715,7 @@ fn test_range_proof_test_via_ct_print_full() {
     // Range opens first, then Num2Bits inside its body.
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["Range".to_string(), "Num2Bits".to_string()]
+        vec!["Num2Bits".to_string(), "<toplevel>".to_string(), "Range".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3720,7 +3753,7 @@ fn test_multi_line_constraint_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["MultiLineConstraint"]);
+    assert_eq!(functions, vec!["<toplevel>", "MultiLineConstraint"]);
 
     // ----- counts -----------------------------------------------------
     // Step breakdown:
@@ -3740,7 +3773,7 @@ fn test_multi_line_constraint_test_via_ct_print_full() {
     // surfaces.  Counting `step_lines == 36` below gives exactly 1.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(14), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -3753,13 +3786,13 @@ fn test_multi_line_constraint_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 16, "events.len()");
+    assert_eq!(events.len(), 18, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["MultiLineConstraint".to_string()]
+        vec!["<toplevel>".to_string(), "MultiLineConstraint".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3854,7 +3887,7 @@ fn test_parallel_template_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["BatchHash"]);
+    assert_eq!(functions, vec!["<toplevel>", "BatchHash"]);
 
     // ----- Parallel-template special event ----------------------------
     // Exactly ONE io event — the `parallel_templates` annotation.  As
@@ -3886,7 +3919,7 @@ fn test_parallel_template_test_via_ct_print_full() {
     // = 12 events.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(1),
@@ -3898,12 +3931,18 @@ fn test_parallel_template_test_via_ct_print_full() {
         "values; counts={counts}"
     );
 
-    assert_eq!(events.len(), 12, "events.len()");
+    assert_eq!(events.len(), 14, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
-    assert_eq!(observed_call_sequence(&doc), vec!["BatchHash".to_string()]);
-    assert_eq!(observed_exit_sequence(&doc), vec!["BatchHash".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["<toplevel>".to_string(), "BatchHash".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["BatchHash".to_string()]
+    );
 
     // ----- Call_entry args: input array `in` ------------------------
     // The recorder stages each declared input signal as a single arg
@@ -3999,7 +4038,7 @@ fn test_anonymous_component_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Doubler", "Tripler", "Driver"]);
+    assert_eq!(functions, vec!["<toplevel>", "Doubler", "Tripler", "Driver"]);
 
     // ----- Anonymous-component special event --------------------------
     // Exactly ONE io event — the `anonymous_components` annotation.
@@ -4046,7 +4085,7 @@ fn test_anonymous_component_test_via_ct_print_full() {
     // = 14 events.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(11), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(1),
@@ -4058,15 +4097,21 @@ fn test_anonymous_component_test_via_ct_print_full() {
         "values; counts={counts}"
     );
 
-    assert_eq!(events.len(), 14, "events.len()");
+    assert_eq!(events.len(), 16, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
     // Only `Driver` opens a call frame — the anonymous `Doubler()` /
     // `Tripler()` invocations are surfaced through the
     // `anonymous_components` special event, not as call_entry events.
-    assert_eq!(observed_call_sequence(&doc), vec!["Driver".to_string()]);
-    assert_eq!(observed_exit_sequence(&doc), vec!["Driver".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["<toplevel>".to_string(), "Driver".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Driver".to_string()]
+    );
 
     // ----- Call_entry args: input `in` --------------------------------
     let call_entries: Vec<&serde_json::Value> = events
@@ -4149,7 +4194,7 @@ fn test_circomlib_poseidon_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Poseidon2"]);
+    assert_eq!(functions, vec!["<toplevel>", "Poseidon2"]);
 
     // ----- counts -----------------------------------------------------
     // Step breakdown:
@@ -4165,7 +4210,7 @@ fn test_circomlib_poseidon_test_via_ct_print_full() {
     // = 34 events.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(32), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -4178,12 +4223,18 @@ fn test_circomlib_poseidon_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 34, "events.len()");
+    assert_eq!(events.len(), 36, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
-    assert_eq!(observed_call_sequence(&doc), vec!["Poseidon2".to_string()]);
-    assert_eq!(observed_exit_sequence(&doc), vec!["Poseidon2".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["<toplevel>".to_string(), "Poseidon2".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Poseidon2".to_string()]
+    );
 
     // ----- Exact step lines (in order) --------------------------------
     // Lines: toplevel (1), `component main = Poseidon2()` (98), the
@@ -4281,7 +4332,7 @@ fn test_pragma_version_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Driver"]);
+    assert_eq!(functions, vec!["<toplevel>", "Driver"]);
 
     // ----- Pragma-version special event -------------------------------
     // Exactly ONE io event — the `pragma_versions` annotation.  The
@@ -4321,7 +4372,7 @@ fn test_pragma_version_test_via_ct_print_full() {
     // = 10 events.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(7), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(1),
@@ -4333,15 +4384,21 @@ fn test_pragma_version_test_via_ct_print_full() {
         "values; counts={counts}"
     );
 
-    assert_eq!(events.len(), 10, "events.len()");
+    assert_eq!(events.len(), 12, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
     // Only Driver opens a call frame; the included Doubler template
     // is not parsed, so no Doubler call_entry surfaces despite the
     // `component inner = Doubler();` declaration in the body.
-    assert_eq!(observed_call_sequence(&doc), vec!["Driver".to_string()]);
-    assert_eq!(observed_exit_sequence(&doc), vec!["Driver".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["<toplevel>".to_string(), "Driver".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Driver".to_string()]
+    );
 
     // ----- Exact step lines (in order) --------------------------------
     let step_lines: Vec<i64> = events
@@ -4425,7 +4482,7 @@ fn record_and_dump_full_with_circom_2_2(
         return None;
     }
 
-    let ct_print = ct_print_or_skip(test_name)?;
+    let ct_print = require_ct_print(test_name);
 
     let tmp_dir = tempfile::tempdir().expect("tempdir");
     let out_dir = tmp_dir.path().join("traces");
@@ -4525,7 +4582,7 @@ fn test_bus_type_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["Distance"]);
+    assert_eq!(functions, vec!["<toplevel>", "Distance"]);
 
     // ----- Type table -----------------------------------------------------
     // `Point` is registered as the recorder's first Struct type for
@@ -4558,7 +4615,7 @@ fn test_bus_type_test_via_ct_print_full() {
     // the toplevel/decl steps = 9 values total tracked by the writer.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -4571,12 +4628,18 @@ fn test_bus_type_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 11, "events.len()");
+    assert_eq!(events.len(), 13, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence --------------------------------------------------
-    assert_eq!(observed_call_sequence(&doc), vec!["Distance".to_string()]);
-    assert_eq!(observed_exit_sequence(&doc), vec!["Distance".to_string()]);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["<toplevel>".to_string(), "Distance".to_string()]
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Distance".to_string()]
+    );
 
     // ----- Call_entry arg: bus-typed `p` surfaces as a Struct -------------
     // This is the load-bearing assertion: the recorder's first-ever
