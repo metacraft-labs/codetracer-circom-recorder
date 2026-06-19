@@ -913,7 +913,7 @@ fn test_control_flow_test_via_ct_print_full() {
     // step events.
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["ControlFlow".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "ControlFlow".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -1556,7 +1556,7 @@ fn test_for_loop_unroll_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["ForLoopUnroll".to_string(), "<toplevel>".to_string()],
+        vec!["<toplevel>".to_string(), "ForLoopUnroll".to_string()],
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -1673,7 +1673,7 @@ fn test_constraint_operators_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["ConstraintOperators".to_string(), "<toplevel>".to_string()],
+        vec!["<toplevel>".to_string(), "ConstraintOperators".to_string()],
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -1821,7 +1821,7 @@ fn test_wire_to_component_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
-    assert_eq!(call_entries.len(), 4);
+    assert_eq!(call_entries.len(), 5);
 
     assert_eq!(
         call_entries[0]["args"].as_array().expect("args").len(),
@@ -1959,7 +1959,7 @@ fn test_circomlib_num2bits_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["Num2Bits".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "Num2Bits".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -2104,7 +2104,7 @@ fn test_template_signal_args_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["Sum".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "Sum".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -2231,7 +2231,7 @@ fn test_signal_array_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["VectorAdd".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "VectorAdd".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -2347,7 +2347,7 @@ fn test_signal_kinds_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["Mixed".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "Mixed".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -2470,7 +2470,7 @@ fn test_function_test_via_ct_print_full() {
     // distinguishes it from witness-bearing templates.
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["UseFib".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "UseFib".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -2889,7 +2889,7 @@ fn test_var_vs_signal_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["VarVsSignal".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "VarVsSignal".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3145,7 +3145,7 @@ fn test_bitwise_var_ops_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["BitwiseVarOps".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "BitwiseVarOps".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3252,7 +3252,7 @@ fn test_field_arithmetic_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["FieldArithmetic".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "FieldArithmetic".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3342,7 +3342,7 @@ fn test_public_signals_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["Foo".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "Foo".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3500,7 +3500,7 @@ fn test_custom_template_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["<toplevel>".to_string(), "Driver".to_string(), "XorGate".to_string()]
+        vec!["XorGate".to_string(), "Driver".to_string(), "<toplevel>".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3640,7 +3640,7 @@ fn test_signal_tags_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["<toplevel>".to_string(), "Driver".to_string(), "Inner".to_string()]
+        vec!["Inner".to_string(), "Driver".to_string(), "<toplevel>".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3723,7 +3723,7 @@ fn test_range_proof_test_via_ct_print_full() {
     // Range opens first, then Num2Bits inside its body.
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["<toplevel>".to_string(), "Range".to_string(), "Num2Bits".to_string()]
+        vec!["Num2Bits".to_string(), "Range".to_string(), "<toplevel>".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3800,7 +3800,7 @@ fn test_multi_line_constraint_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["MultiLineConstraint".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "MultiLineConstraint".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -3945,7 +3945,7 @@ fn test_parallel_template_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["BatchHash".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "BatchHash".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -4114,7 +4114,7 @@ fn test_anonymous_component_test_via_ct_print_full() {
     // `anonymous_components` special event, not as call_entry events.
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["Driver".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "Driver".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -4237,7 +4237,7 @@ fn test_circomlib_poseidon_test_via_ct_print_full() {
     // ----- Call sequence ----------------------------------------------
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["Poseidon2".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "Poseidon2".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
@@ -4401,7 +4401,7 @@ fn test_pragma_version_test_via_ct_print_full() {
     // `component inner = Doubler();` declaration in the body.
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["Driver".to_string(), "<toplevel>".to_string()]
+        vec!["<toplevel>".to_string(), "Driver".to_string()]
     );
     assert_eq!(
         observed_exit_sequence(&doc),
