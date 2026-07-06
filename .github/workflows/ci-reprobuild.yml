@@ -78,6 +78,16 @@ jobs:
           echo "$xz_bin" >> "$GITHUB_PATH"
           "$xz_bin/xz" --version
 
+      - name: Add circom for Circom fixtures
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          circom_out="$(nix build --no-link --print-out-paths github:metacraft-labs/nix-blockchain-development#circom)"
+          circom_bin="${circom_out}/bin"
+          echo "$circom_bin" >> "$GITHUB_PATH"
+          "$circom_bin/circom" --version
+
       - name: Prepare macOS linker paths
         if: matrix.os == 'macos'
         shell: bash
@@ -99,7 +109,8 @@ jobs:
         # `repro.nim`. Verifies the primary shipping artefact (the
         # recorder binary or extension) materialises through the
         # reprobuild engine. Circom is provided by the prepared dev
-        # shell rather than the reprobuild Nix package catalog.
+        # shell / explicit PATH setup rather than the reprobuild Nix
+        # package catalog.
         run: dev-exec repro build --tool-provisioning=path --no-runquota
 
       - name: repro test
