@@ -98,14 +98,15 @@ jobs:
         # Builds the conventional `build` collection declared in
         # `repro.nim`. Verifies the primary shipping artefact (the
         # recorder binary or extension) materialises through the
-        # reprobuild engine.
-        run: dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'path' || 'nix' }} --no-runquota
+        # reprobuild engine. Circom is provided by the prepared dev
+        # shell rather than the reprobuild Nix package catalog.
+        run: dev-exec repro build --tool-provisioning=path --no-runquota
 
       - name: repro test
         # Materialises the `test` collection.
         env:
           REPROBUILD_NO_RUNQUOTA: "1"
-        run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'path' || 'nix' }}
+        run: dev-exec repro test --tool-provisioning=path
 
       - name: Upload logs on failure
         if: failure()
