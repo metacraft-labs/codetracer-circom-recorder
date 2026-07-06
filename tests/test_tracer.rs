@@ -792,6 +792,18 @@ fn observed_exit_sequence(doc: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// Decode user-template call entries, excluding the synthetic
+/// `<toplevel>` frame emitted by the trace writer.
+fn observed_user_call_entries(doc: &serde_json::Value) -> Vec<&serde_json::Value> {
+    doc["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .filter(|e| e["function"].as_str() != Some("<toplevel>"))
+        .collect()
+}
+
 /// Assert that every `step` event carries a strictly increasing
 /// `step_index`.  This is the recorder's only ordering guarantee
 /// against duplicates / reorderings.
@@ -1276,11 +1288,8 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
     // sub-component's input signal is staged with the value the
     // structured evaluator wired into it from the parent's
     // `<comp>.in <== expr;` site (4 for add5.x, 9 for mul2.in).
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
-    assert_eq!(call_entries.len(), 4);
+    let call_entries = observed_user_call_entries(&doc);
+    assert_eq!(call_entries.len(), 3);
 
     let sig_hier_args = call_entries[0]["args"]
         .as_array()
@@ -1288,7 +1297,7 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
     assert_eq!(sig_hier_args.len(), 0);
 
     let add5_args = call_entries[1]["args"].as_array().expect("Add5 args");
-    assert_eq!(add5_args.len(), 0);
+    assert_eq!(add5_args.len(), 1);
     assert_eq!(add5_args[0]["varname"].as_str(), Some("x"));
     assert_eq!(add5_args[0]["value"]["kind"].as_str(), Some("Int"));
     assert_eq!(add5_args[0]["value"]["i"].as_i64(), Some(4));
@@ -1829,11 +1838,8 @@ fn test_wire_to_component_test_via_ct_print_full() {
     // input signal staged from the parent's wire site.  AddOne.x = 5
     // (literal), MulTwo.in = step1.out = 6, SubThree.in = step2.out
     // = 12.  WireToComponent has no input signals.
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
-    assert_eq!(call_entries.len(), 5);
+    let call_entries = observed_user_call_entries(&doc);
+    assert_eq!(call_entries.len(), 4);
 
     assert_eq!(
         call_entries[0]["args"].as_array().expect("args").len(),
@@ -1842,7 +1848,7 @@ fn test_wire_to_component_test_via_ct_print_full() {
     );
 
     let add1 = call_entries[1]["args"].as_array().expect("AddOne args");
-    assert_eq!(add1.len(), 0);
+    assert_eq!(add1.len(), 1);
     assert_eq!(add1[0]["varname"].as_str(), Some("x"));
     assert_eq!(add1[0]["value"]["i"].as_i64(), Some(5));
 
@@ -1979,10 +1985,7 @@ fn test_circomlib_num2bits_test_via_ct_print_full() {
     );
 
     // ----- Call_entry arg: input `in = 0` (default) -------------------
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
+    let call_entries = observed_user_call_entries(&doc);
     assert_eq!(call_entries.len(), 1);
     let args = call_entries[0]["args"].as_array().expect("Num2Bits args");
     assert_eq!(args.len(), 1);
@@ -2124,10 +2127,7 @@ fn test_template_signal_args_test_via_ct_print_full() {
     );
 
     // ----- Call_entry arg: input `in = 0` (default) -------------------
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
+    let call_entries = observed_user_call_entries(&doc);
     assert_eq!(call_entries.len(), 1);
     let args = call_entries[0]["args"].as_array().expect("Sum args");
     assert_eq!(args.len(), 1);
@@ -2255,10 +2255,7 @@ fn test_signal_array_test_via_ct_print_full() {
     // signal as a single arg in the call frame; the per-element
     // values are surfaced through the body's c[i] <== a[i] + b[i]
     // assignments below).
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
+    let call_entries = observed_user_call_entries(&doc);
     assert_eq!(call_entries.len(), 1);
     let args = call_entries[0]["args"].as_array().expect("VectorAdd args");
     assert_eq!(args.len(), 2);
@@ -2370,10 +2367,7 @@ fn test_signal_kinds_test_via_ct_print_full() {
     // Intermediate / output signals are NOT staged as call args —
     // they're declared inside the template body and assigned via
     // `<==`, so they only appear in step events.
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
+    let call_entries = observed_user_call_entries(&doc);
     assert_eq!(call_entries.len(), 1);
     let args = call_entries[0]["args"].as_array().expect("Mixed args");
     assert_eq!(args.len(), 1);
@@ -2490,10 +2484,7 @@ fn test_function_test_via_ct_print_full() {
     );
 
     // ----- Call_entry args: UseFib has no input signals --------------
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
+    let call_entries = observed_user_call_entries(&doc);
     assert_eq!(call_entries.len(), 1);
     let args = call_entries[0]["args"].as_array().expect("UseFib args");
     assert_eq!(args.len(), 0);
@@ -2605,13 +2596,10 @@ fn test_component_array_test_via_ct_print_full() {
     // (defaults to 0 because `in[i]` defaults to 0 with no main
     // signal-input wiring).  UseSubs carries a single `in` arg
     // (default 0).
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
-    assert_eq!(call_entries.len(), 5);
+    let call_entries = observed_user_call_entries(&doc);
+    assert_eq!(call_entries.len(), 4);
     let parent_args = call_entries[0]["args"].as_array().expect("UseSubs args");
-    assert_eq!(parent_args.len(), 0);
+    assert_eq!(parent_args.len(), 1);
     assert_eq!(parent_args[0]["varname"].as_str(), Some("in"));
     assert_eq!(parent_args[0]["value"]["i"].as_i64(), Some(0));
     for child in &call_entries[1..] {
@@ -2912,10 +2900,7 @@ fn test_var_vs_signal_test_via_ct_print_full() {
     );
 
     // ----- Call_entry args: VarVsSignal has no input signals --------
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
+    let call_entries = observed_user_call_entries(&doc);
     assert_eq!(call_entries.len(), 1);
     let args = call_entries[0]["args"].as_array().expect("args");
     assert_eq!(args.len(), 0);
@@ -3021,17 +3006,14 @@ fn test_if_else_compile_time_test_via_ct_print_full() {
     );
 
     // ----- Call_entry args: each Branch carries `x = 0` --------------
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
-    assert_eq!(call_entries.len(), 4);
+    let call_entries = observed_user_call_entries(&doc);
+    assert_eq!(call_entries.len(), 3);
     // Pair has no input signals.
     let pair_args = call_entries[0]["args"].as_array().expect("Pair args");
     assert_eq!(pair_args.len(), 0);
     for branch in &call_entries[1..] {
         let args = branch["args"].as_array().expect("Branch args");
-        assert_eq!(args.len(), 0);
+        assert_eq!(args.len(), 1);
         assert_eq!(args[0]["varname"].as_str(), Some("x"));
         assert_eq!(args[0]["value"]["i"].as_i64(), Some(0));
     }
@@ -3370,10 +3352,7 @@ fn test_public_signals_test_via_ct_print_full() {
     // (which inputs the verifier sees), NOT a recording-trace gating
     // fact.  Private inputs are still staged so the debugger can
     // surface every input value during step-through.
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
+    let call_entries = observed_user_call_entries(&doc);
     assert_eq!(call_entries.len(), 1);
     let args = call_entries[0]["args"].as_array().expect("Foo args");
     assert_eq!(args.len(), 3);
@@ -3523,7 +3502,11 @@ fn test_custom_template_test_via_ct_print_full() {
     );
     assert_eq!(
         observed_exit_sequence(&doc),
-        vec!["XorGate".to_string(), "Driver".to_string()]
+        vec![
+            "XorGate".to_string(),
+            "Driver".to_string(),
+            "<toplevel>".to_string()
+        ]
     );
 
     // ----- Discovery snapshot — print step_lines + observed_int_vars
@@ -3667,7 +3650,11 @@ fn test_signal_tags_test_via_ct_print_full() {
     );
     assert_eq!(
         observed_exit_sequence(&doc),
-        vec!["Inner".to_string(), "Driver".to_string()]
+        vec![
+            "Inner".to_string(),
+            "Driver".to_string(),
+            "<toplevel>".to_string()
+        ]
     );
 }
 
@@ -3754,7 +3741,11 @@ fn test_range_proof_test_via_ct_print_full() {
     );
     assert_eq!(
         observed_exit_sequence(&doc),
-        vec!["Num2Bits".to_string(), "Range".to_string()]
+        vec![
+            "Num2Bits".to_string(),
+            "Range".to_string(),
+            "<toplevel>".to_string()
+        ]
     );
 }
 
@@ -3983,10 +3974,7 @@ fn test_parallel_template_test_via_ct_print_full() {
     // The recorder stages each declared input signal as a single arg
     // in the call frame; the per-element values surface through the
     // body's `out[i] <== in[i] * in[i]` assignments below.
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
+    let call_entries = observed_user_call_entries(&doc);
     assert_eq!(call_entries.len(), 1);
     let args = call_entries[0]["args"].as_array().expect("BatchHash args");
     assert_eq!(args.len(), 1);
@@ -4152,10 +4140,7 @@ fn test_anonymous_component_test_via_ct_print_full() {
     );
 
     // ----- Call_entry args: input `in` --------------------------------
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
+    let call_entries = observed_user_call_entries(&doc);
     assert_eq!(call_entries.len(), 1);
     let args = call_entries[0]["args"].as_array().expect("Driver args");
     assert_eq!(args.len(), 1);
@@ -4687,10 +4672,7 @@ fn test_bus_type_test_via_ct_print_full() {
     // `field_values` mirrors the bus declaration's field order:
     // `signal x; signal y;` -> two field-element `Int 0` values, both
     // typed as `field` (type_id 0).
-    let call_entries: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e["kind"] == "call_entry")
-        .collect();
+    let call_entries = observed_user_call_entries(&doc);
     assert_eq!(call_entries.len(), 1);
     let args = call_entries[0]["args"].as_array().expect("Distance args");
     assert_eq!(args.len(), 1, "Distance has one bus-typed input arg");
