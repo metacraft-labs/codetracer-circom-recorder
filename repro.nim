@@ -80,6 +80,7 @@ package codetracer_circom_recorder:
     # supplies the same versions.
     "rustc >=1.85"
     "cargo >=1.85"
+    "just >=1"
 
     # Nim toolchain — the sibling ``codetracer_trace_writer_nim`` crate's
     # build.rs compiles a Nim FFI static library at cargo build time via
