@@ -1280,20 +1280,23 @@ fn test_signal_hierarchy_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // user templates follow in FIFO nesting order at indices 1..4.
     assert_eq!(call_entries.len(), 4);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
 
-    let sig_hier_args = call_entries[0]["args"]
+    let sig_hier_args = call_entries[1]["args"]
         .as_array()
         .expect("SignalHierarchy args");
     assert_eq!(sig_hier_args.len(), 0);
 
-    let add5_args = call_entries[1]["args"].as_array().expect("Add5 args");
-    assert_eq!(add5_args.len(), 0);
+    let add5_args = call_entries[2]["args"].as_array().expect("Add5 args");
+    assert_eq!(add5_args.len(), 1);
     assert_eq!(add5_args[0]["varname"].as_str(), Some("x"));
     assert_eq!(add5_args[0]["value"]["kind"].as_str(), Some("Int"));
     assert_eq!(add5_args[0]["value"]["i"].as_i64(), Some(4));
 
-    let mul2_args = call_entries[2]["args"].as_array().expect("Mul2 args");
+    let mul2_args = call_entries[3]["args"].as_array().expect("Mul2 args");
     assert_eq!(mul2_args.len(), 1);
     assert_eq!(mul2_args[0]["varname"].as_str(), Some("in"));
     assert_eq!(mul2_args[0]["value"]["kind"].as_str(), Some("Int"));
@@ -1833,25 +1836,28 @@ fn test_wire_to_component_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // user templates follow in FIFO nesting order at indices 1..5.
     assert_eq!(call_entries.len(), 5);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
 
     assert_eq!(
-        call_entries[0]["args"].as_array().expect("args").len(),
+        call_entries[1]["args"].as_array().expect("args").len(),
         0,
         "WireToComponent has no input signals"
     );
 
-    let add1 = call_entries[1]["args"].as_array().expect("AddOne args");
-    assert_eq!(add1.len(), 0);
+    let add1 = call_entries[2]["args"].as_array().expect("AddOne args");
+    assert_eq!(add1.len(), 1);
     assert_eq!(add1[0]["varname"].as_str(), Some("x"));
     assert_eq!(add1[0]["value"]["i"].as_i64(), Some(5));
 
-    let mul2 = call_entries[2]["args"].as_array().expect("MulTwo args");
+    let mul2 = call_entries[3]["args"].as_array().expect("MulTwo args");
     assert_eq!(mul2.len(), 1);
     assert_eq!(mul2[0]["varname"].as_str(), Some("in"));
     assert_eq!(mul2[0]["value"]["i"].as_i64(), Some(6));
 
-    let sub3 = call_entries[3]["args"].as_array().expect("SubThree args");
+    let sub3 = call_entries[4]["args"].as_array().expect("SubThree args");
     assert_eq!(sub3.len(), 1);
     assert_eq!(sub3[0]["varname"].as_str(), Some("in"));
     assert_eq!(sub3[0]["value"]["i"].as_i64(), Some(12));
@@ -1980,8 +1986,11 @@ fn test_circomlib_num2bits_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
-    assert_eq!(call_entries.len(), 1);
-    let args = call_entries[0]["args"].as_array().expect("Num2Bits args");
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // user template `Num2Bits` is the second (and only user) call.
+    assert_eq!(call_entries.len(), 2);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
+    let args = call_entries[1]["args"].as_array().expect("Num2Bits args");
     assert_eq!(args.len(), 1);
     assert_eq!(args[0]["varname"].as_str(), Some("in"));
     assert_eq!(args[0]["value"]["i"].as_i64(), Some(0));
@@ -2122,8 +2131,11 @@ fn test_template_signal_args_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
-    assert_eq!(call_entries.len(), 1);
-    let args = call_entries[0]["args"].as_array().expect("Sum args");
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // user template `Sum` is the second (and only user) call.
+    assert_eq!(call_entries.len(), 2);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
+    let args = call_entries[1]["args"].as_array().expect("Sum args");
     assert_eq!(args.len(), 1);
     assert_eq!(args[0]["varname"].as_str(), Some("in"));
     assert_eq!(args[0]["value"]["i"].as_i64(), Some(0));
@@ -2250,8 +2262,11 @@ fn test_signal_array_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
-    assert_eq!(call_entries.len(), 1);
-    let args = call_entries[0]["args"].as_array().expect("VectorAdd args");
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // user template `VectorAdd` is the second (and only user) call.
+    assert_eq!(call_entries.len(), 2);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
+    let args = call_entries[1]["args"].as_array().expect("VectorAdd args");
     assert_eq!(args.len(), 2);
     assert_eq!(args[0]["varname"].as_str(), Some("a"));
     assert_eq!(args[0]["value"]["i"].as_i64(), Some(0));
@@ -2362,8 +2377,11 @@ fn test_signal_kinds_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
-    assert_eq!(call_entries.len(), 1);
-    let args = call_entries[0]["args"].as_array().expect("Mixed args");
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // user template `Mixed` is the second (and only user) call.
+    assert_eq!(call_entries.len(), 2);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
+    let args = call_entries[1]["args"].as_array().expect("Mixed args");
     assert_eq!(args.len(), 1);
     assert_eq!(args[0]["varname"].as_str(), Some("x"));
     assert_eq!(args[0]["value"]["i"].as_i64(), Some(0));
@@ -2479,8 +2497,11 @@ fn test_function_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
-    assert_eq!(call_entries.len(), 1);
-    let args = call_entries[0]["args"].as_array().expect("UseFib args");
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // user template `UseFib` is the second (and only user) call.
+    assert_eq!(call_entries.len(), 2);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
+    let args = call_entries[1]["args"].as_array().expect("UseFib args");
     assert_eq!(args.len(), 0);
 
     // ----- Exact step lines (in order) --------------------------------
@@ -2594,12 +2615,16 @@ fn test_component_array_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // parent `UseSubs` is call_entries[1] and the three `Sum` children
+    // follow at indices 2..5.
     assert_eq!(call_entries.len(), 5);
-    let parent_args = call_entries[0]["args"].as_array().expect("UseSubs args");
-    assert_eq!(parent_args.len(), 0);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
+    let parent_args = call_entries[1]["args"].as_array().expect("UseSubs args");
+    assert_eq!(parent_args.len(), 1);
     assert_eq!(parent_args[0]["varname"].as_str(), Some("in"));
     assert_eq!(parent_args[0]["value"]["i"].as_i64(), Some(0));
-    for child in &call_entries[1..] {
+    for child in &call_entries[2..] {
         let args = child["args"].as_array().expect("Sum args");
         assert_eq!(args.len(), 1);
         assert_eq!(args[0]["varname"].as_str(), Some("x"));
@@ -2901,8 +2926,11 @@ fn test_var_vs_signal_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
-    assert_eq!(call_entries.len(), 1);
-    let args = call_entries[0]["args"].as_array().expect("args");
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // user template `VarVsSignal` is the second (and only user) call.
+    assert_eq!(call_entries.len(), 2);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
+    let args = call_entries[1]["args"].as_array().expect("args");
     assert_eq!(args.len(), 0);
 
     // ----- Exact step lines (in order) --------------------------------
@@ -3010,13 +3038,17 @@ fn test_if_else_compile_time_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // parent `Pair` is call_entries[1] and the two `Branch` children
+    // follow at indices 2..4.
     assert_eq!(call_entries.len(), 4);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
     // Pair has no input signals.
-    let pair_args = call_entries[0]["args"].as_array().expect("Pair args");
+    let pair_args = call_entries[1]["args"].as_array().expect("Pair args");
     assert_eq!(pair_args.len(), 0);
-    for branch in &call_entries[1..] {
+    for branch in &call_entries[2..] {
         let args = branch["args"].as_array().expect("Branch args");
-        assert_eq!(args.len(), 0);
+        assert_eq!(args.len(), 1);
         assert_eq!(args[0]["varname"].as_str(), Some("x"));
         assert_eq!(args[0]["value"]["i"].as_i64(), Some(0));
     }
@@ -3356,8 +3388,11 @@ fn test_public_signals_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
-    assert_eq!(call_entries.len(), 1);
-    let args = call_entries[0]["args"].as_array().expect("Foo args");
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // user template `Foo` is the second (and only user) call.
+    assert_eq!(call_entries.len(), 2);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
+    let args = call_entries[1]["args"].as_array().expect("Foo args");
     assert_eq!(args.len(), 3);
     assert_eq!(args[0]["varname"].as_str(), Some("a"));
     assert_eq!(args[1]["varname"].as_str(), Some("b"));
@@ -3505,7 +3540,11 @@ fn test_custom_template_test_via_ct_print_full() {
     );
     assert_eq!(
         observed_exit_sequence(&doc),
-        vec!["XorGate".to_string(), "Driver".to_string()]
+        vec![
+            "XorGate".to_string(),
+            "Driver".to_string(),
+            "<toplevel>".to_string()
+        ]
     );
 
     // ----- Discovery snapshot — print step_lines + observed_int_vars
@@ -3522,16 +3561,19 @@ fn test_custom_template_test_via_ct_print_full() {
     // Pinned to the recorder's actual surface.  The custom modifier
     // doesn't perturb the body-step ordering — only the function-table
     // metadata + the `custom_templates` special event.
+    // Custom templates forbid R1CS constraints in the body (CG02), so
+    // XorGate's `<--` witness assignment is the only body statement —
+    // there are NO `===` constraint steps.  The Driver-side `<==`
+    // constraints are legal because Driver is a regular template.
     assert_eq!(
         step_lines,
         vec![
-            1, 38, // toplevel + main component
-            28, 29, 30, // Driver: signal input a/b/output c
-            32, // component gate = XorGate()
-            18, 19, 20, // XorGate: signal input a/b/output c
-            21, // c <-- a + b - 2*a*b
-            22, 23, 24, // three === constraints inside XorGate body
-            33, 34, 35, // Driver-side wires + read-back
+            1, 40, // toplevel + main component
+            30, 31, 32, // Driver: signal input a/b/output c
+            34, // component gate = XorGate()
+            23, 24, 25, // XorGate: signal input a/b/output c
+            26, // c <-- a + b - 2*a*b
+            35, 36, 37, // Driver-side wires + read-back
         ]
     );
 
@@ -3649,7 +3691,11 @@ fn test_signal_tags_test_via_ct_print_full() {
     );
     assert_eq!(
         observed_exit_sequence(&doc),
-        vec!["Inner".to_string(), "Driver".to_string()]
+        vec![
+            "Inner".to_string(),
+            "Driver".to_string(),
+            "<toplevel>".to_string()
+        ]
     );
 }
 
@@ -3736,7 +3782,11 @@ fn test_range_proof_test_via_ct_print_full() {
     );
     assert_eq!(
         observed_exit_sequence(&doc),
-        vec!["Num2Bits".to_string(), "Range".to_string()]
+        vec![
+            "Num2Bits".to_string(),
+            "Range".to_string(),
+            "<toplevel>".to_string()
+        ]
     );
 }
 
@@ -3966,8 +4016,11 @@ fn test_parallel_template_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
-    assert_eq!(call_entries.len(), 1);
-    let args = call_entries[0]["args"].as_array().expect("BatchHash args");
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // user template `BatchHash` is the second (and only user) call.
+    assert_eq!(call_entries.len(), 2);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
+    let args = call_entries[1]["args"].as_array().expect("BatchHash args");
     assert_eq!(args.len(), 1);
     assert_eq!(args[0]["varname"].as_str(), Some("in"));
     assert_eq!(args[0]["value"]["i"].as_i64(), Some(0));
@@ -4132,8 +4185,13 @@ fn test_anonymous_component_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
-    assert_eq!(call_entries.len(), 1);
-    let args = call_entries[0]["args"].as_array().expect("Driver args");
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // user template `Driver` is the second (and only user) call — the
+    // anonymous Doubler()/Tripler() invocations surface via the
+    // `anonymous_components` special event, not as call_entry events.
+    assert_eq!(call_entries.len(), 2);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
+    let args = call_entries[1]["args"].as_array().expect("Driver args");
     assert_eq!(args.len(), 1);
     assert_eq!(args[0]["varname"].as_str(), Some("in"));
     assert_eq!(args[0]["value"]["i"].as_i64(), Some(0));
@@ -4658,8 +4716,11 @@ fn test_bus_type_test_via_ct_print_full() {
         .iter()
         .filter(|e| e["kind"] == "call_entry")
         .collect();
-    assert_eq!(call_entries.len(), 1);
-    let args = call_entries[0]["args"].as_array().expect("Distance args");
+    // call_entries[0] is the synthetic `<toplevel>` root frame; the
+    // user template `Distance` is the second (and only user) call.
+    assert_eq!(call_entries.len(), 2);
+    assert_eq!(call_entries[0]["function"].as_str(), Some("<toplevel>"));
+    let args = call_entries[1]["args"].as_array().expect("Distance args");
     assert_eq!(args.len(), 1, "Distance has one bus-typed input arg");
     assert_eq!(args[0]["varname"].as_str(), Some("p"));
     assert_eq!(args[0]["value"]["kind"].as_str(), Some("Struct"));
