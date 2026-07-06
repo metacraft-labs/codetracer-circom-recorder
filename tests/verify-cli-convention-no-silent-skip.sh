@@ -29,7 +29,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # script stays focused on verification results.
 ( cd "${REPO_ROOT}" && cargo build --locked --quiet )
 
-BIN="${REPO_ROOT}/target/debug/codetracer-circom-recorder"
+TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+BIN="${TARGET_DIR}/debug/codetracer-circom-recorder"
 if [[ ! -x "${BIN}" ]]; then
   echo "ERROR: recorder binary not found at ${BIN}" >&2
   exit 1
