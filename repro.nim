@@ -419,11 +419,20 @@ package codetracer_circom_recorder:
     # recorder is built), then runs the freshly-built debug binary at
     # ``target/debug/codetracer-circom-recorder``; ``after`` the cargo
     # test-build edge guarantees that binary exists before the script
-    # runs. Non-cacheable: the script inspects a runtime binary via
-    # automatic monitoring and asserts on ``--help`` text, so it is
-    # re-run every ``repro test`` pass (matching ``just test``).
+    # runs. Export the Nim dependency paths for that raw cargo build so
+    # the sibling build.rs does not call ``nimble install`` inside the
+    # reprobuild materialization checkout. Non-cacheable: the script
+    # inspects a runtime binary via automatic monitoring and asserts on
+    # ``--help`` text, so it is re-run every ``repro test`` pass
+    # (matching ``just test``).
     let cliVerify = shell(
-      command = "bash tests/verify-cli-convention-no-silent-skip.sh",
+      command =
+        "set -euo pipefail; " &
+        "trace_nim_paths=\"$PWD/.reprobuild-src/libs/results/src:" &
+          "$PWD/.reprobuild-src/libs/nim-stew/src\"; " &
+        "CODETRACER_TRACE_FORMAT_NIM_SKIP_NIMBLE_INSTALL=1 " &
+        "CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS=\"$trace_nim_paths\" " &
+        "bash tests/verify-cli-convention-no-silent-skip.sh",
       actionId = "codetracer-circom-recorder.verify-cli-convention",
       after = @[testsBuild.action],
       extraInputs = @[
