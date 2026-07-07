@@ -115,6 +115,13 @@ proc findProviderZstdIncludeDir(libDir: string): string =
       if fileExists(dir / "zstd.h"):
         return dir
 
+package circom:
+  provisioning:
+    nixPackage "github:metacraft-labs/nix-blockchain-development#circom",
+      executablePath = "bin/circom",
+      packageId = "circom@2.1.5",
+      lockIdentity = "github:metacraft-labs/nix-blockchain-development#circom"
+
 package codetracer_circom_recorder:
   defaultToolProvisioning "path"
 
