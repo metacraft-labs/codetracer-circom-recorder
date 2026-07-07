@@ -10,6 +10,9 @@ license = "Apache-2.0"
 name = "codetracer-circom-recorder"
 path = "src/main.rs"
 
+[lib]
+doctest = false
+
 [dependencies]
 codetracer_trace_types = { path = "../codetracer-trace-format/codetracer_trace_types" }
 codetracer_trace_writer_nim = { path = "../codetracer-trace-format/codetracer_trace_writer_nim" }
