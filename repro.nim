@@ -211,6 +211,7 @@ package codetracer_circom_recorder:
     let recorderBuild = cargo.build(
       locked = true,
       release = true,
+      targetDir = "target",
       actionId = "codetracer-circom-recorder.cargo-build",
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
@@ -386,6 +387,7 @@ package codetracer_circom_recorder:
     let testsBuild = cargo.test(
       locked = true,
       noRun = true,
+      targetDir = "target",
       actionId = "codetracer-circom-recorder.cargo-test-build",
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
@@ -396,6 +398,7 @@ package codetracer_circom_recorder:
 
     let testsRun = cargo.test(
       locked = true,
+      targetDir = "target",
       actionId = "codetracer-circom-recorder.cargo-test-run",
       after = @[testsBuild.action, ctPrintBuild],
       extraInputs = @[
