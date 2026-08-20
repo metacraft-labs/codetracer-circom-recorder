@@ -112,6 +112,11 @@ package codetracer_circom_recorder:
     # ``.circom`` test fixtures the integration tests record against; it
     # is provisioned by ensure-circom.ps1 on Windows.
     "circom"
+    # `choco pack` / `choco push` in .github/workflows/publish-chocolatey.yml.
+    # Windows-guarded because Chocolatey is a Windows package manager with no
+    # POSIX build, so an unguarded entry would fail to resolve on Linux/macOS.
+    when defined(windows):
+      "chocolatey"
 
   executable codetracerCircomRecorder:
     name: "codetracer-circom-recorder"
