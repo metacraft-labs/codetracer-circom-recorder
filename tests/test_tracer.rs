@@ -1979,7 +1979,10 @@ fn test_circomlib_num2bits_test_via_ct_print_full() {
         observed_call_sequence(&doc),
         vec!["<toplevel>".to_string(), "Num2Bits".to_string()]
     );
-    assert_eq!(observed_exit_sequence(&doc), vec!["Num2Bits".to_string(), "<toplevel>".to_string()]);
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Num2Bits".to_string(), "<toplevel>".to_string()]
+    );
 
     // ----- Call_entry arg: input `in = 0` (default) -------------------
     let call_entries: Vec<&serde_json::Value> = events
@@ -2124,7 +2127,10 @@ fn test_template_signal_args_test_via_ct_print_full() {
         observed_call_sequence(&doc),
         vec!["<toplevel>".to_string(), "Sum".to_string()]
     );
-    assert_eq!(observed_exit_sequence(&doc), vec!["Sum".to_string(), "<toplevel>".to_string()]);
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Sum".to_string(), "<toplevel>".to_string()]
+    );
 
     // ----- Call_entry arg: input `in = 0` (default) -------------------
     let call_entries: Vec<&serde_json::Value> = events
@@ -2251,7 +2257,10 @@ fn test_signal_array_test_via_ct_print_full() {
         observed_call_sequence(&doc),
         vec!["<toplevel>".to_string(), "VectorAdd".to_string()]
     );
-    assert_eq!(observed_exit_sequence(&doc), vec!["VectorAdd".to_string(), "<toplevel>".to_string()]);
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["VectorAdd".to_string(), "<toplevel>".to_string()]
+    );
 
     // ----- Call_entry args: input arrays a/b surface as their
     // top-level array names (the recorder stages each declared input
@@ -2367,7 +2376,10 @@ fn test_signal_kinds_test_via_ct_print_full() {
         observed_call_sequence(&doc),
         vec!["<toplevel>".to_string(), "Mixed".to_string()]
     );
-    assert_eq!(observed_exit_sequence(&doc), vec!["Mixed".to_string(), "<toplevel>".to_string()]);
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Mixed".to_string(), "<toplevel>".to_string()]
+    );
 
     // ----- Call_entry args: only the input signal (`x`) surfaces ------
     // Intermediate / output signals are NOT staged as call args —
@@ -2490,7 +2502,10 @@ fn test_function_test_via_ct_print_full() {
         observed_call_sequence(&doc),
         vec!["<toplevel>".to_string(), "UseFib".to_string()]
     );
-    assert_eq!(observed_exit_sequence(&doc), vec!["UseFib".to_string(), "<toplevel>".to_string()]);
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["UseFib".to_string(), "<toplevel>".to_string()]
+    );
 
     // ----- Call_entry args: UseFib has no input signals --------------
     let call_entries: Vec<&serde_json::Value> = events
@@ -3376,7 +3391,10 @@ fn test_public_signals_test_via_ct_print_full() {
         observed_call_sequence(&doc),
         vec!["<toplevel>".to_string(), "Foo".to_string()]
     );
-    assert_eq!(observed_exit_sequence(&doc), vec!["Foo".to_string(), "<toplevel>".to_string()]);
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Foo".to_string(), "<toplevel>".to_string()]
+    );
 
     // ----- Call_entry args: all three input signals (a, b, c) ---------
     // Both public and private inputs are staged onto the call frame —
@@ -4006,7 +4024,10 @@ fn test_parallel_template_test_via_ct_print_full() {
         observed_call_sequence(&doc),
         vec!["<toplevel>".to_string(), "BatchHash".to_string()]
     );
-    assert_eq!(observed_exit_sequence(&doc), vec!["BatchHash".to_string(), "<toplevel>".to_string()]);
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["BatchHash".to_string(), "<toplevel>".to_string()]
+    );
 
     // ----- Call_entry args: input array `in` ------------------------
     // The recorder stages each declared input signal as a single arg
@@ -4178,7 +4199,10 @@ fn test_anonymous_component_test_via_ct_print_full() {
         observed_call_sequence(&doc),
         vec!["<toplevel>".to_string(), "Driver".to_string()]
     );
-    assert_eq!(observed_exit_sequence(&doc), vec!["Driver".to_string(), "<toplevel>".to_string()]);
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Driver".to_string(), "<toplevel>".to_string()]
+    );
 
     // ----- Call_entry args: input `in` --------------------------------
     let call_entries: Vec<&serde_json::Value> = events
@@ -4303,7 +4327,10 @@ fn test_circomlib_poseidon_test_via_ct_print_full() {
         observed_call_sequence(&doc),
         vec!["<toplevel>".to_string(), "Poseidon2".to_string()]
     );
-    assert_eq!(observed_exit_sequence(&doc), vec!["Poseidon2".to_string(), "<toplevel>".to_string()]);
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Poseidon2".to_string(), "<toplevel>".to_string()]
+    );
 
     // ----- Exact step lines (in order) --------------------------------
     // Lines: toplevel (1), `component main = Poseidon2()` (98), the
@@ -4464,7 +4491,10 @@ fn test_pragma_version_test_via_ct_print_full() {
         observed_call_sequence(&doc),
         vec!["<toplevel>".to_string(), "Driver".to_string()]
     );
-    assert_eq!(observed_exit_sequence(&doc), vec!["Driver".to_string(), "<toplevel>".to_string()]);
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Driver".to_string(), "<toplevel>".to_string()]
+    );
 
     // ----- Exact step lines (in order) --------------------------------
     let step_lines: Vec<i64> = events
@@ -4702,7 +4732,10 @@ fn test_bus_type_test_via_ct_print_full() {
         observed_call_sequence(&doc),
         vec!["<toplevel>".to_string(), "Distance".to_string()]
     );
-    assert_eq!(observed_exit_sequence(&doc), vec!["Distance".to_string(), "<toplevel>".to_string()]);
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["Distance".to_string(), "<toplevel>".to_string()]
+    );
 
     // ----- Call_entry arg: bus-typed `p` surfaces as a Struct -------------
     // This is the load-bearing assertion: the recorder's first-ever
