@@ -68,6 +68,7 @@
 ## Circom: tests compile .circom sources via the pinned circom 2.1.5.
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 import repro_dsl_stdlib/packages/sh
 
 package codetracer_circom_recorder:
@@ -122,6 +123,9 @@ package codetracer_circom_recorder:
     name: "codetracer-circom-recorder"
 
   devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
     activity "default"
 
   build:
