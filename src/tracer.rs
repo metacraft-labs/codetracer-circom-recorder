@@ -10,7 +10,9 @@ use std::process::Command;
 
 use codetracer_trace_types::{EventLogKind, FunctionId, Line, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
-use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
+use codetracer_trace_writer_nim::NimTraceWriter;
+
+use crate::line_counts::{line_counted_writer, LineCountedPaths};
 use eyre::{eyre, Context, Result};
 use num_bigint::BigUint;
 use wasmtime::{Caller, Engine, Func, Linker, Module, Store, Val};
@@ -500,7 +502,7 @@ struct TemplateDef {
 
 /// The main tracer struct that captures Circom execution traces.
 pub struct CircomTracer {
-    writer: Box<dyn TraceWriter + Send>,
+    writer: Box<NimTraceWriter>,
     /// Field element type id (registered once).
     field_type_id: Option<codetracer_trace_types::TypeId>,
     bool_type_id: Option<codetracer_trace_types::TypeId>,
@@ -538,7 +540,7 @@ impl CircomTracer {
         // parameter (`TraceEventsFileFormat::{Json,Binary,Ctfs}`) and the
         // CLI exposed a `--format` flag.  The convention now mandates
         // CTFS exclusively.
-        let mut tracer = Self::start_trace(source_path, out_dir)?;
+        let mut tracer = Self::start_trace(source_path, source_code, out_dir)?;
 
         // -- 1. Compile the Circom source --------------------------------------------------
         let compile_dir = tempfile::tempdir()
@@ -769,26 +771,26 @@ impl CircomTracer {
         Ok(())
     }
 
-    fn start_trace(source_path: &Path, out_dir: &Path) -> Result<Self> {
+    fn start_trace(source_path: &Path, source_code: &str, out_dir: &Path) -> Result<Self> {
         // CTFS-only.  Pre-2026-05-08 this method accepted a
         // `TraceEventsFileFormat` parameter and switched the events
         // filename on it; now it pins to the canonical CTFS multi-stream
         // container.
-        let format = TraceEventsFileFormat::Ctfs;
-        let program_str = source_path.to_string_lossy();
-        let mut tracer = CircomTracer {
-            writer: create_trace_writer(&program_str, &[], format),
-            field_type_id: None,
-            bool_type_id: None,
-        };
-
         std::fs::create_dir_all(out_dir)
             .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
         let events_path = out_dir.join("trace.bin");
 
-        TraceWriter::begin_writing_trace_events(&mut *tracer.writer, &events_path)
-            .map_err(|e| eyre!("{e}"))?;
+        let program_str = source_path.to_string_lossy();
+        let mut tracer = CircomTracer {
+            writer: Box::new(line_counted_writer(&program_str, &events_path)?),
+            field_type_id: None,
+            bool_type_id: None,
+        };
+
+        // State the circuit file's real line count in `paths.dat`. It is the
+        // only path the recorder's steps and functions name.
+        LineCountedPaths::default().register(&mut tracer.writer, source_path, source_code)?;
 
         TraceWriter::start(&mut *tracer.writer, source_path, Line(1));
 
