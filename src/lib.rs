@@ -7,6 +7,7 @@
 
 pub mod cpp_witness;
 pub mod evaluator;
+pub mod line_counts;
 pub mod recorder;
 pub mod signal_hierarchy;
 pub mod source_map;
