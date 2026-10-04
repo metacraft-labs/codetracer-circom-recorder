@@ -354,7 +354,7 @@ fn circom_compile_error_emits_error_special_event() {
     let special_events = read_special_events(&ct_path);
     assert!(
         special_events.iter().any(|event| {
-            event.kind == "error"
+            event.kind == "Error"
                 && (event.content.contains("circom compilation failed")
                     || event.content.contains("failed to run circom compiler"))
         }),
@@ -390,7 +390,7 @@ fn circom_log_directive_emits_evm_event_special_event() {
     let special_events = read_special_events(&ct_path);
     assert!(
         special_events.iter().any(|event| {
-            event.kind == "stderr"
+            event.kind == "EvmEvent"
                 && event.content.contains("input 0")
                 && event.content.contains("out 1")
         }),

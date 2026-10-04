@@ -3418,9 +3418,7 @@ fn test_public_signals_test_via_ct_print_full() {
 
     // ----- Public-signal special event --------------------------------
     // Exactly ONE io event — the `public_signals` annotation.  The
-    // CTFS multi-stream IO bucket folds `EvmEvent` into the `stderr`
-    // family (see `toIOEventKind` in `codetracer_trace_writer_ffi.nim`),
-    // so the surfaced `io_kind` is `ioStderr`.  The `text` body
+    // Canonical decoding preserves `EventLogKind::EvmEvent`. The `text` body
     // carries the discriminator + payload: `public_signals=a,b` (the
     // comma-joined ordered set of input names declared `public` on
     // the `component main` line).  Consumers that need to distinguish
@@ -3428,7 +3426,7 @@ fn test_public_signals_test_via_ct_print_full() {
     // the leading `public_signals=` prefix.
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(io_events[0]["text"].as_str(), Some("public_signals=a,b"),);
 
     // ----- Exact step lines (in order) --------------------------------
@@ -3503,16 +3501,15 @@ fn test_custom_template_test_via_ct_print_full() {
 
     // ----- Custom-template special event ------------------------------
     // Exactly ONE io event — the `custom_templates` annotation.  As
-    // with the public-signal annotation, the CTFS multi-stream IO
-    // bucket folds `EvmEvent` into the `stderr` family (see
-    // `toIOEventKind` in `codetracer_trace_writer_ffi.nim`).  The
+    // with the public-signal annotation, canonical decoding preserves
+    // `EventLogKind::EvmEvent`. The
     // `text` body carries the discriminator + payload:
     // `custom_templates=XorGate` (the comma-joined ordered set of
     // template names declared with the `custom` modifier).
     let events = doc["events"].as_array().expect("events array");
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some("custom_templates=XorGate"),
@@ -3657,9 +3654,7 @@ fn test_signal_tags_test_via_ct_print_full() {
     assert_eq!(functions, vec!["<toplevel>", "Inner", "Driver"]);
 
     // ----- Signal-tag special event ------------------------------------
-    // The CTFS multi-stream IO bucket folds `EvmEvent` into the
-    // `stderr` family (see `toIOEventKind` in
-    // `codetracer_trace_writer_ffi.nim`).  The `text` body carries
+    // Canonical decoding preserves `EventLogKind::EvmEvent`. The `text` body carries
     // the discriminator + payload:
     //   `signal_tags=a:bit;b:maxbit;bit_a:bit;maxbit_b:maxbit`
     // Semicolons separate per-signal records, the colon separates
@@ -3682,7 +3677,7 @@ fn test_signal_tags_test_via_ct_print_full() {
     let events = doc["events"].as_array().expect("events array");
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some("signal_tags=a:bit;b:maxbit;bit_a:bit;maxbit_b:maxbit"),
@@ -3757,9 +3752,7 @@ fn test_range_proof_test_via_ct_print_full() {
     // `x_out_of_range_claim === 256` constraint that the structured
     // evaluator detects as failing (LHS=100 from the `<--` literal
     // assignment, RHS=256 from the constraint-RHS literal).  The
-    // CTFS multi-stream IO bucket folds `EvmEvent` into the
-    // `stderr` family (see `toIOEventKind` in
-    // `codetracer_trace_writer_ffi.nim`).  The `text` body carries
+    // Canonical decoding preserves `EventLogKind::EvmEvent`. The `text` body carries
     // the discriminator + payload:
     //   `constraint_violation=constraint violation at line 42:
     //    lhs=100 != rhs=256`
@@ -3772,7 +3765,7 @@ fn test_range_proof_test_via_ct_print_full() {
     let events = doc["events"].as_array().expect("events array");
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some("constraint_violation=constraint violation at line 42: lhs=100 != rhs=256"),
@@ -3977,16 +3970,15 @@ fn test_parallel_template_test_via_ct_print_full() {
     // ----- Parallel-template special event ----------------------------
     // Exactly ONE io event — the `parallel_templates` annotation.  As
     // with the public-signal / custom-template / signal-tags
-    // annotations, the CTFS multi-stream IO bucket folds `EvmEvent`
-    // into the `stderr` family (see `toIOEventKind` in
-    // `codetracer_trace_writer_ffi.nim`).  The `text` body carries
+    // annotations, canonical decoding preserves `EventLogKind::EvmEvent`.
+    // The `text` body carries
     // the discriminator + payload: `parallel_templates=BatchHash` (the
     // comma-joined ordered set of template names declared with the
     // `parallel` modifier).
     let events = doc["events"].as_array().expect("events array");
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some("parallel_templates=BatchHash"),
@@ -4133,9 +4125,7 @@ fn test_anonymous_component_test_via_ct_print_full() {
 
     // ----- Anonymous-component special event --------------------------
     // Exactly ONE io event — the `anonymous_components` annotation.
-    // The CTFS multi-stream IO bucket folds `EvmEvent` into the
-    // `stderr` family (see `toIOEventKind` in
-    // `codetracer_trace_writer_ffi.nim`).  The `text` body carries
+    // Canonical decoding preserves `EventLogKind::EvmEvent`. The `text` body carries
     // the discriminator + payload:
     //   `anonymous_components=__anon@40:Doubler;__anon@41:Tripler`
     // Semicolons separate per-instance records, the colon separates
@@ -4147,7 +4137,7 @@ fn test_anonymous_component_test_via_ct_print_full() {
     let events = doc["events"].as_array().expect("events array");
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some("anonymous_components=__anon@40:Doubler;__anon@41:Tripler"),
@@ -4432,9 +4422,7 @@ fn test_pragma_version_test_via_ct_print_full() {
 
     // ----- Pragma-version special event -------------------------------
     // Exactly ONE io event — the `pragma_versions` annotation.  The
-    // CTFS multi-stream IO bucket folds `EvmEvent` into the `stderr`
-    // family (see `toIOEventKind` in
-    // `codetracer_trace_writer_ffi.nim`).  The `text` body carries
+    // Canonical decoding preserves `EventLogKind::EvmEvent`. The `text` body carries
     // the discriminator + payload:
     //   `pragma_versions=pragma_version_test.circom:2.1.5;
     //    pragma_version_helper.circom:2.1.0`
@@ -4446,7 +4434,7 @@ fn test_pragma_version_test_via_ct_print_full() {
     let events = doc["events"].as_array().expect("events array");
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some(
