@@ -171,11 +171,11 @@ package codetracer_circom_recorder:
     # package declares).
     const binarySuffix = (when defined(windows): ".exe" else: "")
     const recorderBinary =
-      "target/release/codetracer-circom-recorder" & binarySuffix
+      "target/debug/codetracer-circom-recorder" & binarySuffix
 
     let recorderBuild = cargo.build(
       locked = true,
-      release = true,
+      release = false,
       actionId = "codetracer-circom-recorder.cargo-build",
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
@@ -183,6 +183,15 @@ package codetracer_circom_recorder:
       ],
       extraOutputs = @[recorderBinary])
     discard collect("default", @[recorderBuild])
+
+    # Preserve the original explicit `just build-release` shipping profile.
+    let recorderReleaseBuild = cargo.build(
+      locked = true,
+      release = true,
+      actionId = "codetracer-circom-recorder.cargo-build-release",
+      extraInputs = @["Cargo.toml", "Cargo.lock", "src"],
+      extraOutputs = @["target/release/codetracer-circom-recorder" & binarySuffix])
+    discard collect("release", @[recorderReleaseBuild])
 
     # ---- Test-binary build + run edges (the `test` collection) -------
     #
@@ -267,7 +276,7 @@ package codetracer_circom_recorder:
       ] & traceManifestInputs & completeTestSourceInputs,
       cacheable = false)
 
-    for action in [recorderBuild, testsBuild.action, testsRun.action, cliVerify]:
+    for action in [recorderBuild, recorderReleaseBuild, testsBuild.action, testsRun.action, cliVerify]:
       appendRegisteredActionToolIdentityRefs(action.id,
         ["cargo", "rustc", "nim", "nimble", "git", "capnp", "zstd"])
       when defined(linux):
