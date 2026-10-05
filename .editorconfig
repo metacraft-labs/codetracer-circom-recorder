@@ -1,0 +1,40 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.{rs,circom,py}]
+indent_size = 4
+
+[{Cargo.lock,repro.lock}]
+indent_size = 1
+
+[packaging/aur/.SRCINFO]
+indent_style = tab
+
+# The owning env script uses four-space nesting; generated packaging scripts
+# retain their actual launcher-template two-space code under the default rule.
+[env.ps1]
+indent_size = 4
+
+# Debian control description continuations require their literal leading space.
+[packaging/deb/control]
+indent_size = 1
+
+# Preserve the published license's literal layout; byte checks remain enabled.
+[LICENSE]
+indent_size = unset
+
+# Native Cargo fmt in unfiltered owning lint enforces all Rust code.
+# These exact files contain string payload physical lines, not code nesting.
+[{src/evaluator.rs,src/main.rs,src/tracer.rs,tests/test_line_count_table.rs,tests/test_tracer.rs}]
+indent_size = unset
+
+# The native Prettier hook preserves this folded YAML expression's content.
+[.github/workflows/publish-workspace-lock.yml]
+indent_size = unset

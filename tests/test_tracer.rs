@@ -4513,58 +4513,42 @@ fn test_pragma_version_test_via_ct_print_full() {
 
 // --- bus_type_test.circom -----------------------------------------------
 
-/// Path to the Circom 2.2.3 binary built locally from the
-/// `metacraft-circom-fork` tree.  The dev shell pins circom 2.1.5,
-/// which doesn't recognise the `bus` / `input BusName()` syntax
-/// introduced in Circom 2.2 — the bus_type fixture's `pragma circom
-/// 2.2.0;` declaration is rejected with `Pragma version 2.2.0 is not
-/// supported`.  Tests that need bus support route the recorder
-/// through this binary by setting `CIRCOM_BIN` on the recorder
-/// subprocess, which keeps the env override scoped to the bus test
-/// (cargo test runs all test functions in the same process by
-/// default; setting `std::env::set_var` would leak the override into
-/// every other test running in parallel and silently re-circle the
-/// 2.1.5 corpus through 2.2.3, which is not 100% backward-compatible
-/// for some constraint patterns the existing fixtures rely on).
-///
-/// Resolved relative to the workspace root (`<workspace>/codetracer-
-/// circom-recorder/../metacraft-circom-fork/target/release/circom`)
-/// so the path is portable across machines that follow the metacraft
-/// repo workspace layout.  An externally-set `CIRCOM_2_2_BIN` env
-/// override (e.g. for CI runners that build circom in a different
-/// location) takes precedence.
+/// Published owning adapted Circom 2.2.3 compiler. Keep its override scoped
+/// to this bus recorder child; primary Circom 2.1.5 serves the original corpus.
+/// Windows retains the declared CIRCOM_2_2_BIN provisioning contract.
 fn circom_2_2_path() -> PathBuf {
     if let Ok(p) = std::env::var("CIRCOM_2_2_BIN") {
         return PathBuf::from(p);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("metacraft-circom-fork")
-        .join("target")
-        .join("release")
-        .join("circom")
+    assert!(
+        !cfg!(windows),
+        "required Windows CIRCOM_2_2_BIN must select Circom 2.2.3"
+    );
+    PathBuf::from("circom-bus")
 }
 
-/// Like `record_and_dump_full`, but invokes the recorder as a
-/// subprocess with `CIRCOM_BIN` pointed at the Circom 2.2.3 binary
-/// so the bus-type fixture compiles.  Returns `None` when either the
-/// 2.2 binary or `ct-print` is unavailable, surfacing a `SKIP:` line
-/// (the verify-cli-convention-no-silent-skip.sh check greps for that
-/// literal token).
+/// Invoke the bus recorder with the real owning adapted 2.2.3 compiler.
+/// Missing or wrong-version prerequisites fail before recording; no silent skip.
 fn record_and_dump_full_with_circom_2_2(
     test_name: &str,
     program: &str,
-) -> Option<(serde_json::Value, PathBuf)> {
+) -> (serde_json::Value, PathBuf) {
     let circom_bin = circom_2_2_path();
-    if !circom_bin.exists() {
-        eprintln!(
-            "SKIP: {test_name} requires circom 2.2.3 at {} — only available \
-            within the metacraft workspace where metacraft-circom-fork is a sibling \
-            and built (cd ~/metacraft/metacraft-circom-fork && cargo build --release).",
-            circom_bin.display()
-        );
-        return None;
-    }
+    let version = Command::new(&circom_bin)
+        .arg("--version")
+        .output()
+        .expect("required owning Circom 2.2.3 compiler is unavailable");
+    assert!(
+        version.status.success(),
+        "required owning Circom 2.2.3 version probe failed"
+    );
+    assert_eq!(
+        String::from_utf8(version.stdout)
+            .expect("compiler version UTF-8")
+            .trim(),
+        "circom compiler 2.2.3",
+        "required owning Circom bus compiler version"
+    );
 
     let ct_print = require_ct_print(test_name);
 
@@ -4618,7 +4602,7 @@ fn record_and_dump_full_with_circom_2_2(
 
     drop(tmp_dir);
 
-    Some((doc, source_path))
+    (doc, source_path)
 }
 
 /// Records `bus_type_test.circom`, the recorder's first fixture for
@@ -4647,12 +4631,10 @@ fn record_and_dump_full_with_circom_2_2(
 /// non-zero field values rather than weakened to allow them.
 #[test]
 fn test_bus_type_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full_with_circom_2_2(
+    let (doc, source_path) = record_and_dump_full_with_circom_2_2(
         "test_bus_type_test_via_ct_print_full",
         "bus_type_test.circom",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -4669,21 +4651,58 @@ fn test_bus_type_test_via_ct_print_full() {
     assert_eq!(functions, vec!["<toplevel>", "Distance"]);
 
     // ----- Type table -----------------------------------------------------
-    // `Point` is registered as the recorder's first Struct type for
-    // Circom (`TypeKind::Struct`, lang_type = "Point").  `field` and
-    // `bool` are the standard scalar types every Circom trace
-    // registers; `type_0` is the per-int-type-id alias the writer
-    // creates as a side-effect of the `register_variable_int` /
-    // `register_variable_cbor` fast path (every other Circom fixture
-    // also surfaces it — see `template_signal_args_test`'s 3-entry
-    // type table).
+    // The recorder declares field (id 0), bool (id 1), and Point (id 2).
+    // Current typed-ID FFI registrations reuse these identities; they must not
+    // synthesize the retired type_0 alias for a value already typed as field.
     let types: Vec<&str> = doc["types"]
         .as_array()
         .expect("types array")
         .iter()
-        .filter_map(|v| v.as_str())
+        .map(|v| v.as_str().expect("every declared type has a name"))
         .collect();
-    assert_eq!(types, vec!["field", "bool", "Point", "type_0"]);
+    assert_eq!(types, vec!["field", "bool", "Point"]);
+    assert_eq!(doc["counts"]["types"].as_u64(), Some(3));
+
+    // Check every emitted type reference, including nested bus members and
+    // step-variable envelopes. All references must resolve to the exact
+    // declared table; integer values keep field identity and bus values keep
+    // Point identity. Existing field/value/event/count assertions below remain.
+    fn assert_registered_types(value: &serde_json::Value, types: &[&str]) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                assert!(
+                    !fields.contains_key("type_name") || fields.contains_key("type_id"),
+                    "emitted type_name must carry its registered type_id"
+                );
+                if let Some(type_id) = fields.get("type_id") {
+                    let id = type_id.as_u64().expect("type_id must be unsigned") as usize;
+                    let name = types
+                        .get(id)
+                        .expect("every emitted type_id must be registered");
+                    if let Some(type_name) = fields.get("type_name") {
+                        assert_eq!(type_name.as_str(), Some(*name));
+                    }
+                    if let Some(kind) = fields.get("kind").and_then(|v| v.as_str()) {
+                        match kind {
+                            "Int" => assert_eq!((id, *name), (0, "field")),
+                            "Struct" => assert_eq!((id, *name), (2, "Point")),
+                            _ => panic!("unexpected bus fixture value kind: {kind}"),
+                        }
+                    }
+                }
+                for child in fields.values() {
+                    assert_registered_types(child, types);
+                }
+            }
+            serde_json::Value::Array(elements) => {
+                for child in elements {
+                    assert_registered_types(child, types);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_registered_types(&doc["events"], &types);
 
     // ----- counts ---------------------------------------------------------
     // 9 step events: 1 toplevel (line 1) + 1 component-main (line 47)

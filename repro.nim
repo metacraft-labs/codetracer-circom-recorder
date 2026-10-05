@@ -67,9 +67,15 @@
 ##
 ## Circom: tests compile .circom sources via the pinned circom 2.1.5.
 
+import std/os
 import repro_project_dsl
+import tools/source_inputs
 import repro_dsl_stdlib/foreign_env
 import repro_dsl_stdlib/packages/sh
+import "../codetracer-trace-format-nim/build_writer_artifacts"
+
+when not defined(windows):
+  import circom_bus_sdk_tools
 
 package codetracer_circom_recorder:
   defaultToolProvisioning "path"
@@ -83,8 +89,10 @@ package codetracer_circom_recorder:
     "cargo >=1.85"
     # C compiler driver — rustc links through `cc`, and build scripts
     # (cc-rs, the Nim FFI) compile C. Declaring it puts its directory on
-    # every cargo edge's PATH. Windows links with MSVC instead.
-    when defined(linux):
+    # every cargo edge's PATH. Windows Cargo retains MSVC; the owning
+    # ct-print constructor separately uses GCC on Windows. Declaring this
+    # decoder compiler does not qualify native MSVC provisioning.
+    when defined(linux) or defined(windows):
       "gcc"
     elif defined(macosx):
       "clang"
@@ -115,11 +123,17 @@ package codetracer_circom_recorder:
     # the same ``bash tests/verify-cli-convention-no-silent-skip.sh``
     # step ``just test`` runs after ``cargo test``.
     "sh"
+    "bash"
+    "dirname"
+    "grep"
+    "git"
 
     # Language-specific compiler / runtime tool. ``circom`` compiles the
     # ``.circom`` test fixtures the integration tests record against; it
     # is provisioned by ensure-circom.ps1 on Windows.
     "circom"
+    when not defined(windows):
+      "circom-bus"
     # `choco pack` / `choco push` in .github/workflows/publish-chocolatey.yml.
     # Windows-guarded because Chocolatey is a Windows package manager with no
     # POSIX build, so an unguarded entry would fail to resolve on Linux/macOS.
@@ -187,6 +201,25 @@ package codetracer_circom_recorder:
     # §M4 — the whole-binary edge becomes a fan-out point without
     # changing this recipe.
 
+    const nimRoot = "../codetracer-trace-format-nim"
+    const traceRoot = "../codetracer-trace-format"
+    let traceManifestInputs = @[traceRoot / "Cargo.toml", traceRoot / "Cargo.lock",
+      nimRoot / "build_ffi.nims", nimRoot / "build_ffi_flags.nim",
+      nimRoot / "config.nims", nimRoot / "nim.cfg",
+      nimRoot / "codetracer_trace_format.nimble"]
+    # Recognized-format Cargo depfiles do not record runtime fixture reads.
+    # Enumerate every genuine file and register actual recursive membership.
+    let completeTestSourceInputs = completeRegularSourceInputs(
+      packageProjectRoot(currentOwningPackage()),
+      @["src", "tests", "test-programs",
+        traceRoot / "codetracer_trace_types", traceRoot / "codetracer_trace_writer_nim",
+        traceRoot / "codetracer_trace_reader", traceRoot / "codetracer_ctfs",
+        traceRoot / "codetracer_trace_format_capnp",
+        traceRoot / "codetracer_trace_format_cbor_zstd",
+        traceRoot / "codetracer_trace_writer", nimRoot / "src", nimRoot / "include"])
+    let decoderBuild = buildCtPrint(nimRoot)
+    let decoderBinary = ctPrintPath(nimRoot)
+
     let testsBuild = cargo.test(
       locked = true,
       noRun = true,
@@ -194,18 +227,18 @@ package codetracer_circom_recorder:
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
         "src", "tests", "test-programs"
-      ],
+      ] & traceManifestInputs & completeTestSourceInputs,
       extraOutputs = @["target/debug/deps"])
 
     let testsRun = cargo.test(
       locked = true,
       actionId = "codetracer-circom-recorder.cargo-test-run",
-      after = @[testsBuild.action],
+      after = @[testsBuild.action, decoderBuild],
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
         "src", "tests", "test-programs",
-        "target/debug/deps"
-      ])
+        "target/debug/deps", decoderBinary
+      ] & traceManifestInputs & completeTestSourceInputs)
 
     # ---- CLI-convention verification edge -----------------------------
     #
@@ -220,18 +253,29 @@ package codetracer_circom_recorder:
     # itself does ``cargo build --locked --quiet`` (a no-op once the
     # recorder is built), then runs the freshly-built debug binary at
     # ``target/debug/codetracer-circom-recorder``; ``after`` the cargo
-    # test-build edge guarantees that binary exists before the script
-    # runs. Non-cacheable: the script inspects a runtime binary via
+    # test-run edge preserves canonical full-Cargo-before-CLI ordering.
+    # Non-cacheable: the script inspects a runtime binary via
     # automatic monitoring and asserts on ``--help`` text, so it is
     # re-run every ``repro test`` pass (matching ``just test``).
     let cliVerify = shell(
       command = "bash tests/verify-cli-convention-no-silent-skip.sh",
       actionId = "codetracer-circom-recorder.verify-cli-convention",
-      after = @[testsBuild.action],
+      after = @[testsRun.action],
       extraInputs = @[
         "tests/verify-cli-convention-no-silent-skip.sh",
         "Cargo.toml", "Cargo.lock", "src"
-      ],
+      ] & traceManifestInputs & completeTestSourceInputs,
       cacheable = false)
 
+    for action in [recorderBuild, testsBuild.action, testsRun.action, cliVerify]:
+      appendRegisteredActionToolIdentityRefs(action.id,
+        ["cargo", "rustc", "nim", "nimble", "git", "capnp", "zstd"])
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(action.id, ["gcc", "pkg-config", "openssl"])
+      elif defined(macosx):
+        appendRegisteredActionToolIdentityRefs(action.id, ["clang", "pkg-config", "openssl"])
+    appendRegisteredActionToolIdentityRefs(testsRun.action.id, ["circom"])
+    when not defined(windows):
+      appendRegisteredActionToolIdentityRefs(testsRun.action.id, ["circom-bus"])
+    appendRegisteredActionToolIdentityRefs(cliVerify.id, ["sh", "bash", "dirname", "grep"])
     discard collect("test", @[testsRun.action, cliVerify])

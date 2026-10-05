@@ -3,6 +3,10 @@
 
   inputs = {
     mcl-blockchain.url = "github:metacraft-labs/nix-blockchain-development";
+    circom-bus-source = {
+      url = "github:metacraft-labs/circom/4a6c82e8fdeb18523cad60f816f578bcb8629878";
+      flake = false;
+    };
     nixpkgs.follows = "mcl-blockchain/nixpkgs";
     flake-utils.follows = "mcl-blockchain/flake-utils";
     git-hooks = {
@@ -17,6 +21,7 @@
       nixpkgs,
       flake-utils,
       mcl-blockchain,
+      circom-bus-source,
       git-hooks,
       ...
     }:
@@ -24,19 +29,13 @@
       system:
       let
         pkgs = import nixpkgs { inherit system; };
-        # The repo's pre-commit hooks. Entering the default dev shell writes
-        # the (gitignored) .pre-commit-config.yaml symlink and installs them;
-        # CI's shared lint workflow runs the same set from this shell.
-        preCommit = git-hooks.lib.${system}.run {
-          src = ./.;
-          hooks = {
-            check-added-large-files.enable = true;
-            check-merge-conflicts.enable = true;
-            # `just lint` (cargo fmt + clippy) is not a hook yet: clippy needs
-            # the ../codetracer-trace-format sibling, which repro.lock does not
-            # pin, so a CI hook run could not resolve it.
-          };
+        busCompiler = import ./tools/circom-bus-sdk/package.nix {
+          inherit pkgs;
+          source = circom-bus-source;
+          rustPlatform = mcl-blockchain.legacyPackages.${system}.rustPlatformStable;
+          craneLib = mcl-blockchain.legacyPackages.${system}.craneLib-fenix-stable;
         };
+        # Committed portable rules are installed only in the owning checkout.
         # git-hooks.nix installs `.pre-commit-config.yaml` and git hooks into
         # `git rev-parse --show-toplevel` of the directory the shell is entered
         # from, so `nix develop /path/to/this-repo` run inside another checkout
@@ -63,9 +62,19 @@
         '';
       in
       {
+        packages.circom = mcl-blockchain.packages.${system}.circom;
+        packages.circom-bus = busCompiler;
         devShells.default = pkgs.mkShell {
           inputsFrom = [ mcl-blockchain.devShells.${system}.circom-recorder ];
           packages = [
+            pkgs.prek
+            pkgs.uv
+            pkgs.python3
+            pkgs.editorconfig-checker
+            pkgs.nixfmt-rfc-style
+            pkgs.opentofu
+            pkgs.nodePackages.prettier
+            busCompiler # Published adapted 2.2.3; primary Circom 2.1.5 is unchanged.
             pkgs.zstd # required by libcodetracer_trace_writer (Nim FFI)
             # Declare the toolchain explicitly so CI's dev shell
             # mirrors local dev exactly.  Cached mcl-blockchain
@@ -104,26 +113,34 @@
           # are symlinks to the real CARGO_HOME, and so are its config and
           # credentials when present: the download cache is shared, and only
           # the proxy directory is left behind.
-          shellHook = ownRepoOnly preCommit.shellHook + ''
-            _ct_real_cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
-            _ct_cargo_home="''${XDG_CACHE_HOME:-$HOME/.cache}/codetracer-circom-recorder/cargo-home"
-            if [ "$_ct_real_cargo_home" != "$_ct_cargo_home" ]; then
-              mkdir -p "$_ct_cargo_home" \
-                "$_ct_real_cargo_home/registry" "$_ct_real_cargo_home/git"
-              # Re-pointed on every entry, so a changed CARGO_HOME is followed
-              # rather than left sharing the previous one's cache. Only a link
-              # is ever replaced; a real file placed here is left alone.
-              for _ct_entry in registry git config.toml credentials.toml; do
-                if [ -e "$_ct_real_cargo_home/$_ct_entry" ] &&
-                  { [ -L "$_ct_cargo_home/$_ct_entry" ] ||
-                    [ ! -e "$_ct_cargo_home/$_ct_entry" ]; }; then
-                  ln -sfn "$_ct_real_cargo_home/$_ct_entry" "$_ct_cargo_home/$_ct_entry"
-                fi
-              done
-              export CARGO_HOME="$_ct_cargo_home"
-            fi
-            unset _ct_real_cargo_home _ct_cargo_home _ct_entry
-          '';
+          shellHook =
+            ownRepoOnly ''
+              _ct_matching_repro="''${REPROBUILD_REPRO:-$(command -v repro)}"
+              ${pkgs.python3}/bin/python3 tools/install-canonical-hooks.py --repro "$_ct_matching_repro" --bootstrap-managed || return $?
+              ${pkgs.python3}/bin/python3 tools/install-canonical-hooks.py --repro "$_ct_matching_repro" || return $?
+              unset _ct_matching_repro
+            ''
+            + ''
+              export PREK_NO_FAST_PATH=1
+              _ct_real_cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
+              _ct_cargo_home="''${XDG_CACHE_HOME:-$HOME/.cache}/codetracer-circom-recorder/cargo-home"
+              if [ "$_ct_real_cargo_home" != "$_ct_cargo_home" ]; then
+                mkdir -p "$_ct_cargo_home" \
+                  "$_ct_real_cargo_home/registry" "$_ct_real_cargo_home/git"
+                # Re-pointed on every entry, so a changed CARGO_HOME is followed
+                # rather than left sharing the previous one's cache. Only a link
+                # is ever replaced; a real file placed here is left alone.
+                for _ct_entry in registry git config.toml credentials.toml; do
+                  if [ -e "$_ct_real_cargo_home/$_ct_entry" ] &&
+                    { [ -L "$_ct_cargo_home/$_ct_entry" ] ||
+                      [ ! -e "$_ct_cargo_home/$_ct_entry" ]; }; then
+                    ln -sfn "$_ct_real_cargo_home/$_ct_entry" "$_ct_cargo_home/$_ct_entry"
+                  fi
+                done
+                export CARGO_HOME="$_ct_cargo_home"
+              fi
+              unset _ct_real_cargo_home _ct_cargo_home _ct_entry
+            '';
         };
       }
     );
