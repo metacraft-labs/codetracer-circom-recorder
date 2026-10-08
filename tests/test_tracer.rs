@@ -3417,10 +3417,8 @@ fn test_public_signals_test_via_ct_print_full() {
     assert_eq!(args[2]["varname"].as_str(), Some("c"));
 
     // ----- Public-signal special event --------------------------------
-    // Exactly ONE io event — the `public_signals` annotation.  The
-    // CTFS multi-stream IO bucket folds `EvmEvent` into the `stderr`
-    // family (see `toIOEventKind` in `codetracer_trace_writer_ffi.nim`),
-    // so the surfaced `io_kind` is `ioStderr`.  The `text` body
+    // Exactly ONE io event — the `public_signals` annotation, an
+    // `EvmEvent`, which is the surfaced `io_kind`.  The `text` body
     // carries the discriminator + payload: `public_signals=a,b` (the
     // comma-joined ordered set of input names declared `public` on
     // the `component main` line).  Consumers that need to distinguish
@@ -3428,7 +3426,7 @@ fn test_public_signals_test_via_ct_print_full() {
     // the leading `public_signals=` prefix.
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(io_events[0]["text"].as_str(), Some("public_signals=a,b"),);
 
     // ----- Exact step lines (in order) --------------------------------
@@ -3512,7 +3510,7 @@ fn test_custom_template_test_via_ct_print_full() {
     let events = doc["events"].as_array().expect("events array");
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some("custom_templates=XorGate"),
@@ -3682,7 +3680,7 @@ fn test_signal_tags_test_via_ct_print_full() {
     let events = doc["events"].as_array().expect("events array");
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some("signal_tags=a:bit;b:maxbit;bit_a:bit;maxbit_b:maxbit"),
@@ -3772,7 +3770,7 @@ fn test_range_proof_test_via_ct_print_full() {
     let events = doc["events"].as_array().expect("events array");
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some("constraint_violation=constraint violation at line 42: lhs=100 != rhs=256"),
@@ -3986,7 +3984,7 @@ fn test_parallel_template_test_via_ct_print_full() {
     let events = doc["events"].as_array().expect("events array");
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some("parallel_templates=BatchHash"),
@@ -4147,7 +4145,7 @@ fn test_anonymous_component_test_via_ct_print_full() {
     let events = doc["events"].as_array().expect("events array");
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some("anonymous_components=__anon@40:Doubler;__anon@41:Tripler"),
@@ -4446,7 +4444,7 @@ fn test_pragma_version_test_via_ct_print_full() {
     let events = doc["events"].as_array().expect("events array");
     let io_events: Vec<&serde_json::Value> = events.iter().filter(|e| e["kind"] == "io").collect();
     assert_eq!(io_events.len(), 1);
-    assert_eq!(io_events[0]["io_kind"].as_str(), Some("ioStderr"));
+    assert_eq!(io_events[0]["io_kind"].as_str(), Some("EvmEvent"));
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some(
