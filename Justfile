@@ -10,9 +10,15 @@ build:
 build-release:
   cargo build --release --locked
 
-# The Cargo.lock check runs first: when the lock is stale it names the cause
-# and the remedy, where `cargo test --locked` would only refuse the lock.
-test:
+# ct-print, which the trace-decoding tests run, is built in its own sibling
+# checkout's environment.
+build-decoder:
+  cd ../codetracer-trace-format-nim && direnv exec . just build-ct-print
+
+# The Cargo.lock check runs before `cargo test`: when the lock is stale it names
+# the cause and the remedy, where `cargo test --locked` would only refuse the
+# lock.
+test: build-decoder
   bash tests/verify-cargo-lock-matches-trace-format.sh
   cargo test --locked
   bash tests/verify-cli-convention-no-silent-skip.sh
@@ -255,3 +261,8 @@ verify-chocolatey:
 # Runs `nix develop`, so it is not part of the in-shell test recipes.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
+
+# Owning native SDK and matching managed-hook protocol are required.
+install-hooks REPRO:
+  python3 tools/install-canonical-hooks.py --repro "{{REPRO}}" --bootstrap-managed
+  python3 tools/install-canonical-hooks.py --repro "{{REPRO}}"

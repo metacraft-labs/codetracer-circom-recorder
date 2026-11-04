@@ -10,4 +10,3 @@ Cargo.lock
 
 # Local Nix flake input overrides (machine-specific; never committed)
 .env
-

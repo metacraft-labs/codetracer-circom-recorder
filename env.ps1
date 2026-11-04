@@ -61,8 +61,8 @@ if ($env:WINDOWS_DIY_CL_EXE -and (Test-Path $env:WINDOWS_DIY_CL_EXE)) {
 
 # --- 3. Circom compiler (2.1.5 default + 2.2.3 for bus fixtures) -------------
 $devDepsRoot = if ($env:WINDOWS_DIY_INSTALL_ROOT) { $env:WINDOWS_DIY_INSTALL_ROOT }
-               elseif (Test-Path "D:\") { "D:\metacraft-dev-deps" }
-               else { Join-Path $env:LOCALAPPDATA "codetracer\windows-diy" }
+                elseif (Test-Path "D:\") { "D:\metacraft-dev-deps" }
+                else { Join-Path $env:LOCALAPPDATA "codetracer\windows-diy" }
 
 function Install-Circom {
     param([string]$Version)

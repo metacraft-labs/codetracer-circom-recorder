@@ -2,8 +2,8 @@
 # Entering this repository's dev shell from ANOTHER git repository writes
 # nothing into that repository.
 #
-# The dev shell's hook installs git hooks (`.pre-commit-config.yaml`, hooks
-# under `.git/hooks`, `core.hooksPath`). git-hooks.nix aims them at
+# The dev shell's hook installs git hooks (hooks under `.git/hooks`,
+# `core.hooksPath`). Its installer aims them at
 # `git rev-parse --show-toplevel` of the CURRENT DIRECTORY, so without a guard
 # `nix develop /path/to/this-repo` run from a sibling checkout plants this
 # repository's hooks there: an untracked file that blocks that repository's
@@ -14,8 +14,9 @@
 # file or directory appears, no hook is
 # installed and `core.hooksPath` is untouched. As the positive control, entered
 # from inside this repository the hook still installs the pre-commit hook
-# (running the committed `.pre-commit-config.yaml`, which it leaves
-# byte-identical).
+# (running the committed, tracked `.pre-commit-config.yaml`, which it leaves
+# byte-identical), and every Reprobuild hook dispatcher that held a slot before
+# entry still holds it afterwards, with its `.repro-managed` body beside it.
 #
 #   bash tests/test_dev_shell_writes_nothing_elsewhere.sh
 set -euo pipefail
@@ -44,8 +45,18 @@ for dir in "$SCRATCH" "$SCRATCH/sub"; do
 done
 
 # Positive control: the guard must not stop the hook in this repository.
+[ -f "$REPO/.pre-commit-config.yaml" ] && [ ! -L "$REPO/.pre-commit-config.yaml" ] \
+  || fail "control: the committed .pre-commit-config.yaml is not a regular file"
+git -C "$REPO" ls-files --error-unmatch .pre-commit-config.yaml >/dev/null \
+  || fail "control: .pre-commit-config.yaml is not tracked"
 config_before="$(git -C "$REPO" hash-object .pre-commit-config.yaml)"
 hooks_dir="$(git -C "$REPO" rev-parse --path-format=absolute --git-path hooks)"
+dispatched=()
+for hook in pre-commit pre-push; do
+  if [ -f "$hooks_dir/$hook" ] && grep -q 'reprobuild hook dispatcher protocol=2' "$hooks_dir/$hook"; then
+    dispatched+=("$hook")
+  fi
+done
 ( cd "$REPO" && nix develop "$REPO" --no-write-lock-file -c true ) >/dev/null 2>&1 \
   || fail "the dev shell did not start from this repository"
 [ -f "$REPO/.pre-commit-config.yaml" ] && [ ! -L "$REPO/.pre-commit-config.yaml" ] \
@@ -53,5 +64,23 @@ hooks_dir="$(git -C "$REPO" rev-parse --path-format=absolute --git-path hooks)"
   || fail "control: the committed .pre-commit-config.yaml was replaced or changed"
 grep -qs -- '--config .pre-commit-config.yaml' "$hooks_dir/pre-commit" "$hooks_dir/pre-commit.repro-local" \
   || fail "control: entered from this repository, no pre-commit hook runs the committed config"
+# Entering the shell must leave Reprobuild's dispatchers in their slots: the
+# pre-push one is the publication gate.
+for hook in "${dispatched[@]}"; do
+  [ -f "$hooks_dir/$hook" ] && [ ! -L "$hooks_dir/$hook" ] && [ -x "$hooks_dir/$hook" ] \
+    && grep -q 'reprobuild hook dispatcher protocol=2' "$hooks_dir/$hook" \
+    || fail "control: the Reprobuild dispatcher in $hook was displaced"
+  [ -f "$hooks_dir/$hook.repro-managed" ] && [ ! -L "$hooks_dir/$hook.repro-managed" ] \
+    && [ -x "$hooks_dir/$hook.repro-managed" ] \
+    || fail "control: missing regular executable managed $hook.repro-managed"
+  [ ! -e "$hooks_dir/$hook.legacy" ] \
+    || fail "control: a displaced $hook.legacy was left behind"
+done
+if [[ " ${dispatched[*]} " == *" pre-commit "* ]]; then
+  [ -f "$hooks_dir/pre-commit.repro-local" ] && [ ! -L "$hooks_dir/pre-commit.repro-local" ] \
+    && [ -x "$hooks_dir/pre-commit.repro-local" ] \
+    && grep -q -- '--config .pre-commit-config.yaml' "$hooks_dir/pre-commit.repro-local" \
+    || fail "control: under the dispatcher, pre-commit.repro-local does not run the committed config"
+fi
 
-echo "PASS: entered from another repository the dev shell writes nothing there; from this one it installs its hooks"
+echo "PASS: entered from another repository the dev shell writes nothing there; from this one it installs its hooks and keeps the Reprobuild dispatchers in place"

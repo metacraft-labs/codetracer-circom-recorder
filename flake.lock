@@ -74,6 +74,23 @@
         "type": "github"
       }
     },
+    "circom-bus-source": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1774959932,
+        "narHash": "sha256-QT/kUWs8wrLNB6+SdVq+3VhcuWQLJS+9lJuz/D4IqUk=",
+        "owner": "metacraft-labs",
+        "repo": "circom",
+        "rev": "4a6c82e8fdeb18523cad60f816f578bcb8629878",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "repo": "circom",
+        "rev": "4a6c82e8fdeb18523cad60f816f578bcb8629878",
+        "type": "github"
+      }
+    },
     "crane": {
       "locked": {
         "lastModified": 1767744144,
@@ -1322,6 +1339,7 @@
     },
     "root": {
       "inputs": {
+        "circom-bus-source": "circom-bus-source",
         "flake-utils": [
           "mcl-blockchain",
           "flake-utils"

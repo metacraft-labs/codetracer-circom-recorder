@@ -58,7 +58,7 @@
 # Reading the pin
 # ---------------
 # `repro.lock` is TOML whose `deps` is a one-line array of inline tables. The
-# dev shell has no python3, so the record is selected with grep: each inline
+# script does not depend on python3, so the record is selected with grep: each inline
 # table is isolated, and the one whose `name` KEY is exactly
 # `codetracer-trace-format` is taken. Matching the bare string would also hit
 # the self record's `depends = "...,codetracer-trace-format,..."`. Anything

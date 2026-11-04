@@ -3,6 +3,10 @@
 
   inputs = {
     mcl-blockchain.url = "github:metacraft-labs/nix-blockchain-development";
+    circom-bus-source = {
+      url = "github:metacraft-labs/circom/4a6c82e8fdeb18523cad60f816f578bcb8629878";
+      flake = false;
+    };
     nixpkgs.follows = "mcl-blockchain/nixpkgs";
     flake-utils.follows = "mcl-blockchain/flake-utils";
     git-hooks = {
@@ -17,6 +21,7 @@
       nixpkgs,
       flake-utils,
       mcl-blockchain,
+      circom-bus-source,
       git-hooks,
       ...
     }:
@@ -36,6 +41,12 @@
             # the ../codetracer-trace-format sibling, which repro.lock does not
             # pin, so a CI hook run could not resolve it.
           };
+        };
+        busCompiler = import ./tools/circom-bus-sdk/package.nix {
+          inherit pkgs;
+          source = circom-bus-source;
+          rustPlatform = mcl-blockchain.legacyPackages.${system}.rustPlatformStable;
+          craneLib = mcl-blockchain.legacyPackages.${system}.craneLib-fenix-stable;
         };
         # The committed `.pre-commit-config.yaml` is what the pre-commit hook
         # runs, with the flake's pre-commit: the flake provides the tools, the
@@ -94,9 +105,19 @@
         '';
       in
       {
+        packages.circom = mcl-blockchain.packages.${system}.circom;
+        packages.circom-bus = busCompiler;
         devShells.default = pkgs.mkShell {
           inputsFrom = [ mcl-blockchain.devShells.${system}.circom-recorder ];
           packages = [
+            pkgs.prek
+            pkgs.uv
+            pkgs.python3
+            pkgs.editorconfig-checker
+            pkgs.nixfmt-rfc-style
+            pkgs.opentofu
+            pkgs.nodePackages.prettier
+            busCompiler # Published adapted 2.2.3; primary Circom 2.1.5 is unchanged.
             pkgs.zstd # required by libcodetracer_trace_writer (Nim FFI)
             # Declare the toolchain explicitly so CI's dev shell
             # mirrors local dev exactly.  Cached mcl-blockchain
@@ -136,6 +157,10 @@
           # credentials when present: the download cache is shared, and only
           # the proxy directory is left behind.
           shellHook = ownRepoOnly installGitHooks + ''
+            # prek's native fast path for the upstream pre-commit-hooks rounds file
+            # sizes differently at the exact 1 MiB boundary; run the configured
+            # upstream hooks themselves.
+            export PREK_NO_FAST_PATH=1
             _ct_real_cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
             _ct_cargo_home="''${XDG_CACHE_HOME:-$HOME/.cache}/codetracer-circom-recorder/cargo-home"
             if [ "$_ct_real_cargo_home" != "$_ct_cargo_home" ]; then
