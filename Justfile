@@ -19,6 +19,7 @@ build-decoder:
 # the cause and the remedy, where `cargo test --locked` would only refuse the
 # lock.
 test: build-decoder
+  python3 -m unittest discover -s tests -p test_canonical_hook_ownership.py
   bash tests/verify-cargo-lock-matches-trace-format.sh
   cargo test --locked
   bash tests/verify-cli-convention-no-silent-skip.sh
@@ -37,6 +38,7 @@ verify-cargo-lock:
   bash tests/verify-cargo-lock-matches-trace-format.sh
 
 lint:
+  python3 -m unittest discover -s tests -p test_canonical_hook_ownership.py
   cargo fmt --check
   cargo clippy --locked --all-targets -- -D warnings
   bash tests/verify-cli-convention-no-silent-skip.sh

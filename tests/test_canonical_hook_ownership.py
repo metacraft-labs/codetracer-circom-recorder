@@ -25,6 +25,14 @@ SPEC.loader.exec_module(INSTALLER)
 
 class CommonHooksOwnership(unittest.TestCase):
     def setUp(self) -> None:
+        # This suite also runs inside a real Git hook. Inherited repository,
+        # index and command-configuration variables belong to that outer Git
+        # transaction, not these private repositories. Restore them afterward;
+        # individual negative controls explicitly inject their own Git settings.
+        inherited_git = {key: value for key, value in os.environ.items() if key.startswith("GIT_")}
+        for key in inherited_git:
+            del os.environ[key]
+        self.addCleanup(os.environ.update, inherited_git)
         self.temporary = tempfile.TemporaryDirectory(prefix="circom-hook-ownership-")
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
@@ -49,7 +57,10 @@ class CommonHooksOwnership(unittest.TestCase):
         self.command("worktree", "add", "--detach", str(self.linked), "HEAD")
 
     def command(self, *args: str) -> str:
-        return subprocess.check_output([self.git, *args], cwd=self.primary, text=True, stderr=subprocess.STDOUT).strip()
+        result = subprocess.run([self.git, *args], cwd=self.primary, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        return result.stdout.strip()
 
     def inventory(self) -> dict[str, tuple[str, int, str]]:
         result = {}
@@ -101,13 +112,44 @@ class CommonHooksOwnership(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Ownership-checked matching managed bootstrap complete", result.stdout)
         hooks = self.primary / ".git/hooks"
-        self.assertEqual(set(INSTALLER.pre_push_inventory(hooks, INSTALLER.selected_tool("prek"))), {"pre-push", "pre-push.repro-managed", "pre-push.sample"})
-        for name, expected in INSTALLER.KNOWN_MANAGED_BODIES.items():
+        expected_bodies = INSTALLER.selected_managed_bodies(Path(repro), self.git)
+        self.assertEqual({p.name for p in hooks.glob("pre-push*")}, {"pre-push", "pre-push.repro-managed", "pre-push.sample"})
+        for name, expected in expected_bodies.items():
             target = hooks / name
             self.assertFalse(target.is_symlink())
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
-            self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), expected)
+            self.assertEqual(target.read_bytes(), expected)
         self.assertEqual({name: (self.primary / name).read_bytes() for name in INSTALLER.OWNING_DECLARATIONS}, source_before)
+
+    def test_selected_engine_full_install_and_reinstall(self) -> None:
+        # A genuine local system hook isolates chaining from upstream checker
+        # downloads. Both registered worktrees retain the same declaration.
+        config = "repos:\n- repo: local\n  hooks:\n  - id: smoke\n    name: smoke\n    entry: /bin/sh -c 'touch canonical-smoke-ran'\n    language: system\n    always_run: true\n    pass_filenames: false\n"
+        for worktree in (self.primary, self.linked):
+            (worktree / ".pre-commit-config.yaml").write_text(config)
+        repro = os.environ.get("REPROBUILD_REPRO") or shutil.which("repro")
+        self.assertIsNotNone(repro, "real Repro required")
+        factory = self.base / "factory"
+        subprocess.run([self.git, "init", "--quiet", str(factory)], check=True)
+        subprocess.run([repro, "hooks", "ensure", "--vcs", str(factory)], check=True, capture_output=True)
+        names = ("pre-commit", "pre-commit.repro-managed", "pre-push", "pre-push.repro-managed")
+        expected = {name: (factory / ".git/hooks" / name).read_bytes() for name in names}
+        command = [os.sys.executable, str(self.primary / "tools/install-canonical-hooks.py"), "--repro", repro]
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        for args in (["--bootstrap-managed"], [], ["--bootstrap-managed"], []):
+            result = subprocess.run(command + args, cwd=self.primary, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for name, body in expected.items():
+                self.assertEqual((self.primary / ".git/hooks" / name).read_bytes(), body)
+        for kind in ("pre-commit", "pre-push"):
+            local = self.primary / ".git/hooks" / (kind + ".repro-local")
+            self.assertEqual(local.read_bytes(), INSTALLER.canonical_body(INSTALLER.selected_tool("prek"), kind))
+        self.command("add", ".pre-commit-config.yaml")
+        result = subprocess.run([str(self.primary / ".git/hooks/pre-commit")], cwd=self.primary,
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.primary / "canonical-smoke-ran").is_file())
 
     def test_unknown_hook_refuses_before_bootstrap_writes(self) -> None:
         hook = self.primary / ".git/hooks/pre-commit"
