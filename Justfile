@@ -10,10 +10,14 @@ build:
 build-release:
   cargo build --release --locked
 
-# ct-print, which the trace-decoding tests run, is built in its own sibling
-# checkout's environment.
+# Build `ct-print` in the sibling codetracer-trace-format-nim checkout. The
+# trace-decoding tests run it at the fixed path
+# `../codetracer-trace-format-nim/ct-print`. The sibling's own `buildCtPrint`
+# nimble task (what its `build-ct-print` recipe runs) owns the compile flags.
+# It runs with this dev shell's Nim, as CI does: CI's dev shell has no
+# `direnv`, and a fresh sibling clone has no allowed `.envrc`.
 build-decoder:
-  cd ../codetracer-trace-format-nim && direnv exec . just build-ct-print
+  cd ../codetracer-trace-format-nim && nimble buildCtPrint
 
 # The Cargo.lock check runs before `cargo test`: when the lock is stale it names
 # the cause and the remedy, where `cargo test --locked` would only refuse the
