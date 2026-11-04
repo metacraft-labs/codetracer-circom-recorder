@@ -129,6 +129,24 @@ package codetracer_circom_recorder:
     "dirname"
     "grep"
     "git"
+    # The rest of what ``verify-cargo-lock-matches-trace-format.sh`` runs:
+    # it unpacks a ``git archive`` of the pinned trace-format revision
+    # (``tar``), builds a scratch shadow workspace (``mktemp``, ``mkdir``,
+    # ``cp``, ``ln``, ``basename``, ``rm``) and compares the re-resolved
+    # lock with the committed one (``cmp``, ``diff``, ``head``, ``cat``).
+    # Its edge's PATH is built from these declarations, and the script
+    # refuses to run when one is missing.
+    "tar"
+    "mktemp"
+    "mkdir"
+    "cp"
+    "ln"
+    "basename"
+    "rm"
+    "cmp"
+    "diff"
+    "head"
+    "cat"
 
     # Language-specific compiler / runtime tool. ``circom`` compiles the
     # ``.circom`` test fixtures the integration tests record against; it
@@ -319,5 +337,6 @@ package codetracer_circom_recorder:
       appendRegisteredActionToolIdentityRefs(testsRun.action.id, ["circom-bus"])
     appendRegisteredActionToolIdentityRefs(cliVerify.id, ["sh", "bash", "dirname", "grep"])
     appendRegisteredActionToolIdentityRefs(cargoLockVerify.id,
-      ["sh", "bash", "dirname", "grep", "git", "cargo"])
+      ["sh", "bash", "dirname", "grep", "git", "cargo", "tar", "mktemp",
+        "mkdir", "cp", "ln", "basename", "rm", "cmp", "diff", "head", "cat"])
     discard collect("test", @[testsRun.action, cliVerify, cargoLockVerify])
