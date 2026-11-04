@@ -252,9 +252,6 @@ package codetracer_circom_recorder:
         traceRoot / "codetracer_trace_format_capnp",
         traceRoot / "codetracer_trace_format_cbor_zstd",
         traceRoot / "codetracer_trace_writer", nimRoot / "src", nimRoot / "include"])
-    let decoderBuild = buildCtPrint(nimRoot)
-    let decoderBinary = ctPrintPath(nimRoot)
-
     let testsBuild = cargo.test(
       locked = true,
       noRun = true,
@@ -264,6 +261,14 @@ package codetracer_circom_recorder:
         "src", "tests", "test-programs"
       ] & traceManifestInputs & completeTestSourceInputs,
       extraOutputs = @["target/debug/deps"])
+
+    # The decoder edge runs after the test build: that build's
+    # ``codetracer_trace_writer_nim`` ``build.rs`` is what installs the
+    # sibling's nimble ``requires`` (``results``, ``stew``) into the nimble
+    # path ``buildCtPrint``'s compile resolves them from (its doc comment
+    # asks a recorder to pass that edge here).
+    let decoderBuild = buildCtPrint(nimRoot, after = @[testsBuild.action])
+    let decoderBinary = ctPrintPath(nimRoot)
 
     let testsRun = cargo.test(
       locked = true,
