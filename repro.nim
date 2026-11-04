@@ -11,12 +11,12 @@
 ## `shell(command = "bash scripts/...")` wrappers for the Rust build /
 ## test — delegation defeats the engine's incremental-build,
 ## action-cache, per-test invalidation, and the CI sharding the engine
-## grows into per ``reprobuild-specs/CI-Sharding.md``. The ONE
-## ``sh.shell`` edge below wraps the repo's CLI-convention verification
-## script, which is not a cargo target — it is a POSIX-shell assertion
-## harness that ``just test`` runs after ``cargo test`` (see ``Justfile``
-## ``test:``), so it is modelled as its own execute edge rather than
-## dropped.
+## grows into per ``reprobuild-specs/CI-Sharding.md``. The TWO
+## ``sh.shell`` edges below wrap the repo's shell verification scripts
+## — the CLI-convention check and the Cargo.lock-matches-trace-format
+## check. Neither is a cargo target; both are POSIX-shell assertion
+## harnesses that ``just test`` runs (see ``Justfile`` ``test:``), so
+## each is modelled as its own execute edge rather than dropped.
 ##
 ## On Windows the recipe drives real reprobuild tool provisioning via
 ## the tarball entries the ``uses:`` packages declare (cargo, rustc,
@@ -46,16 +46,17 @@
 ## in ``uses:``, and cargo does the cross-crate wiring itself.
 ##
 ## **Per-test platform gating.** ``just test`` is ``cargo test
-## --locked`` followed by the CLI-convention shell script — no test
-## FILE in this repo carries a per-host gate. ``tests/test_tracer.rs``
+## --locked`` bracketed by the two shell verification scripts
+## (Cargo.lock against trace-format first, the CLI convention last)
+## — no test FILE in this repo carries a per-host gate. ``tests/test_tracer.rs``
 ## and ``tests/test_ctfs_audit.rs`` contain no ``#[cfg(target_os =
 ## …)]`` / ``#[ignore]`` selection (they compile ``.circom`` fixtures
 ## via the pinned ``circom`` compiler and assert on the produced CTFS
 ## bundle on every host cargo + circom support), so the single
 ## whole-workspace ``cargo.test`` execute edge below matches the repo's
 ## own ``just test`` one-for-one — there is no per-OS partition to
-## model. The shell verify edge is POSIX-portable (``bash``) and is
-## likewise unconditional.
+## model. The two shell verify edges are
+## POSIX-portable (``bash``) and are likewise unconditional.
 ##
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
 ## canonical Rust-recorder recipes: the nix dev shell puts ``cargo`` /
@@ -67,9 +68,15 @@
 ##
 ## Circom: tests compile .circom sources via the pinned circom 2.1.5.
 
+import std/os
 import repro_project_dsl
+import tools/source_inputs
 import repro_dsl_stdlib/foreign_env
 import repro_dsl_stdlib/packages/sh
+import "../codetracer-trace-format-nim/build_writer_artifacts"
+
+when not defined(windows):
+  import circom_bus_sdk_tools
 
 package codetracer_circom_recorder:
   defaultToolProvisioning "path"
@@ -83,8 +90,10 @@ package codetracer_circom_recorder:
     "cargo >=1.85"
     # C compiler driver — rustc links through `cc`, and build scripts
     # (cc-rs, the Nim FFI) compile C. Declaring it puts its directory on
-    # every cargo edge's PATH. Windows links with MSVC instead.
-    when defined(linux):
+    # every cargo edge's PATH. Windows Cargo retains MSVC; the owning
+    # ct-print constructor separately uses GCC on Windows. Declaring this
+    # decoder compiler does not qualify native MSVC provisioning.
+    when defined(linux) or defined(windows):
       "gcc"
     elif defined(macosx):
       "clang"
@@ -111,15 +120,40 @@ package codetracer_circom_recorder:
       "pkg-config"
       "openssl"
 
-    # POSIX shell — drives the CLI-convention verification edge below,
-    # the same ``bash tests/verify-cli-convention-no-silent-skip.sh``
-    # step ``just test`` runs after ``cargo test``.
+    # POSIX shell — drives the two shell verification edges below, the
+    # same ``bash tests/verify-cli-convention-no-silent-skip.sh`` and
+    # ``bash tests/verify-cargo-lock-matches-trace-format.sh`` steps
+    # ``just test`` runs.
     "sh"
+    "bash"
+    "dirname"
+    "grep"
+    "git"
+    # The rest of what ``verify-cargo-lock-matches-trace-format.sh`` runs:
+    # it unpacks a ``git archive`` of the pinned trace-format revision
+    # (``tar``), builds a scratch shadow workspace (``mktemp``, ``mkdir``,
+    # ``cp``, ``ln``, ``basename``, ``rm``) and compares the re-resolved
+    # lock with the committed one (``cmp``, ``diff``, ``head``, ``cat``).
+    # Its edge's PATH is built from these declarations, and the script
+    # refuses to run when one is missing.
+    "tar"
+    "mktemp"
+    "mkdir"
+    "cp"
+    "ln"
+    "basename"
+    "rm"
+    "cmp"
+    "diff"
+    "head"
+    "cat"
 
     # Language-specific compiler / runtime tool. ``circom`` compiles the
     # ``.circom`` test fixtures the integration tests record against; it
     # is provisioned by ensure-circom.ps1 on Windows.
     "circom"
+    when not defined(windows):
+      "circom-bus"
     # `choco pack` / `choco push` in .github/workflows/publish-chocolatey.yml.
     # Windows-guarded because Chocolatey is a Windows package manager with no
     # POSIX build, so an unguarded entry would fail to resolve on Linux/macOS.
@@ -157,11 +191,11 @@ package codetracer_circom_recorder:
     # package declares).
     const binarySuffix = (when defined(windows): ".exe" else: "")
     const recorderBinary =
-      "target/release/codetracer-circom-recorder" & binarySuffix
+      "target/debug/codetracer-circom-recorder" & binarySuffix
 
     let recorderBuild = cargo.build(
       locked = true,
-      release = true,
+      release = false,
       actionId = "codetracer-circom-recorder.cargo-build",
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
@@ -169,6 +203,15 @@ package codetracer_circom_recorder:
       ],
       extraOutputs = @[recorderBinary])
     discard collect("default", @[recorderBuild])
+
+    # Preserve the original explicit `just build-release` shipping profile.
+    let recorderReleaseBuild = cargo.build(
+      locked = true,
+      release = true,
+      actionId = "codetracer-circom-recorder.cargo-build-release",
+      extraInputs = @["Cargo.toml", "Cargo.lock", "src"],
+      extraOutputs = @["target/release/codetracer-circom-recorder" & binarySuffix])
+    discard collect("release", @[recorderReleaseBuild])
 
     # ---- Test-binary build + run edges (the `test` collection) -------
     #
@@ -187,6 +230,25 @@ package codetracer_circom_recorder:
     # §M4 — the whole-binary edge becomes a fan-out point without
     # changing this recipe.
 
+    const nimRoot = "../codetracer-trace-format-nim"
+    const traceRoot = "../codetracer-trace-format"
+    let traceManifestInputs = @[traceRoot / "Cargo.toml", traceRoot / "Cargo.lock",
+      nimRoot / "build_ffi.nims", nimRoot / "build_ffi_flags.nim",
+      nimRoot / "config.nims", nimRoot / "nim.cfg",
+      nimRoot / "codetracer_trace_format.nimble"]
+    # Recognized-format Cargo depfiles do not record runtime fixture reads.
+    # Enumerate every genuine file and register actual recursive membership.
+    let completeTestSourceInputs = completeRegularSourceInputs(
+      packageProjectRoot(currentOwningPackage()),
+      @["src", "tests", "test-programs",
+        traceRoot / "codetracer_trace_types", traceRoot / "codetracer_trace_writer_nim",
+        traceRoot / "codetracer_trace_reader", traceRoot / "codetracer_ctfs",
+        traceRoot / "codetracer_trace_format_capnp",
+        traceRoot / "codetracer_trace_format_cbor_zstd",
+        traceRoot / "codetracer_trace_writer", nimRoot / "src", nimRoot / "include"])
+    let decoderBuild = buildCtPrint(nimRoot)
+    let decoderBinary = ctPrintPath(nimRoot)
+
     let testsBuild = cargo.test(
       locked = true,
       noRun = true,
@@ -194,18 +256,18 @@ package codetracer_circom_recorder:
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
         "src", "tests", "test-programs"
-      ],
+      ] & traceManifestInputs & completeTestSourceInputs,
       extraOutputs = @["target/debug/deps"])
 
     let testsRun = cargo.test(
       locked = true,
       actionId = "codetracer-circom-recorder.cargo-test-run",
-      after = @[testsBuild.action],
+      after = @[testsBuild.action, decoderBuild],
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
         "src", "tests", "test-programs",
-        "target/debug/deps"
-      ])
+        "target/debug/deps", decoderBinary
+      ] & traceManifestInputs & completeTestSourceInputs)
 
     # ---- CLI-convention verification edge -----------------------------
     #
@@ -220,18 +282,61 @@ package codetracer_circom_recorder:
     # itself does ``cargo build --locked --quiet`` (a no-op once the
     # recorder is built), then runs the freshly-built debug binary at
     # ``target/debug/codetracer-circom-recorder``; ``after`` the cargo
-    # test-build edge guarantees that binary exists before the script
-    # runs. Non-cacheable: the script inspects a runtime binary via
+    # test-run edge preserves canonical full-Cargo-before-CLI ordering.
+    # Non-cacheable: the script inspects a runtime binary via
     # automatic monitoring and asserts on ``--help`` text, so it is
     # re-run every ``repro test`` pass (matching ``just test``).
     let cliVerify = shell(
       command = "bash tests/verify-cli-convention-no-silent-skip.sh",
       actionId = "codetracer-circom-recorder.verify-cli-convention",
-      after = @[testsBuild.action],
+      after = @[testsRun.action],
       extraInputs = @[
         "tests/verify-cli-convention-no-silent-skip.sh",
         "Cargo.toml", "Cargo.lock", "src"
+      ] & traceManifestInputs & completeTestSourceInputs,
+      cacheable = false)
+
+    # ---- Cargo.lock vs trace-format verification edge ------------------
+    #
+    # ``just test`` runs ``bash
+    # tests/verify-cargo-lock-matches-trace-format.sh`` FIRST, before
+    # ``cargo test --locked``, so that a stale lock is reported with this
+    # diagnosis rather than only cargo's "needs to be updated but
+    # --locked was passed". ``Cargo.toml`` reaches three
+    # ``codetracer-trace-format`` crates by sibling path, and cargo
+    # writes those crates' own dependency edges into ``Cargo.lock``, so
+    # the lock is valid for exactly one trace-format tree. The script re-resolves a scratch copy of the lock with
+    # ``cargo update --workspace --offline`` against a ``git archive``
+    # of the trace-format revision ``repro.lock`` pins and against the
+    # sibling checkout on disk, and requires both results to be
+    # byte-identical to the committed lock (it never writes the
+    # committed lock). Like the CLI-convention script it is not a cargo
+    # target, so it is its own ``sh.shell`` execute edge. It needs no
+    # built binary, so it has no ``after``. Non-cacheable: its verdict
+    # depends on the sibling checkout and on the cargo registry index
+    # cache, both outside this repo, so it is re-run every ``repro
+    # test`` pass (matching ``just test``).
+    let cargoLockVerify = shell(
+      command = "bash tests/verify-cargo-lock-matches-trace-format.sh",
+      actionId = "codetracer-circom-recorder.verify-cargo-lock",
+      extraInputs = @[
+        "tests/verify-cargo-lock-matches-trace-format.sh",
+        "Cargo.toml", "Cargo.lock", "repro.lock"
       ],
       cacheable = false)
 
-    discard collect("test", @[testsRun.action, cliVerify])
+    for action in [recorderBuild, recorderReleaseBuild, testsBuild.action, testsRun.action, cliVerify]:
+      appendRegisteredActionToolIdentityRefs(action.id,
+        ["cargo", "rustc", "nim", "nimble", "git", "capnp", "zstd"])
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(action.id, ["gcc", "pkg-config", "openssl"])
+      elif defined(macosx):
+        appendRegisteredActionToolIdentityRefs(action.id, ["clang", "pkg-config", "openssl"])
+    appendRegisteredActionToolIdentityRefs(testsRun.action.id, ["circom"])
+    when not defined(windows):
+      appendRegisteredActionToolIdentityRefs(testsRun.action.id, ["circom-bus"])
+    appendRegisteredActionToolIdentityRefs(cliVerify.id, ["sh", "bash", "dirname", "grep"])
+    appendRegisteredActionToolIdentityRefs(cargoLockVerify.id,
+      ["sh", "bash", "dirname", "grep", "git", "cargo", "tar", "mktemp",
+        "mkdir", "cp", "ln", "basename", "rm", "cmp", "diff", "head", "cat"])
+    discard collect("test", @[testsRun.action, cliVerify, cargoLockVerify])

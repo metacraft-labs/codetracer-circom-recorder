@@ -1,0 +1,45 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.{rs,circom,py}]
+indent_size = 4
+
+[{Cargo.lock,repro.lock}]
+indent_size = 1
+
+[packaging/aur/.SRCINFO]
+indent_style = tab
+
+# The owning env script uses four-space nesting; generated packaging scripts
+# retain their actual launcher-template two-space code under the default rule.
+[env.ps1]
+indent_size = 4
+
+# Debian control description continuations require their literal leading space.
+[packaging/deb/control]
+indent_size = 1
+
+# Preserve the published license's literal layout; byte checks remain enabled.
+[LICENSE]
+indent_size = unset
+
+# Native Cargo fmt in unfiltered owning lint enforces all Rust code.
+# These exact files contain string payload physical lines, not code nesting.
+[{src/evaluator.rs,src/main.rs,src/tracer.rs,tests/test_line_count_table.rs,tests/test_tracer.rs}]
+indent_size = unset
+
+# shfmt-style tab indentation, as committed with the script.
+[scripts/install-git-hooks.sh]
+indent_style = tab
+
+# Its remedy text is a heredoc whose continuation lines are aligned under the
+# command they explain, not code nesting.
+[tests/verify-cargo-lock-matches-trace-format.sh]
+indent_size = unset
