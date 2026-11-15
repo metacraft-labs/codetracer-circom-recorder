@@ -36,6 +36,22 @@ class CommonHooksOwnership(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="circom-hook-ownership-")
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
+        # The private repositories must not read the developer's or runner's
+        # global/system Git configuration either: a self-hosted runner with
+        # commit.gpgsign=true and no usable key fails every fixture commit
+        # ("gpg failed to sign the data"). Every Git process this suite starts,
+        # directly or through the installer, Repro and Prek, inherits this
+        # environment. An empty file (not /dev/null) keeps `git config
+        # --global` reads well-defined. Negative controls that need a specific
+        # global configuration still override GIT_CONFIG_GLOBAL per command.
+        # Cleanups run last-in first-out, so these are removed before the
+        # inherited GIT_* values above are restored.
+        isolated_global = self.base / "isolated-global-gitconfig"
+        isolated_global.write_bytes(b"")
+        os.environ["GIT_CONFIG_GLOBAL"] = str(isolated_global)
+        os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+        self.addCleanup(os.environ.pop, "GIT_CONFIG_GLOBAL", None)
+        self.addCleanup(os.environ.pop, "GIT_CONFIG_NOSYSTEM", None)
         self.primary = self.base / "primary"
         self.linked = self.base / "linked"
         self.primary.mkdir()
