@@ -3,11 +3,22 @@
 Each case owns a temporary primary/linked worktree populated with the actual
 owning declaration bytes. It never changes the production checkout or a user
 hook. Native installer/template/default-hook controls remain separate tests.
+
+One fixture stands in for a different Git build: a two-line shell wrapper,
+named `git` and placed first on PATH, that runs the real Git with
+GIT_TEMPLATE_DIR set to a copy of the real templates whose pre-push.sample
+shebang names another bash. It is justified because the defect it guards
+against only appears with a Git distribution other than the one on the test
+host (Nix rewrites sample shebangs per platform), and installing a second Git
+is not possible here. It is not a mock: every command still runs the real Git,
+and the wrapper sets the variable itself, so the installer's isolation of
+GIT_TEMPLATE_DIR cannot strip it, just as it cannot strip a compiled-in path.
 """
 from __future__ import annotations
 import importlib.util
 import hashlib
 import os
+import shlex
 import stat
 from pathlib import Path
 import shutil
@@ -237,6 +248,100 @@ class CommonHooksOwnership(unittest.TestCase):
                     sample.chmod(original_mode)
                 self.assertEqual(sample.read_bytes(), original)
                 self.assertEqual(stat.S_IMODE(sample.stat().st_mode), original_mode)
+
+    def test_selected_git_sample_is_the_one_git_init_installed(self) -> None:
+        # The fixture repository was created by the same real Git, so its
+        # sample is exactly what the installer derives from that Git.
+        sample = (self.primary / ".git/hooks/pre-push.sample").read_bytes()
+        self.assertEqual(INSTALLER.selected_git_pre_push_sample(self.git), sample)
+        # An inherited template override must not change the reference: the
+        # derivation reports the distribution's own sample, not the caller's.
+        override = self.base / "inherited-template"
+        (override / "hooks").mkdir(parents=True)
+        (override / "hooks/pre-push.sample").write_bytes(b"#!/bin/sh\n# inherited override\n")
+        os.environ["GIT_TEMPLATE_DIR"] = str(override)
+        self.addCleanup(os.environ.pop, "GIT_TEMPLATE_DIR", None)
+        self.assertEqual(INSTALLER.selected_git_pre_push_sample(self.git), sample)
+
+    def other_git_build(self) -> tuple[Path, bytes]:
+        """Create a `git` that installs a sample no known hash covers.
+
+        Returns the directory to put first on PATH and that Git's sample body.
+        See the module docstring for why a wrapper stands in for a real build.
+        """
+        stock = self.base / "stock-template-source"
+        subprocess.run([self.git, "init", "--quiet", str(stock)], check=True)
+        template = self.base / "other-git-templates"
+        template.mkdir()
+        for name in ("hooks", "info"):
+            shutil.copytree(stock / ".git" / name, template / name, symlinks=True)
+        shutil.copy2(stock / ".git/description", template / "description")
+        sample = template / "hooks/pre-push.sample"
+        mode = stat.S_IMODE(sample.stat().st_mode)
+        _, rest = sample.read_bytes().split(b"\n", 1)
+        sample.write_bytes(b"#!/opt/other-git-build/bin/bash\n" + rest)
+        sample.chmod(mode)
+        bindir = self.base / "other-git-build"
+        bindir.mkdir()
+        wrapper = bindir / "git"
+        wrapper.write_text(
+            "#!/bin/sh\nexport GIT_TEMPLATE_DIR=" + shlex.quote(str(template))
+            + "\nexec " + shlex.quote(self.git) + ' "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        # Controls: this Git really creates the substituted sample, and that
+        # body is outside the known list, so only the comparison with the
+        # selected Git can qualify it.
+        body = sample.read_bytes()
+        created = self.base / "other-git-created"
+        subprocess.run([str(wrapper), "init", "--quiet", str(created)], check=True)
+        self.assertEqual((created / ".git/hooks/pre-push.sample").read_bytes(), body)
+        self.assertEqual(INSTALLER.selected_git_pre_push_sample(str(wrapper)), body)
+        self.assertNotIn(hashlib.sha256(body).hexdigest(), INSTALLER.KNOWN_GIT_PRE_PUSH_SAMPLE_BODIES)
+        self.assertNotEqual(body, (self.primary / ".git/hooks/pre-push.sample").read_bytes())
+        return bindir, body
+
+    def test_sample_from_selected_git_outside_known_list_installs(self) -> None:
+        # Regression: on macOS the development shell's Git installs a sample
+        # whose shebang names a darwin bash, a body absent from the known
+        # list, and the installer refused the repository that Git created.
+        bindir, body = self.other_git_build()
+        hooks = self.primary / ".git/hooks"
+        sample = hooks / "pre-push.sample"
+        mode = stat.S_IMODE(sample.stat().st_mode)
+        sample.write_bytes(body)
+        config = "repos:\n- repo: local\n  hooks:\n  - id: smoke\n    name: smoke\n    entry: /bin/sh -c 'touch canonical-smoke-ran'\n    language: system\n    always_run: true\n    pass_filenames: false\n"
+        for worktree in (self.primary, self.linked):
+            (worktree / ".pre-commit-config.yaml").write_text(config)
+        repro = os.environ.get("REPROBUILD_REPRO") or shutil.which("repro")
+        self.assertIsNotNone(repro, "real Repro required")
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["PATH"] = str(bindir) + os.pathsep + env["PATH"]
+        command = [os.sys.executable, str(self.primary / "tools/install-canonical-hooks.py"), "--repro", repro]
+        for args in (["--bootstrap-managed"], []):
+            result = subprocess.run(command + args, cwd=self.primary, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sample.read_bytes(), body)
+        self.assertEqual(stat.S_IMODE(sample.stat().st_mode), mode)
+        expected_local = INSTALLER.canonical_body(INSTALLER.selected_tool("prek"), "pre-push")
+        self.assertEqual((hooks / "pre-push.repro-local").read_bytes(), expected_local)
+
+    def test_sample_from_unselected_or_modified_git_template_refuses(self) -> None:
+        bindir, body = self.other_git_build()
+        sample = self.primary / ".git/hooks/pre-push.sample"
+        selected = {"PATH": str(bindir) + os.pathsep + os.environ["PATH"]}
+        for case, contents, env in (
+            # The other build's sample, judged against the real Git: it is
+            # neither what that Git installs nor a known body.
+            ("unselected Git", body, None),
+            # The selected Git's own sample, changed after creation.
+            ("modified", body + b"# genuinely modified sample\n", selected),
+        ):
+            with self.subTest(case=case):
+                sample.write_bytes(contents)
+                self.assert_installer_refuses(
+                    "modified pre-push hook body or mode: pre-push.sample", env, bootstrap=True)
 
     def test_unknown_managed_body_refuses_before_writes(self) -> None:
         hook = self.primary / ".git/hooks/pre-commit"

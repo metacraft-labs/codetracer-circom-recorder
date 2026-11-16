@@ -103,15 +103,27 @@ def native_install_to_terminal(argv: list[str], root: Path, env: dict[str, str])
     if code:
         raise subprocess.CalledProcessError(code, argv)
 
+def isolated_git_environment() -> dict[str, str]:
+    """Return the caller's environment with Git's inherited inputs removed.
+
+    Dropping every GIT_* variable removes repository redirection
+    (GIT_DIR, GIT_WORK_TREE), command configuration and GIT_TEMPLATE_DIR;
+    disabling the system and global files removes init.templateDir and
+    core.hooksPath. A private `git init` under this environment therefore
+    uses only the selected Git's compiled-in defaults.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    return env
+
 def selected_managed_bodies(repro: Path, git: str) -> dict[str, bytes]:
     """Ask the selected engine for its bodies without writing owning hooks.
 
     Isolate Git configuration so a global hooksPath or inherited Git metadata
     cannot redirect the private generation into somebody else's hooks.
     """
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env["GIT_CONFIG_NOSYSTEM"] = "1"
-    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env = isolated_git_environment()
     env["REPROBUILD_REPRO"] = str(repro)
     # The private generation is this installer's own scratch step: pin the
     # umask so the 0755 check below validates Repro's output, not the caller's.
@@ -180,11 +192,50 @@ LEGACY_MANAGED_BODIES = {
 # Exact immutable native Git sample templates: former host and both owning
 # Git2.51.2 package outputs, independently qualified full bodies/generated0755.
 # Git does not dispatch the .sample filename, even with its native0755 mode.
+#
+# This list is an additional accepted set, not the primary qualification
+# (see selected_git_pre_push_sample). A repository's sample is written once,
+# by whichever Git created or cloned it, and is never refreshed. A checkout
+# made before the development shell's Git was updated, or by the host Git
+# outside that shell, keeps an older distribution's sample; these are the
+# bodies such earlier Git builds are known to have installed.
 KNOWN_GIT_PRE_PUSH_SAMPLE_BODIES = {
     "99925aa22f22eed1a7e63b88b3416f2ecf28a222f5b627dfd6396bb8ec1b9508",
     "f35ff977f07f76b61e0ebc047bf500793d22d95fbcf86c6ab95561b6ba339bc8",
     "7b9d5ae35b46834cbd02a674efcae68e76994e513058d825ecd65b7060d35c83",
 }
+
+def selected_git_pre_push_sample(git: str) -> bytes | None:
+    """Return the pre-push.sample body the selected Git installs by default.
+
+    Git copies its template directory into every repository it initialises
+    or clones (https://git-scm.com/docs/git-init#_template_directory). Git
+    distributions patch those templates: Nix, for one, rewrites each sample's
+    shebang to the store path of its own bash, so the body differs between
+    platforms and Git builds and no fixed list of hashes can cover them.
+    Instead, let the selected Git create a private repository and read the
+    sample back. That is exactly the body this Git writes, without guessing
+    where its templates live (the compiled-in directory may be relative to
+    the executable on runtime-prefix builds).
+
+    The environment is isolated (isolated_git_environment), so GIT_TEMPLATE_DIR
+    and init.templateDir cannot substitute somebody else's template: the
+    result is the Git distribution's own sample. A repository created from a
+    custom template directory therefore carries a sample that is not from
+    the distribution, and pre_push_inventory keeps refusing it.
+
+    Returns None when this Git installs no regular pre-push.sample (a build
+    without templates); the caller then has nothing to compare against and
+    accepts only KNOWN_GIT_PRE_PUSH_SAMPLE_BODIES.
+    """
+    with hook_creation_umask(), tempfile.TemporaryDirectory(prefix="selected-git-template-") as directory:
+        root = Path(directory)
+        env = isolated_git_environment()
+        subprocess.run([git, "init", "--quiet", str(root)], env=env, check=True, capture_output=True)
+        sample = root / ".git/hooks/pre-push.sample"
+        if sample.is_symlink() or not sample.is_file():
+            return None
+        return sample.read_bytes()
 
 
 def git_template_sample_mode(mode: int) -> bool:
@@ -202,7 +253,14 @@ def git_template_sample_mode(mode: int) -> bool:
     return mode & ~0o775 == 0 and mode & 0o700 == 0o700
 
 
-def pre_push_inventory(hooks: Path, prek: str, managed_hashes: dict[str, str]) -> dict[str, tuple[bytes, int]]:
+def pre_push_inventory(
+    hooks: Path, prek: str, managed_hashes: dict[str, str], git_sample: bytes | None,
+) -> dict[str, tuple[bytes, int]]:
+    """Snapshot every pre-push* entry in hooks, refusing anything unqualified.
+
+    git_sample is the selected Git's own pre-push.sample body
+    (selected_git_pre_push_sample), or None when it installs none.
+    """
     inventory = {}
     if not hooks.exists():
         return inventory
@@ -221,12 +279,23 @@ def pre_push_inventory(hooks: Path, prek: str, managed_hashes: dict[str, str]) -
         body = path.read_bytes()
         mode = stat.S_IMODE(metadata.st_mode)
         digest = hashlib.sha256(body).hexdigest()
-        qualified_body = digest in KNOWN_GIT_PRE_PUSH_SAMPLE_BODIES if sample else digest in (expected, LEGACY_MANAGED_BODIES.get(path.name))
+        if sample:
+            # Whole-body equality with what the selected Git installs, or an
+            # exact body an earlier Git build is known to have installed.
+            qualified_body = (
+                (git_sample is not None and body == git_sample)
+                or digest in KNOWN_GIT_PRE_PUSH_SAMPLE_BODIES
+            )
+        else:
+            qualified_body = digest in (expected, LEGACY_MANAGED_BODIES.get(path.name))
         if path.name == "pre-push.repro-local":
             qualified_body = qualified_body or body in (native_generated_body(prek, "pre-push"), canonical_body(prek, "pre-push"))
         qualified_mode = git_template_sample_mode(mode) if sample else mode == 0o755
         if not qualified_mode or not qualified_body:
-            raise RuntimeError(f"modified pre-push hook body or mode: {path.name}")
+            detail = ""
+            if sample and not qualified_body and git_sample is None:
+                detail = " (the selected Git installs no pre-push.sample to compare with)"
+            raise RuntimeError(f"modified pre-push hook body or mode: {path.name}{detail}")
         inventory[path.name] = (body, mode)
     return inventory
 
@@ -367,7 +436,8 @@ def install_hooks() -> None:
                 validate_prior_owned_body(body, stat.S_IMODE(path.stat().st_mode), prek)
             elif hashlib.sha256(body).hexdigest() not in (expected_hash, LEGACY_MANAGED_BODIES.get(name)) or stat.S_IMODE(path.stat().st_mode) != 0o755:
                 raise RuntimeError(f"unknown or modified managed hook template: {name}")
-    original_pre_push = pre_push_inventory(hooks, prek, managed_hashes)
+    git_sample = selected_git_pre_push_sample(git)
+    original_pre_push = pre_push_inventory(hooks, prek, managed_hashes, git_sample)
 
     env = os.environ.copy()
     env["PREK_NO_FAST_PATH"] = "1"
@@ -424,7 +494,7 @@ def install_hooks() -> None:
         # Separate caller bootstrap: every ownership check above completed before
         # matching ensure creates any hook. Preserve existing pre-push entries.
         subprocess.run([str(repro), "hooks", "ensure", "--vcs", "."], cwd=root, env=env, check=True)
-        current_pre_push = pre_push_inventory(hooks, prek, managed_hashes)
+        current_pre_push = pre_push_inventory(hooks, prek, managed_hashes, git_sample)
         expected_names = {"pre-push", "pre-push.repro-managed"} | (set(original_pre_push) & {"pre-push.sample", "pre-push.repro-local"})
         if set(current_pre_push) != expected_names:
             raise RuntimeError("matching bootstrap did not create qualified pre-push hooks")
@@ -492,7 +562,7 @@ def install_hooks() -> None:
         for name in ("pre-push", "pre-push.repro-managed"):
             expected_push[name] = (managed_bodies[name], 0o755)
         expected_push["pre-push.repro-local"] = (canonical_push, 0o755)
-        if pre_push_inventory(hooks, prek, managed_hashes) != expected_push:
+        if pre_push_inventory(hooks, prek, managed_hashes, git_sample) != expected_push:
             raise RuntimeError("unexpected pre-push migration inventory")
         for name, digest in managed_hashes.items():
             target = hooks / name
@@ -510,7 +580,7 @@ def install_hooks() -> None:
                         target.unlink()
                 else:
                     atomic_write(target, snapshot[0], snapshot[1])
-            if pre_push_inventory(hooks, prek, managed_hashes) != original_pre_push:
+            if pre_push_inventory(hooks, prek, managed_hashes, git_sample) != original_pre_push:
                 raise RuntimeError("failed migration did not restore original pre-push inventory")
         if subprocess.check_output([git, "config", "--null", "--show-origin", "--list"], cwd=root) != persisted_config:
             raise RuntimeError("persisted Git configuration changed during native installation")
