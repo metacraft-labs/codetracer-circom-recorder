@@ -167,6 +167,45 @@ class CommonHooksOwnership(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((self.primary / "canonical-smoke-ran").is_file())
 
+    def test_group_writable_umask_installs_owner_only_writable_hooks(self) -> None:
+        # Regression: some self-hosted CI runners run with
+        # umask 002, under which Repro and Prek create 0775 hooks and the
+        # installer used to refuse its own private generation ("selected Repro
+        # generated invalid managed hook"). The installer must pin the umask
+        # for the hooks it generates, so the outcome is the same 0755 shape
+        # as under the common 022 default. Children inherit this test's umask.
+        previous_umask = os.umask(0o002)
+        self.addCleanup(os.umask, previous_umask)
+        repro = os.environ.get("REPROBUILD_REPRO") or shutil.which("repro")
+        self.assertIsNotNone(repro, "real Repro required")
+        # In-process library use must succeed and must restore the caller's umask.
+        bodies = INSTALLER.selected_managed_bodies(Path(repro), self.git)
+        self.assertEqual(set(bodies), {"pre-commit", "pre-commit.repro-managed", "pre-push", "pre-push.repro-managed"})
+        self.assertEqual(os.umask(0o002), 0o002, "selected_managed_bodies leaked its pinned umask")
+        config = "repos:\n- repo: local\n  hooks:\n  - id: smoke\n    name: smoke\n    entry: /bin/sh -c 'touch canonical-smoke-ran'\n    language: system\n    always_run: true\n    pass_filenames: false\n"
+        for worktree in (self.primary, self.linked):
+            (worktree / ".pre-commit-config.yaml").write_text(config)
+        command = [os.sys.executable, str(self.primary / "tools/install-canonical-hooks.py"), "--repro", repro]
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        hooks = self.primary / ".git/hooks"
+        # setUp ran `git init` under the suite's ambient umask; reproduce the
+        # 0775 sample a repository created under umask 002 carries (Git copies
+        # templates as 0777 & ~umask) so that pre-existing state is covered too.
+        (hooks / "pre-push.sample").chmod(0o775)
+        for args in (["--bootstrap-managed"], []):
+            result = subprocess.run(command + args, cwd=self.primary, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name, body in bodies.items():
+            target = hooks / name
+            self.assertFalse(target.is_symlink())
+            self.assertEqual(target.read_bytes(), body, name)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755, name)
+        for kind in ("pre-commit", "pre-push"):
+            local = hooks / (kind + ".repro-local")
+            self.assertEqual(local.read_bytes(), INSTALLER.canonical_body(INSTALLER.selected_tool("prek"), kind))
+            self.assertEqual(stat.S_IMODE(local.stat().st_mode), 0o755, local.name)
+
     def test_unknown_hook_refuses_before_bootstrap_writes(self) -> None:
         hook = self.primary / ".git/hooks/pre-commit"
         hook.write_bytes(b"#!/bin/sh\necho genuinely unknown owned fixture\n")
@@ -177,13 +216,17 @@ class CommonHooksOwnership(unittest.TestCase):
         sample = self.primary / ".git/hooks/pre-push.sample"
         original = sample.read_bytes()
         original_mode = stat.S_IMODE(sample.stat().st_mode)
-        for mutation in ("body", "mode"):
+        # A non-executable or world-writable sample is no mode `git init`
+        # produces under any umask (0777 & ~umask), so it was changed later.
+        for mutation in ("body", "mode", "world-writable"):
             with self.subTest(mutation=mutation):
                 try:
                     if mutation == "body":
                         sample.write_bytes(original + b"# genuinely modified sample\n")
-                    else:
+                    elif mutation == "mode":
                         sample.chmod(0o644)
+                    else:
+                        sample.chmod(0o777)
                     self.assert_installer_refuses("modified pre-push hook body or mode", bootstrap=True)
                 finally:
                     sample.write_bytes(original)
