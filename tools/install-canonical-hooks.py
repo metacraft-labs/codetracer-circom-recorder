@@ -51,6 +51,22 @@ def hook_creation_umask():
 def run(argv: list[str], cwd: Path) -> str:
     return subprocess.check_output(argv, cwd=cwd, text=True, stderr=subprocess.STDOUT).strip()
 
+def canonical_location(path: Path) -> Path:
+    """Return path with every ancestor symlink resolved but the leaf kept.
+
+    Git reports repository locations after resolving symlinks, so on macOS,
+    where /var and /tmp are symlinks into /private, a repository under the
+    default temporary directory is reported as /private/var/... while the
+    caller names it /var/.... Comparing the two forms refuses a genuine owner.
+    Only the ancestors are resolved: the leaf itself is left lexical, so a
+    leaf that is a symlink still compares unequal to the real directory Git
+    reports, and the explicit is_symlink() refusals keep their meaning.
+    """
+    absolute = path.absolute()
+    if absolute.name in ("", ".."):
+        raise RuntimeError("unqualified path without a final component: " + str(path))
+    return absolute.parent.resolve(strict=True) / absolute.name
+
 def native_install_environment(env: dict[str, str], git: str, root: Path, hooks: Path) -> dict[str, str]:
     # Native Prek refuses a nonempty hooksPath, then installs in common/hooks.
     # Override only this child command after proving that same owned destination.
@@ -59,7 +75,10 @@ def native_install_environment(env: dict[str, str], git: str, root: Path, hooks:
         raise RuntimeError("ambiguous inherited Git command configuration")
     common = Path(run([git, "rev-parse", "--path-format=absolute", "--git-common-dir"], root))
     default_hooks = common / "hooks"
-    if default_hooks.is_symlink() or default_hooks.resolve() != hooks:
+    # Git reports common symlink-resolved; compare it with the canonical form
+    # of the caller's hooks path, never with the caller's spelling of it.
+    if (default_hooks.is_symlink() or hooks.is_symlink()
+            or default_hooks.resolve() != canonical_location(hooks)):
         raise RuntimeError("native default hooks differ from verified owning hooks")
     # main already validates effective ownership, including its narrowly
     # qualified registered-worktree relative-path repair before installation.
@@ -219,7 +238,15 @@ OWNING_DECLARATIONS = (
 )
 
 def owned_common_directory(git: str, root: Path) -> Path:
-    # Git registration and primary-owned metadata establish shared-hook ownership.
+    """Return the symlink-resolved Git common directory root's hooks belong to.
+
+    Git registration and primary-owned metadata establish shared-hook
+    ownership. Git reports worktree and metadata paths symlink-resolved, so
+    root enters in canonical form (see canonical_location) and every
+    comparison below is between canonical paths. A root that is itself a
+    symlink still matches no registered worktree and is refused.
+    """
+    root = canonical_location(root)
     raw_common = Path(run([git, "rev-parse", "--git-common-dir"], root))
     lexical_common = raw_common if raw_common.is_absolute() else root / raw_common
     if lexical_common.is_symlink():

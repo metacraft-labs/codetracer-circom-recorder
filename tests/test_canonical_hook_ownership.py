@@ -35,7 +35,7 @@ class CommonHooksOwnership(unittest.TestCase):
         self.addCleanup(os.environ.update, inherited_git)
         self.temporary = tempfile.TemporaryDirectory(prefix="circom-hook-ownership-")
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = self.fixture_base(Path(self.temporary.name))
         # The private repositories must not read the developer's or runner's
         # global/system Git configuration either: a self-hosted runner with
         # commit.gpgsign=true and no usable key fails every fixture commit
@@ -71,6 +71,10 @@ class CommonHooksOwnership(unittest.TestCase):
         self.command("add", "--", *INSTALLER.OWNING_DECLARATIONS)
         self.command("commit", "-q", "-m", "Own exact declaration fixture")
         self.command("worktree", "add", "--detach", str(self.linked), "HEAD")
+
+    def fixture_base(self, temporary: Path) -> Path:
+        """Directory, as the caller names it, that holds every fixture repo."""
+        return temporary
 
     def command(self, *args: str) -> str:
         result = subprocess.run([self.git, *args], cwd=self.primary, text=True,
@@ -274,7 +278,8 @@ class CommonHooksOwnership(unittest.TestCase):
         self.assertEqual(list(external.iterdir()), [])
 
     def test_primary_and_registered_linked_worktree(self) -> None:
-        expected = self.primary / ".git"
+        # The common directory is returned symlink-resolved, as Git reports it.
+        expected = self.primary.resolve(strict=True) / ".git"
         self.assertEqual(INSTALLER.owned_common_directory(self.git, self.primary), expected)
         self.assertEqual(INSTALLER.owned_common_directory(self.git, self.linked), expected)
 
@@ -300,6 +305,26 @@ class CommonHooksOwnership(unittest.TestCase):
         (unregistered / ".git").write_bytes((self.linked / ".git").read_bytes())
         with self.assertRaisesRegex(RuntimeError, "not registered"):
             INSTALLER.owned_common_directory(self.git, unregistered)
+
+    def test_symlinked_worktree_root_refuses(self) -> None:
+        # Only ancestors are canonicalised: a root that is itself a symlink to
+        # the registered primary is not that worktree.
+        alias = self.base / "primary-alias"
+        alias.symlink_to(self.primary, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "not registered"):
+            INSTALLER.owned_common_directory(self.git, alias)
+
+    def test_symlinked_hooks_argument_refuses_without_writes(self) -> None:
+        # A hooks path that is a symlink to the genuine default hooks directory
+        # must not be accepted as that directory.
+        hooks = self.primary / ".git/hooks"
+        hooks.mkdir(exist_ok=True)
+        alias = self.base / "hooks-alias"
+        alias.symlink_to(hooks, target_is_directory=True)
+        original = self.inventory()
+        with self.assertRaisesRegex(RuntimeError, "native default hooks differ"):
+            INSTALLER.native_install_environment(os.environ.copy(), self.git, self.primary, alias)
+        self.assertEqual(self.inventory(), original)
 
     def test_symlink_declaration_refuses(self) -> None:
         config = self.linked / ".pre-commit-config.yaml"
@@ -331,6 +356,29 @@ class CommonHooksOwnership(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ambiguous inherited"):
                 INSTALLER.native_install_environment(env, self.git, self.primary, self.primary / ".git/hooks")
             self.assertEqual(self.inventory(), original)
+
+class SymlinkedTemporaryRootOwnership(CommonHooksOwnership):
+    """Rerun every ownership case with the fixtures reached through a symlink.
+
+    On macOS /var and /tmp are symlinks into /private, so a repository made
+    under tempfile's default directory is named /var/folders/... by the caller
+    but reported by Git as /private/var/folders/.... Comparing the two forms
+    refused genuine owners there ("owning worktree is not registered",
+    "native default hooks differ from verified owning hooks"). This class
+    reproduces that shape on every host with a real symlink, so the whole
+    suite also proves that an ancestor symlink does not change any verdict
+    while the leaf symlink refusals above still hold.
+    """
+
+    def fixture_base(self, temporary: Path) -> Path:
+        real = temporary / "real-root"
+        real.mkdir()
+        alias = temporary / "symlinked-root"
+        alias.symlink_to(real, target_is_directory=True)
+        # Control: the fixtures really are named through a symlinked ancestor.
+        self.assertTrue(alias.is_symlink())
+        self.assertNotEqual(alias.resolve(strict=True), alias)
+        return alias
 
 if __name__ == "__main__":
     unittest.main()
