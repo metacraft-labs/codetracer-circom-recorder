@@ -157,6 +157,16 @@ package codetracer_circom_recorder:
     "diff"
     "head"
     "cat"
+    # just runs the Justfile recipes, which CI's cross-check steps call
+    # through `dev-exec` (`repro exec`), so it must be declared here: the
+    # activated environment's PATH is the runner's plus the declared tools,
+    # and the Windows runner has no `just`.
+    "just"
+    # ``just test`` (and ``just lint``) start with ``python3 -m unittest``
+    # over ``tests/test_canonical_hook_ownership.py``, so the cross-check
+    # needs python3 in the activated environment on every lane. The flake dev
+    # shell supplies it on Linux/macOS; on Windows reprobuild realizes it.
+    "python3"
 
     # Language-specific compiler / runtime tool. ``circom`` compiles the
     # ``.circom`` test fixtures the integration tests record against; it
