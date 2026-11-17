@@ -28,4 +28,8 @@ jobs:
     uses: metacraft-labs/devops-modules/.github/workflows/reusable-recorder-ci.yml@dev
     with:
       prepare-recipe: prepare-ci
+      # The hook-ownership tests that `just lint` runs need a real `repro`
+      # engine and fail rather than skip without one; the nix dev env installs
+      # none, so ask the shared workflow to install the CLI.
+      install-repro: true
     secrets: inherit

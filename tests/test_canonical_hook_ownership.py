@@ -3,11 +3,22 @@
 Each case owns a temporary primary/linked worktree populated with the actual
 owning declaration bytes. It never changes the production checkout or a user
 hook. Native installer/template/default-hook controls remain separate tests.
+
+One fixture stands in for a different Git build: a two-line shell wrapper,
+named `git` and placed first on PATH, that runs the real Git with
+GIT_TEMPLATE_DIR set to a copy of the real templates whose pre-push.sample
+shebang names another bash. It is justified because the defect it guards
+against only appears with a Git distribution other than the one on the test
+host (Nix rewrites sample shebangs per platform), and installing a second Git
+is not possible here. It is not a mock: every command still runs the real Git,
+and the wrapper sets the variable itself, so the installer's isolation of
+GIT_TEMPLATE_DIR cannot strip it, just as it cannot strip a compiled-in path.
 """
 from __future__ import annotations
 import importlib.util
 import hashlib
 import os
+import shlex
 import stat
 from pathlib import Path
 import shutil
@@ -25,9 +36,33 @@ SPEC.loader.exec_module(INSTALLER)
 
 class CommonHooksOwnership(unittest.TestCase):
     def setUp(self) -> None:
+        # This suite also runs inside a real Git hook. Inherited repository,
+        # index and command-configuration variables belong to that outer Git
+        # transaction, not these private repositories. Restore them afterward;
+        # individual negative controls explicitly inject their own Git settings.
+        inherited_git = {key: value for key, value in os.environ.items() if key.startswith("GIT_")}
+        for key in inherited_git:
+            del os.environ[key]
+        self.addCleanup(os.environ.update, inherited_git)
         self.temporary = tempfile.TemporaryDirectory(prefix="circom-hook-ownership-")
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = self.fixture_base(Path(self.temporary.name))
+        # The private repositories must not read the developer's or runner's
+        # global/system Git configuration either: a self-hosted runner with
+        # commit.gpgsign=true and no usable key fails every fixture commit
+        # ("gpg failed to sign the data"). Every Git process this suite starts,
+        # directly or through the installer, Repro and Prek, inherits this
+        # environment. An empty file (not /dev/null) keeps `git config
+        # --global` reads well-defined. Negative controls that need a specific
+        # global configuration still override GIT_CONFIG_GLOBAL per command.
+        # Cleanups run last-in first-out, so these are removed before the
+        # inherited GIT_* values above are restored.
+        isolated_global = self.base / "isolated-global-gitconfig"
+        isolated_global.write_bytes(b"")
+        os.environ["GIT_CONFIG_GLOBAL"] = str(isolated_global)
+        os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+        self.addCleanup(os.environ.pop, "GIT_CONFIG_GLOBAL", None)
+        self.addCleanup(os.environ.pop, "GIT_CONFIG_NOSYSTEM", None)
         self.primary = self.base / "primary"
         self.linked = self.base / "linked"
         self.primary.mkdir()
@@ -48,8 +83,15 @@ class CommonHooksOwnership(unittest.TestCase):
         self.command("commit", "-q", "-m", "Own exact declaration fixture")
         self.command("worktree", "add", "--detach", str(self.linked), "HEAD")
 
+    def fixture_base(self, temporary: Path) -> Path:
+        """Directory, as the caller names it, that holds every fixture repo."""
+        return temporary
+
     def command(self, *args: str) -> str:
-        return subprocess.check_output([self.git, *args], cwd=self.primary, text=True, stderr=subprocess.STDOUT).strip()
+        result = subprocess.run([self.git, *args], cwd=self.primary, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        return result.stdout.strip()
 
     def inventory(self) -> dict[str, tuple[str, int, str]]:
         result = {}
@@ -101,13 +143,83 @@ class CommonHooksOwnership(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Ownership-checked matching managed bootstrap complete", result.stdout)
         hooks = self.primary / ".git/hooks"
-        self.assertEqual(set(INSTALLER.pre_push_inventory(hooks, INSTALLER.selected_tool("prek"))), {"pre-push", "pre-push.repro-managed", "pre-push.sample"})
-        for name, expected in INSTALLER.KNOWN_MANAGED_BODIES.items():
+        expected_bodies = INSTALLER.selected_managed_bodies(Path(repro), self.git)
+        self.assertEqual({p.name for p in hooks.glob("pre-push*")}, {"pre-push", "pre-push.repro-managed", "pre-push.sample"})
+        for name, expected in expected_bodies.items():
             target = hooks / name
             self.assertFalse(target.is_symlink())
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
-            self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), expected)
+            self.assertEqual(target.read_bytes(), expected)
         self.assertEqual({name: (self.primary / name).read_bytes() for name in INSTALLER.OWNING_DECLARATIONS}, source_before)
+
+    def test_selected_engine_full_install_and_reinstall(self) -> None:
+        # A genuine local system hook isolates chaining from upstream checker
+        # downloads. Both registered worktrees retain the same declaration.
+        config = "repos:\n- repo: local\n  hooks:\n  - id: smoke\n    name: smoke\n    entry: /bin/sh -c 'touch canonical-smoke-ran'\n    language: system\n    always_run: true\n    pass_filenames: false\n"
+        for worktree in (self.primary, self.linked):
+            (worktree / ".pre-commit-config.yaml").write_text(config)
+        repro = os.environ.get("REPROBUILD_REPRO") or shutil.which("repro")
+        self.assertIsNotNone(repro, "real Repro required")
+        factory = self.base / "factory"
+        subprocess.run([self.git, "init", "--quiet", str(factory)], check=True)
+        subprocess.run([repro, "hooks", "ensure", "--vcs", str(factory)], check=True, capture_output=True)
+        names = ("pre-commit", "pre-commit.repro-managed", "pre-push", "pre-push.repro-managed")
+        expected = {name: (factory / ".git/hooks" / name).read_bytes() for name in names}
+        command = [os.sys.executable, str(self.primary / "tools/install-canonical-hooks.py"), "--repro", repro]
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        for args in (["--bootstrap-managed"], [], ["--bootstrap-managed"], []):
+            result = subprocess.run(command + args, cwd=self.primary, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for name, body in expected.items():
+                self.assertEqual((self.primary / ".git/hooks" / name).read_bytes(), body)
+        for kind in ("pre-commit", "pre-push"):
+            local = self.primary / ".git/hooks" / (kind + ".repro-local")
+            self.assertEqual(local.read_bytes(), INSTALLER.canonical_body(INSTALLER.selected_tool("prek"), kind))
+        self.command("add", ".pre-commit-config.yaml")
+        result = subprocess.run([str(self.primary / ".git/hooks/pre-commit")], cwd=self.primary,
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.primary / "canonical-smoke-ran").is_file())
+
+    def test_group_writable_umask_installs_owner_only_writable_hooks(self) -> None:
+        # Regression: some self-hosted CI runners run with
+        # umask 002, under which Repro and Prek create 0775 hooks and the
+        # installer used to refuse its own private generation ("selected Repro
+        # generated invalid managed hook"). The installer must pin the umask
+        # for the hooks it generates, so the outcome is the same 0755 shape
+        # as under the common 022 default. Children inherit this test's umask.
+        previous_umask = os.umask(0o002)
+        self.addCleanup(os.umask, previous_umask)
+        repro = os.environ.get("REPROBUILD_REPRO") or shutil.which("repro")
+        self.assertIsNotNone(repro, "real Repro required")
+        # In-process library use must succeed and must restore the caller's umask.
+        bodies = INSTALLER.selected_managed_bodies(Path(repro), self.git)
+        self.assertEqual(set(bodies), {"pre-commit", "pre-commit.repro-managed", "pre-push", "pre-push.repro-managed"})
+        self.assertEqual(os.umask(0o002), 0o002, "selected_managed_bodies leaked its pinned umask")
+        config = "repos:\n- repo: local\n  hooks:\n  - id: smoke\n    name: smoke\n    entry: /bin/sh -c 'touch canonical-smoke-ran'\n    language: system\n    always_run: true\n    pass_filenames: false\n"
+        for worktree in (self.primary, self.linked):
+            (worktree / ".pre-commit-config.yaml").write_text(config)
+        command = [os.sys.executable, str(self.primary / "tools/install-canonical-hooks.py"), "--repro", repro]
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        hooks = self.primary / ".git/hooks"
+        # setUp ran `git init` under the suite's ambient umask; reproduce the
+        # 0775 sample a repository created under umask 002 carries (Git copies
+        # templates as 0777 & ~umask) so that pre-existing state is covered too.
+        (hooks / "pre-push.sample").chmod(0o775)
+        for args in (["--bootstrap-managed"], []):
+            result = subprocess.run(command + args, cwd=self.primary, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name, body in bodies.items():
+            target = hooks / name
+            self.assertFalse(target.is_symlink())
+            self.assertEqual(target.read_bytes(), body, name)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755, name)
+        for kind in ("pre-commit", "pre-push"):
+            local = hooks / (kind + ".repro-local")
+            self.assertEqual(local.read_bytes(), INSTALLER.canonical_body(INSTALLER.selected_tool("prek"), kind))
+            self.assertEqual(stat.S_IMODE(local.stat().st_mode), 0o755, local.name)
 
     def test_unknown_hook_refuses_before_bootstrap_writes(self) -> None:
         hook = self.primary / ".git/hooks/pre-commit"
@@ -119,19 +231,117 @@ class CommonHooksOwnership(unittest.TestCase):
         sample = self.primary / ".git/hooks/pre-push.sample"
         original = sample.read_bytes()
         original_mode = stat.S_IMODE(sample.stat().st_mode)
-        for mutation in ("body", "mode"):
+        # A non-executable or world-writable sample is no mode `git init`
+        # produces under any umask (0777 & ~umask), so it was changed later.
+        for mutation in ("body", "mode", "world-writable"):
             with self.subTest(mutation=mutation):
                 try:
                     if mutation == "body":
                         sample.write_bytes(original + b"# genuinely modified sample\n")
-                    else:
+                    elif mutation == "mode":
                         sample.chmod(0o644)
+                    else:
+                        sample.chmod(0o777)
                     self.assert_installer_refuses("modified pre-push hook body or mode", bootstrap=True)
                 finally:
                     sample.write_bytes(original)
                     sample.chmod(original_mode)
                 self.assertEqual(sample.read_bytes(), original)
                 self.assertEqual(stat.S_IMODE(sample.stat().st_mode), original_mode)
+
+    def test_selected_git_sample_is_the_one_git_init_installed(self) -> None:
+        # The fixture repository was created by the same real Git, so its
+        # sample is exactly what the installer derives from that Git.
+        sample = (self.primary / ".git/hooks/pre-push.sample").read_bytes()
+        self.assertEqual(INSTALLER.selected_git_pre_push_sample(self.git), sample)
+        # An inherited template override must not change the reference: the
+        # derivation reports the distribution's own sample, not the caller's.
+        override = self.base / "inherited-template"
+        (override / "hooks").mkdir(parents=True)
+        (override / "hooks/pre-push.sample").write_bytes(b"#!/bin/sh\n# inherited override\n")
+        os.environ["GIT_TEMPLATE_DIR"] = str(override)
+        self.addCleanup(os.environ.pop, "GIT_TEMPLATE_DIR", None)
+        self.assertEqual(INSTALLER.selected_git_pre_push_sample(self.git), sample)
+
+    def other_git_build(self) -> tuple[Path, bytes]:
+        """Create a `git` that installs a sample no known hash covers.
+
+        Returns the directory to put first on PATH and that Git's sample body.
+        See the module docstring for why a wrapper stands in for a real build.
+        """
+        stock = self.base / "stock-template-source"
+        subprocess.run([self.git, "init", "--quiet", str(stock)], check=True)
+        template = self.base / "other-git-templates"
+        template.mkdir()
+        for name in ("hooks", "info"):
+            shutil.copytree(stock / ".git" / name, template / name, symlinks=True)
+        shutil.copy2(stock / ".git/description", template / "description")
+        sample = template / "hooks/pre-push.sample"
+        mode = stat.S_IMODE(sample.stat().st_mode)
+        _, rest = sample.read_bytes().split(b"\n", 1)
+        sample.write_bytes(b"#!/opt/other-git-build/bin/bash\n" + rest)
+        sample.chmod(mode)
+        bindir = self.base / "other-git-build"
+        bindir.mkdir()
+        wrapper = bindir / "git"
+        wrapper.write_text(
+            "#!/bin/sh\nexport GIT_TEMPLATE_DIR=" + shlex.quote(str(template))
+            + "\nexec " + shlex.quote(self.git) + ' "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        # Controls: this Git really creates the substituted sample, and that
+        # body is outside the known list, so only the comparison with the
+        # selected Git can qualify it.
+        body = sample.read_bytes()
+        created = self.base / "other-git-created"
+        subprocess.run([str(wrapper), "init", "--quiet", str(created)], check=True)
+        self.assertEqual((created / ".git/hooks/pre-push.sample").read_bytes(), body)
+        self.assertEqual(INSTALLER.selected_git_pre_push_sample(str(wrapper)), body)
+        self.assertNotIn(hashlib.sha256(body).hexdigest(), INSTALLER.KNOWN_GIT_PRE_PUSH_SAMPLE_BODIES)
+        self.assertNotEqual(body, (self.primary / ".git/hooks/pre-push.sample").read_bytes())
+        return bindir, body
+
+    def test_sample_from_selected_git_outside_known_list_installs(self) -> None:
+        # Regression: on macOS the development shell's Git installs a sample
+        # whose shebang names a darwin bash, a body absent from the known
+        # list, and the installer refused the repository that Git created.
+        bindir, body = self.other_git_build()
+        hooks = self.primary / ".git/hooks"
+        sample = hooks / "pre-push.sample"
+        mode = stat.S_IMODE(sample.stat().st_mode)
+        sample.write_bytes(body)
+        config = "repos:\n- repo: local\n  hooks:\n  - id: smoke\n    name: smoke\n    entry: /bin/sh -c 'touch canonical-smoke-ran'\n    language: system\n    always_run: true\n    pass_filenames: false\n"
+        for worktree in (self.primary, self.linked):
+            (worktree / ".pre-commit-config.yaml").write_text(config)
+        repro = os.environ.get("REPROBUILD_REPRO") or shutil.which("repro")
+        self.assertIsNotNone(repro, "real Repro required")
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["PATH"] = str(bindir) + os.pathsep + env["PATH"]
+        command = [os.sys.executable, str(self.primary / "tools/install-canonical-hooks.py"), "--repro", repro]
+        for args in (["--bootstrap-managed"], []):
+            result = subprocess.run(command + args, cwd=self.primary, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sample.read_bytes(), body)
+        self.assertEqual(stat.S_IMODE(sample.stat().st_mode), mode)
+        expected_local = INSTALLER.canonical_body(INSTALLER.selected_tool("prek"), "pre-push")
+        self.assertEqual((hooks / "pre-push.repro-local").read_bytes(), expected_local)
+
+    def test_sample_from_unselected_or_modified_git_template_refuses(self) -> None:
+        bindir, body = self.other_git_build()
+        sample = self.primary / ".git/hooks/pre-push.sample"
+        selected = {"PATH": str(bindir) + os.pathsep + os.environ["PATH"]}
+        for case, contents, env in (
+            # The other build's sample, judged against the real Git: it is
+            # neither what that Git installs nor a known body.
+            ("unselected Git", body, None),
+            # The selected Git's own sample, changed after creation.
+            ("modified", body + b"# genuinely modified sample\n", selected),
+        ):
+            with self.subTest(case=case):
+                sample.write_bytes(contents)
+                self.assert_installer_refuses(
+                    "modified pre-push hook body or mode: pre-push.sample", env, bootstrap=True)
 
     def test_unknown_managed_body_refuses_before_writes(self) -> None:
         hook = self.primary / ".git/hooks/pre-commit"
@@ -173,7 +383,8 @@ class CommonHooksOwnership(unittest.TestCase):
         self.assertEqual(list(external.iterdir()), [])
 
     def test_primary_and_registered_linked_worktree(self) -> None:
-        expected = self.primary / ".git"
+        # The common directory is returned symlink-resolved, as Git reports it.
+        expected = self.primary.resolve(strict=True) / ".git"
         self.assertEqual(INSTALLER.owned_common_directory(self.git, self.primary), expected)
         self.assertEqual(INSTALLER.owned_common_directory(self.git, self.linked), expected)
 
@@ -199,6 +410,26 @@ class CommonHooksOwnership(unittest.TestCase):
         (unregistered / ".git").write_bytes((self.linked / ".git").read_bytes())
         with self.assertRaisesRegex(RuntimeError, "not registered"):
             INSTALLER.owned_common_directory(self.git, unregistered)
+
+    def test_symlinked_worktree_root_refuses(self) -> None:
+        # Only ancestors are canonicalised: a root that is itself a symlink to
+        # the registered primary is not that worktree.
+        alias = self.base / "primary-alias"
+        alias.symlink_to(self.primary, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "not registered"):
+            INSTALLER.owned_common_directory(self.git, alias)
+
+    def test_symlinked_hooks_argument_refuses_without_writes(self) -> None:
+        # A hooks path that is a symlink to the genuine default hooks directory
+        # must not be accepted as that directory.
+        hooks = self.primary / ".git/hooks"
+        hooks.mkdir(exist_ok=True)
+        alias = self.base / "hooks-alias"
+        alias.symlink_to(hooks, target_is_directory=True)
+        original = self.inventory()
+        with self.assertRaisesRegex(RuntimeError, "native default hooks differ"):
+            INSTALLER.native_install_environment(os.environ.copy(), self.git, self.primary, alias)
+        self.assertEqual(self.inventory(), original)
 
     def test_symlink_declaration_refuses(self) -> None:
         config = self.linked / ".pre-commit-config.yaml"
@@ -230,6 +461,29 @@ class CommonHooksOwnership(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ambiguous inherited"):
                 INSTALLER.native_install_environment(env, self.git, self.primary, self.primary / ".git/hooks")
             self.assertEqual(self.inventory(), original)
+
+class SymlinkedTemporaryRootOwnership(CommonHooksOwnership):
+    """Rerun every ownership case with the fixtures reached through a symlink.
+
+    On macOS /var and /tmp are symlinks into /private, so a repository made
+    under tempfile's default directory is named /var/folders/... by the caller
+    but reported by Git as /private/var/folders/.... Comparing the two forms
+    refused genuine owners there ("owning worktree is not registered",
+    "native default hooks differ from verified owning hooks"). This class
+    reproduces that shape on every host with a real symlink, so the whole
+    suite also proves that an ancestor symlink does not change any verdict
+    while the leaf symlink refusals above still hold.
+    """
+
+    def fixture_base(self, temporary: Path) -> Path:
+        real = temporary / "real-root"
+        real.mkdir()
+        alias = temporary / "symlinked-root"
+        alias.symlink_to(real, target_is_directory=True)
+        # Control: the fixtures really are named through a symlinked ancestor.
+        self.assertTrue(alias.is_symlink())
+        self.assertNotEqual(alias.resolve(strict=True), alias)
+        return alias
 
 if __name__ == "__main__":
     unittest.main()

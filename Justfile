@@ -19,13 +19,30 @@ build-release:
 build-decoder:
   cd ../codetracer-trace-format-nim && nimble buildCtPrint
 
+test: build-decoder test-hook-ownership test-portable
+
+# `test` minus its POSIX-only part, for hosts without POSIX tooling (the
+# Windows lanes of the reprobuild CI workflow run this; Linux and macOS run
+# `test`). Excluded, and why:
+#
+# - `test-hook-ownership`: the canonical git-hook ownership tests run the
+#   `prek` hook manager, which has no Windows package in the build
+#   environment, assert POSIX file modes (0o755) on the installed hooks, and
+#   execute the hooks through `/bin/sh`.
+#
+# Everything else `test` runs is here, in the same order.
+#
 # The Cargo.lock check runs before `cargo test`: when the lock is stale it names
 # the cause and the remedy, where `cargo test --locked` would only refuse the
 # lock.
-test: build-decoder
+test-portable: build-decoder
   bash tests/verify-cargo-lock-matches-trace-format.sh
   cargo test --locked
   bash tests/verify-cli-convention-no-silent-skip.sh
+
+# POSIX-only: see `test-portable` above.
+test-hook-ownership:
+  python3 -m unittest discover -s tests -p test_canonical_hook_ownership.py
 
 t: test
 
@@ -41,6 +58,7 @@ verify-cargo-lock:
   bash tests/verify-cargo-lock-matches-trace-format.sh
 
 lint:
+  python3 -m unittest discover -s tests -p test_canonical_hook_ownership.py
   cargo fmt --check
   cargo clippy --locked --all-targets -- -D warnings
   bash tests/verify-cli-convention-no-silent-skip.sh

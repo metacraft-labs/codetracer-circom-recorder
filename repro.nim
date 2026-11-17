@@ -112,6 +112,16 @@ package codetracer_circom_recorder:
     # static library into the cargo build (the FFI's C output
     # ``#include``s ``zstd.h`` and the CBOR+Zstd writer links libzstd).
     "zstd"
+    # zstd.h + libzstd for the sibling ct-print edge
+    # (``build_writer_artifacts.buildCtPrint`` compiles and links against
+    # them; ``zstd`` is the CLI only). The ct-print edge needs both on every
+    # host, so this is declared on Windows too: there reprobuild provisions
+    # ``zstd-dev`` from a tarball whose prefix holds ``zstd.h`` and a static
+    # ``libzstd.a``, which ct-print links with ``-lzstd``. The constructor
+    # cannot provision a tool from inside ``build:`` and refuses a recipe
+    # that omits any of ``CtPrintToolSelectors`` (the C compiler plus
+    # ``zstd-dev``), on Windows as on POSIX.
+    "zstd-dev"
 
     # pkg-config + OpenSSL — openssl-sys consults pkg-config to find
     # OpenSSL on Linux/macOS. The Windows build uses the rustls-tls
@@ -147,6 +157,18 @@ package codetracer_circom_recorder:
     "diff"
     "head"
     "cat"
+    # just runs the Justfile recipes, which CI's cross-check steps call
+    # through `dev-exec` (`repro exec`), so it must be declared here: the
+    # activated environment's PATH is the runner's plus the declared tools,
+    # and the Windows runner has no `just`.
+    "just"
+    # ``just test`` (and ``just lint``) start with ``python3 -m unittest``
+    # over ``tests/test_canonical_hook_ownership.py``, so the cross-check
+    # needs python3 in the activated environment. The flake dev shell
+    # supplies it on Linux/macOS; on Windows reprobuild realizes it, although
+    # the Windows cross-check runs ``just test-portable``, which leaves those
+    # POSIX-only tests out (see the Justfile).
+    "python3"
 
     # Language-specific compiler / runtime tool. ``circom`` compiles the
     # ``.circom`` test fixtures the integration tests record against; it
@@ -246,9 +268,6 @@ package codetracer_circom_recorder:
         traceRoot / "codetracer_trace_format_capnp",
         traceRoot / "codetracer_trace_format_cbor_zstd",
         traceRoot / "codetracer_trace_writer", nimRoot / "src", nimRoot / "include"])
-    let decoderBuild = buildCtPrint(nimRoot)
-    let decoderBinary = ctPrintPath(nimRoot)
-
     let testsBuild = cargo.test(
       locked = true,
       noRun = true,
@@ -258,6 +277,14 @@ package codetracer_circom_recorder:
         "src", "tests", "test-programs"
       ] & traceManifestInputs & completeTestSourceInputs,
       extraOutputs = @["target/debug/deps"])
+
+    # The decoder edge runs after the test build: that build's
+    # ``codetracer_trace_writer_nim`` ``build.rs`` is what installs the
+    # sibling's nimble ``requires`` (``results``, ``stew``) into the nimble
+    # path ``buildCtPrint``'s compile resolves them from (its doc comment
+    # asks a recorder to pass that edge here).
+    let decoderBuild = buildCtPrint(nimRoot, after = @[testsBuild.action])
+    let decoderBinary = ctPrintPath(nimRoot)
 
     let testsRun = cargo.test(
       locked = true,
