@@ -164,8 +164,10 @@ package codetracer_circom_recorder:
     "just"
     # ``just test`` (and ``just lint``) start with ``python3 -m unittest``
     # over ``tests/test_canonical_hook_ownership.py``, so the cross-check
-    # needs python3 in the activated environment on every lane. The flake dev
-    # shell supplies it on Linux/macOS; on Windows reprobuild realizes it.
+    # needs python3 in the activated environment. The flake dev shell
+    # supplies it on Linux/macOS; on Windows reprobuild realizes it, although
+    # the Windows cross-check runs ``just test-portable``, which leaves those
+    # POSIX-only tests out (see the Justfile).
     "python3"
 
     # Language-specific compiler / runtime tool. ``circom`` compiles the
